@@ -1,0 +1,62 @@
+{
+  "log": {
+    "access": "none",
+    "error": "none",
+    "loglevel": "warning",
+    "dnsLog": true,
+    "maskAddress": ""
+  },
+  "inbounds": [
+    {
+      "tag": "in-socks",
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true,
+        "allowTransparent": false
+      },
+      "sniffing": {
+        "enabled": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "out-proxy",
+      "protocol": "vless",
+      "settings": {
+        "address": "<Cloudflare_1>",
+        "port": 443,
+        "id": "<XHTTP_UUID>",
+        "flow": "",
+        "encryption": "none"
+      },
+      "streamSettings": {
+        "method": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "<XHTTP_CDN_Site>",
+          "fingerprint": "chrome",
+          "alpn": ["h2"],
+          "show": false
+        },
+        "xhttpSettings": {
+          "mode": "auto",
+          "host": "<XHTTP_CDN_Site>",
+          "path": "/<XHTTP_PATH>",
+          "extra": {}
+        }
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": "in-socks",
+        "outboundTag": "out-proxy"
+      }
+    ]
+  }
+}
