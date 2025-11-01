@@ -1,0 +1,225 @@
+{
+  "log": {
+    "access": "none",
+    "error": "none",
+    "loglevel": "warning",
+    "dnsLog": true,
+    "maskAddress": ""
+  },
+  "dns": {
+    "hosts": {
+      "domain:googleapis.cn": ["googleapis.com"],
+      "dns.alidns.com": [
+        "223.5.5.5",
+        "223.6.6.6",
+        "2400:3200::1",
+        "2400:3200:baba::1"
+      ]
+    },
+    "servers": [
+      {
+        "address": "8.8.8.8",
+        "tag": "dns-google-1"
+      },
+      {
+        "address": "https+local://dns.alidns.com/dns-query",
+        "domains": [
+          "full:cfcn-a-proctusa.chinabaidu.pp.ua",
+          "full:singgcdn.singgnetworkcdn.com",
+          "keyword:gh-proxy.org",
+          "ext:geosite.dat:private",
+          "ext:geosite.dat:category-game-platforms-download@cn"
+        ],
+        "skipFallback": true,
+        "tag": "dns-ali-1"
+      },
+      {
+        "address": "8.8.8.8",
+        "domains": ["ext:geosite.dat:geolocation-!cn"],
+        "skipFallback": true,
+        "tag": "dns-google-2"
+      },
+      {
+        "address": "https+local://dns.alidns.com/dns-query",
+        "domains": ["ext:geosite.dat:cn"],
+        "expectedIPs": ["ext:geoip-cn.dat:cn"],
+        "skipFallback": true,
+        "tag": "dns-ali-2"
+      }
+    ],
+    "queryStrategy": "UseIPv4",
+    "useSystemHosts": false
+  },
+  "inbounds": [
+    {
+      "tag": "in-tun",
+      "protocol": "tun",
+      "settings": {
+        "name": "xray0",
+        "mtu": 1500,
+        "gateway": ["172.18.0.1/24", "fdfe:dcba:9876::1/64"],
+        "dns": [
+          "94.140.14.14",
+          "94.140.15.15",
+          "2a10:50c0::ad1:ff",
+          "2a10:50c0::ad2:ff"
+        ],
+        "autoSystemRoutingTable": ["0.0.0.0/0", "::/0"],
+        "autoOutboundsInterface": "auto"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"],
+        "metadataOnly": false,
+        "routeOnly": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "out-proxy",
+      "protocol": "vless",
+      "settings": {
+        "address": "<VPS_IPv4>",
+        "port": 443,
+        "id": "<XHTTP_UUID>",
+        "flow": "",
+        "encryption": "none"
+      },
+      "streamSettings": {
+        "method": "xhttp",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "<Reality_Site>",
+          "fingerprint": "chrome",
+          "password": "<Reality_publicKey>",
+          "shortId": "<Reality_shortId>",
+          "spiderX": "/",
+          "show": false
+        },
+        "xhttpSettings": {
+          "mode": "auto",
+          "host": "",
+          "path": "/<XHTTP_PATH>",
+          "extra": {
+            "downloadSettings": {
+              "address": "<Cloudflare_1>",
+              "port": 443,
+              "method": "xhttp",
+              "security": "tls",
+              "tlsSettings": {
+                "serverName": "<XHTTP_CDN_Site>",
+                "fingerprint": "chrome",
+                "alpn": ["h2"],
+                "show": false
+              },
+              "xhttpSettings": {
+                "mode": "auto",
+                "host": "<XHTTP_CDN_Site>",
+                "path": "/<XHTTP_PATH>"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "tag": "out-direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      }
+    },
+    {
+      "tag": "out-block",
+      "protocol": "blackhole"
+    },
+    {
+      "tag": "out-dns",
+      "protocol": "dns",
+      "settings": {
+        "rules": [
+          {
+            "qType": "1,28",
+            "action": "hijack"
+          },
+          {
+            "qType": 65,
+            "action": "return",
+            "rCode": 5
+          }
+        ]
+      }
+    }
+  ],
+  "geodata": {
+    "cron": "30 3 * * *",
+    "assets": [
+      {
+        "url": "https://raw.githubusercontent.com/XTLS/Xray-rules-dat/release/geoip/dat/cn.dat",
+        "file": "geoip-cn.dat"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/XTLS/Xray-rules-dat/release/geoip/dat/private.dat",
+        "file": "geoip-private.dat"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/XTLS/Xray-rules-dat/release/geosite/geosite.dat",
+        "file": "geosite.dat"
+      }
+    ]
+  },
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "inboundTag": ["dns-google-1", "dns-google-2"],
+        "outboundTag": "out-proxy"
+      },
+      {
+        "inboundTag": ["in-tun"],
+        "port": "53",
+        "outboundTag": "out-dns"
+      },
+      {
+        "domain": ["ext:geosite.dat:private"],
+        "outboundTag": "out-direct"
+      },
+      {
+        "ip": ["ext:geoip-private.dat:private"],
+        "outboundTag": "out-direct"
+      },
+      {
+        "network": "udp",
+        "port": "443",
+        "outboundTag": "out-block"
+      },
+      {
+        "network": "tcp,udp",
+        "port": "853",
+        "outboundTag": "out-block"
+      },
+      {
+        "protocol": ["bittorrent"],
+        "outboundTag": "out-direct"
+      },
+      {
+        "domain": [
+          "full:cfcn-a-proctusa.chinabaidu.pp.ua",
+          "full:singgcdn.singgnetworkcdn.com",
+          "keyword:gh-proxy.org",
+          "ext:geosite.dat:category-game-platforms-download@cn"
+        ],
+        "outboundTag": "out-direct"
+      },
+      {
+        "domain": ["ext:geosite.dat:geolocation-!cn"],
+        "outboundTag": "out-proxy"
+      },
+      {
+        "ip": ["ext:geoip-cn.dat:cn"],
+        "outboundTag": "out-direct"
+      }
+    ]
+  }
+}

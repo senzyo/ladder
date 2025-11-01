@@ -1,0 +1,60 @@
+[package]
+name = "ladder"
+version = "2.34.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = "3.5"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Com",
+    "Win32_System_SystemInformation",
+    "Win32_System_Console",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-registry = "0.6"
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# 保留 abort: 在 opt-level = "z" + LTO 下改成 unwind 会让 exe 从 2076 KB 涨到
+# 2660 KB (+584 KB / +28%) , 代价来自遍布 windows crate 调用点的 landing pad。
+#
+# abort 下 panic 不展开, Drop 和 catch_unwind 都不会执行, 但 panic 钩子仍会在
+# abort 之前被调用。必须做的清理 (恢复物理网卡 DNS、终止核心进程) 因此放在
+# emergency::install_panic_hook 里, 见那里的说明。
+panic = "abort"
+

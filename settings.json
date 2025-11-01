@@ -1,0 +1,18 @@
+{
+  "log": {
+    "level": "debug",
+    "max_size_mb": 5
+  },
+  "download": {
+    "core": {
+      "gh_proxy": "https://axisnow.gh-proxy.org/"
+    },
+    "retry": {
+      "max_retries": 3,
+      "delay_secs": 2
+    }
+  },
+  "core": {
+    "mode": "xray"
+  }
+}
