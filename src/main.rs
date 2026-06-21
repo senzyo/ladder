@@ -106,9 +106,7 @@ fn restart_xray() -> Result<(), String> {
 }
 
 fn stop_all() -> Result<(), String> {
-    stop_processes(&["sing-box.exe", "xray.exe"])?;
-    flush_dns();
-    Ok(())
+    stop_processes(&["sing-box.exe", "xray.exe"])
 }
 
 fn stop_processes(processes: &[&str]) -> Result<(), String> {
@@ -117,6 +115,7 @@ fn stop_processes(processes: &[&str]) -> Result<(), String> {
             .args(["/F", "/IM", process])
             .status();
     }
+    flush_dns();
     Ok(())
 }
 
