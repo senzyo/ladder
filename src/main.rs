@@ -43,6 +43,8 @@ struct ConfigAction {
 struct AppState {
     work_dir: PathBuf,
     config_actions: HashMap<u16, ConfigAction>,
+    sing_box_version: Option<String>,
+    xray_version: Option<String>,
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -71,13 +73,35 @@ fn run() -> Result<(), String> {
     APP.set(Mutex::new(AppState {
         work_dir: work_dir.clone(),
         config_actions: HashMap::new(),
+        sing_box_version: None,
+        xray_version: None,
     }))
     .map_err(|_| "初始化状态失败".to_string())?;
+
+    let tooltip = {
+        let mut app = app_state_mut().ok_or("应用状态不可用")?;
+        let sing_exe = app.work_dir.join("sing-box.exe");
+        let xray_exe = app.work_dir.join("xray.exe");
+        app.sing_box_version = if sing_exe.exists() {
+            let v = update::get_local_version(&sing_exe, "version");
+            if v != "0.0.0" { Some(v) } else { None }
+        } else {
+            None
+        };
+        app.xray_version = if xray_exe.exists() {
+            let v = update::get_local_version(&xray_exe, "version");
+            if v != "0.0.0" { Some(v) } else { None }
+        } else {
+            None
+        };
+        format_tooltip(app.sing_box_version.as_deref(), app.xray_version.as_deref())
+    };
 
     unsafe {
         let h_instance = GetModuleHandleW(null());
         let hwnd = tray::create_window(h_instance)?;
         tray::add_icon(hwnd, h_instance, &work_dir)?;
+        tray::set_tooltip(&tooltip);
         tray::run_message_loop();
     }
 
@@ -100,18 +124,22 @@ fn execute_menu_command(hwnd: HWND, id: u16) {
                     return;
                 }
             };
+            let (sing_ver, xray_ver) = {
+                let app = app_state().expect("应用状态不可用");
+                (app.sing_box_version.clone(), app.xray_version.clone())
+            };
             let _ = stop_all();
             std::thread::spawn(move || {
                 unsafe {
                     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
                 }
                 let result = match id {
-                    tray::ID_UPDATE_ALL => update::update_cores(&work_dir),
-                    tray::ID_UPDATE_SING => update::update_sing_box(&work_dir),
-                    tray::ID_UPDATE_XRAY => update::update_xray(&work_dir),
+                    tray::ID_UPDATE_ALL => update::update_cores(&work_dir, sing_ver.as_deref(), xray_ver.as_deref()),
+                    tray::ID_UPDATE_SING => update::update_sing_box(&work_dir, sing_ver.as_deref()),
+                    tray::ID_UPDATE_XRAY => update::update_xray(&work_dir, xray_ver.as_deref()),
                     _ => unreachable!(),
                 };
-                tray::set_tooltip("sing-box-with-xray");
+                refresh_versions_and_tooltip(&work_dir);
                 if let Err(e) = result {
                     toast::show_toast("更新失败", &e);
                 }
@@ -495,6 +523,40 @@ fn set_wstr_array<const N: usize>(target: &mut [u16; N], value: &str) {
     let len = wide.len().saturating_sub(1).min(N - 1);
     target[..len].copy_from_slice(&wide[..len]);
     target[len] = 0;
+}
+
+fn format_tooltip(sing_ver: Option<&str>, xray_ver: Option<&str>) -> String {
+    let sing = match sing_ver {
+        Some(v) => format!("sing-box v{}", v),
+        None => "sing-box 未安装".to_string(),
+    };
+    let xray = match xray_ver {
+        Some(v) => format!("xray v{}", v),
+        None => "xray 未安装".to_string(),
+    };
+    format!("{}\n{}", sing, xray)
+}
+
+fn refresh_versions_and_tooltip(work_dir: &Path) {
+    if let Some(mut app) = app_state_mut() {
+        let sing_exe = work_dir.join("sing-box.exe");
+        let xray_exe = work_dir.join("xray.exe");
+        app.sing_box_version = if sing_exe.exists() {
+            let v = update::get_local_version(&sing_exe, "version");
+            if v != "0.0.0" { Some(v) } else { None }
+        } else {
+            None
+        };
+        app.xray_version = if xray_exe.exists() {
+            let v = update::get_local_version(&xray_exe, "version");
+            if v != "0.0.0" { Some(v) } else { None }
+        } else {
+            None
+        };
+        let tooltip = format_tooltip(app.sing_box_version.as_deref(), app.xray_version.as_deref());
+        drop(app);
+        tray::set_tooltip(&tooltip);
+    }
 }
 
 

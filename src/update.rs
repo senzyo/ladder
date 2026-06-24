@@ -9,17 +9,24 @@ const GH_PROXY: &str = "https://gh-proxy.com/";
 const USER_AGENT: &str = "sing-box-with-xray";
 const MAX_RETRIES: u32 = 3;
 
-pub fn update_cores(work_dir: &Path) -> Result<(), String> {
+pub fn update_cores(
+    work_dir: &Path,
+    sing_ver: Option<&str>,
+    xray_ver: Option<&str>,
+) -> Result<(), String> {
     let work_dir = work_dir.to_path_buf();
-    update_sing_box(&work_dir)?;
-    update_xray(&work_dir)
+    update_sing_box(&work_dir, sing_ver)?;
+    update_xray(&work_dir, xray_ver)
 }
 
-pub fn update_sing_box(work_dir: &Path) -> Result<(), String> {
+pub fn update_sing_box(work_dir: &Path, local_version: Option<&str>) -> Result<(), String> {
     let exe_path = work_dir.join("sing-box.exe");
     let api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
 
-    let local = get_local_version(&exe_path, "version");
+    let local = match local_version {
+        Some(v) if v != "0.0.0" => v.to_string(),
+        _ => get_local_version(&exe_path, "version"),
+    };
     let (remote_ver, assets) = fetch_release(api_url)?;
 
     if !is_newer(&local, &remote_ver) {
@@ -61,11 +68,14 @@ pub fn update_sing_box(work_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn update_xray(work_dir: &Path) -> Result<(), String> {
+pub fn update_xray(work_dir: &Path, local_version: Option<&str>) -> Result<(), String> {
     let exe_path = work_dir.join("xray.exe");
     let api_url = "https://api.github.com/repos/XTLS/Xray-core/releases/latest";
 
-    let local = get_local_version(&exe_path, "version");
+    let local = match local_version {
+        Some(v) if v != "0.0.0" => v.to_string(),
+        _ => get_local_version(&exe_path, "version"),
+    };
     let (remote_ver, assets) = fetch_release(api_url)?;
 
     if !is_newer(&local, &remote_ver) {
@@ -106,7 +116,7 @@ pub fn update_xray(work_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn get_local_version(exe_path: &Path, version_arg: &str) -> String {
+pub(crate) fn get_local_version(exe_path: &Path, version_arg: &str) -> String {
     let output = match Command::new(exe_path).arg(version_arg).output() {
         Ok(out) => out,
         Err(_) => return "0.0.0".to_string(),
