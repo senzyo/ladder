@@ -11,12 +11,15 @@ use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -40,8 +43,6 @@ struct ConfigAction {
 struct AppState {
     work_dir: PathBuf,
     config_actions: HashMap<u16, ConfigAction>,
-    sing_box: Option<Child>,
-    xray: Option<Child>,
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -70,8 +71,6 @@ fn run() -> Result<(), String> {
     APP.set(Mutex::new(AppState {
         work_dir: work_dir.clone(),
         config_actions: HashMap::new(),
-        sing_box: None,
-        xray: None,
     }))
     .map_err(|_| "初始化状态失败".to_string())?;
 
@@ -161,15 +160,6 @@ fn stop_processes(processes: &[&str]) -> Result<(), String> {
             .status();
     }
     flush_dns();
-
-    if let Some(mut app) = app_state_mut() {
-        if processes.contains(&"sing-box.exe") {
-            app.sing_box = None;
-        }
-        if processes.contains(&"xray.exe") {
-            app.xray = None;
-        }
-    }
     Ok(())
 }
 
@@ -184,7 +174,7 @@ fn start_sing_box() -> Result<(), String> {
     ensure_exists(&config)?;
     randomize_tun_name(&config)?;
 
-    let child = hidden_command(exe)
+    hidden_command(exe)
         .args(["run", "-D"])
         .arg(&work_dir)
         .arg("-c")
@@ -192,10 +182,6 @@ fn start_sing_box() -> Result<(), String> {
         .current_dir(work_dir)
         .spawn()
         .map_err(|e| format!("启动 sing-box 失败: {e}"))?;
-
-    if let Some(mut app) = app_state_mut() {
-        app.sing_box = Some(child);
-    }
 
     Ok(())
 }
@@ -208,16 +194,12 @@ fn start_xray() -> Result<(), String> {
     ensure_exists(&exe)?;
     ensure_exists(&config)?;
 
-    let child = hidden_command(exe)
+    hidden_command(exe)
         .args(["run", "-c"])
         .arg(config)
         .current_dir(work_dir)
         .spawn()
         .map_err(|e| format!("启动 xray 失败: {e}"))?;
-
-    if let Some(mut app) = app_state_mut() {
-        app.xray = Some(child);
-    }
 
     Ok(())
 }
@@ -309,19 +291,10 @@ fn sing_box_state(app: &mut AppState) -> ProcessState {
     if !app.work_dir.join("sing-box.exe").exists() {
         return ProcessState::NotInstalled;
     }
-    match &mut app.sing_box {
-        Some(child) => match child.try_wait() {
-            Ok(Some(_)) => {
-                app.sing_box = None;
-                ProcessState::NotRunning
-            }
-            Ok(None) => ProcessState::Running,
-            Err(_) => {
-                app.sing_box = None;
-                ProcessState::NotRunning
-            }
-        },
-        None => ProcessState::NotRunning,
+    if is_process_running("sing-box.exe") {
+        ProcessState::Running
+    } else {
+        ProcessState::NotRunning
     }
 }
 
@@ -329,19 +302,40 @@ fn xray_state(app: &mut AppState) -> ProcessState {
     if !app.work_dir.join("xray.exe").exists() {
         return ProcessState::NotInstalled;
     }
-    match &mut app.xray {
-        Some(child) => match child.try_wait() {
-            Ok(Some(_)) => {
-                app.xray = None;
-                ProcessState::NotRunning
+    if is_process_running("xray.exe") {
+        ProcessState::Running
+    } else {
+        ProcessState::NotRunning
+    }
+}
+
+fn is_process_running(exe_name: &str) -> bool {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return false;
+        }
+
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                let name_bytes = &entry.szExeFile[..end];
+                let name = String::from_utf16_lossy(name_bytes);
+                if name.eq_ignore_ascii_case(exe_name) {
+                    CloseHandle(snapshot);
+                    return true;
+                }
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
             }
-            Ok(None) => ProcessState::Running,
-            Err(_) => {
-                app.xray = None;
-                ProcessState::NotRunning
-            }
-        },
-        None => ProcessState::NotRunning,
+        }
+
+        CloseHandle(snapshot);
+        false
     }
 }
 
