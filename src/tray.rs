@@ -1,3 +1,4 @@
+use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -175,6 +176,71 @@ unsafe fn load_app_icon(h_instance: HINSTANCE, work_dir: &Path) -> HICON {
     LoadIconW(null_mut(), IDI_APPLICATION)
 }
 
+pub(crate) unsafe fn load_icon_bitmap(work_dir: &Path, icon_name: &str) -> isize {
+    let icon_path = work_dir.join("icon").join(icon_name);
+    if !icon_path.exists() {
+        return 0;
+    }
+    let icon_path = crate::wide_path(&icon_path);
+    let hicon = LoadImageW(
+        null_mut(),
+        icon_path.as_ptr(),
+        IMAGE_ICON,
+        16,
+        16,
+        LR_LOADFROMFILE,
+    );
+    if hicon.is_null() {
+        return 0;
+    }
+
+    let screen_dc = GetDC(null_mut());
+    if screen_dc.is_null() {
+        DestroyIcon(hicon as HICON);
+        return 0;
+    }
+    let mem_dc = CreateCompatibleDC(screen_dc);
+    if mem_dc.is_null() {
+        ReleaseDC(null_mut(), screen_dc);
+        DestroyIcon(hicon as HICON);
+        return 0;
+    }
+
+    let mut bmi: BITMAPINFO = zeroed();
+    bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = 16;
+    bmi.bmiHeader.biHeight = 16;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    let mut pv_bits: *mut c_void = null_mut();
+    let bmp = CreateDIBSection(
+        mem_dc,
+        &bmi,
+        DIB_RGB_COLORS,
+        &mut pv_bits,
+        0 as _,
+        0,
+    );
+
+    ReleaseDC(null_mut(), screen_dc);
+
+    if bmp.is_null() {
+        DeleteDC(mem_dc);
+        DestroyIcon(hicon as HICON);
+        return 0;
+    }
+
+    let old_bmp = SelectObject(mem_dc, bmp);
+    DrawIconEx(mem_dc, 0, 0, hicon as HICON, 16, 16, 0, null_mut(), DI_NORMAL);
+    SelectObject(mem_dc, old_bmp);
+    DeleteDC(mem_dc);
+    DestroyIcon(hicon as HICON);
+
+    bmp as isize
+}
+
 unsafe fn remove_tray_icon(hwnd: HWND) {
     let mut nid: NOTIFYICONDATAW = zeroed();
     nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
@@ -195,10 +261,10 @@ unsafe fn show_tray_menu(hwnd: HWND) -> u16 {
     let xray_state = crate::xray_state(&mut app);
     let work_dir = app.work_dir.clone();
 
-    let status_icon = |s: ProcessState| match s {
-        ProcessState::Running => "green_circle.ico",
-        ProcessState::NotRunning => "yellow_circle.ico",
-        ProcessState::NotInstalled => "red_circle.ico",
+    let status_hbmp = |s: ProcessState| match s {
+        ProcessState::Running => app.icon_green,
+        ProcessState::NotRunning => app.icon_yellow,
+        ProcessState::NotInstalled => app.icon_red,
     };
     let status_label = |s: ProcessState, name: &str| match s {
         ProcessState::Running => format!("{name} 正在运行"),
@@ -206,8 +272,8 @@ unsafe fn show_tray_menu(hwnd: HWND) -> u16 {
         ProcessState::NotInstalled => format!("{name} 未安装"),
     };
 
-    append_status_item(menu, &status_label(sing_state, "sing-box"), &work_dir, status_icon(sing_state));
-    append_status_item(menu, &status_label(xray_state, "xray"), &work_dir, status_icon(xray_state));
+    append_status_item(menu, &status_label(sing_state, "sing-box"), status_hbmp(sing_state));
+    append_status_item(menu, &status_label(xray_state, "xray"), status_hbmp(xray_state));
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
 
     let restart_menu = CreatePopupMenu();
@@ -250,7 +316,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> u16 {
     append_submenu(menu, sing_menu, "切换 sing-box 配置");
     append_submenu(menu, xray_menu, "切换 xray 配置");
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    append_item(menu, ID_EXIT, "退出托盘程序");
+    append_item(menu, ID_EXIT, "退出并终止");
 
     let mut point = POINT { x: 0, y: 0 };
     GetCursorPos(&mut point);
@@ -283,84 +349,20 @@ unsafe fn append_disabled_item(menu: HMENU, label: &str) {
 unsafe fn append_status_item(
     menu: HMENU,
     label: &str,
-    work_dir: &Path,
-    icon_name: &str,
+    hbmp: isize,
 ) {
     let label = crate::wide(label);
     let position = GetMenuItemCount(menu) as u32;
     AppendMenuW(menu, MF_STRING, 0, label.as_ptr());
 
-    let icon_path = work_dir.join("icon").join(icon_name);
-    if !icon_path.exists() {
+    if hbmp == 0 {
         return;
     }
-    let icon_path = crate::wide_path(&icon_path);
-    let hicon = LoadImageW(
-        null_mut(),
-        icon_path.as_ptr(),
-        IMAGE_ICON,
-        16,
-        16,
-        LR_LOADFROMFILE,
-    );
-    if hicon.is_null() {
-        return;
-    }
-
-    let screen_dc = GetDC(null_mut());
-    if screen_dc.is_null() {
-        DestroyIcon(hicon as HICON);
-        return;
-    }
-    let mem_dc = CreateCompatibleDC(screen_dc);
-    if mem_dc.is_null() {
-        ReleaseDC(null_mut(), screen_dc);
-        DestroyIcon(hicon as HICON);
-        return;
-    }
-
-    // 配置 32 位（ARGB）带有透明通道的 BITMAPINFO 结构体
-    let mut bmi: BITMAPINFO = zeroed();
-    bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-    bmi.bmiHeader.biWidth = 16;
-    bmi.bmiHeader.biHeight = 16;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    let mut pv_bits: *mut std::ffi::c_void = null_mut();
-    // 创建一个 32 位 DIB。其像素初始值全为 0（代表 100% 完全透明）
-    let bmp = CreateDIBSection(
-        mem_dc,
-        &bmi,
-        DIB_RGB_COLORS,
-        &mut pv_bits,
-        0 as _, // 兼容 windows-sys 的 HANDLE 类型转换为 0
-        0,
-    );
-
-    ReleaseDC(null_mut(), screen_dc);
-
-    if bmp.is_null() {
-        DeleteDC(mem_dc);
-        DestroyIcon(hicon as HICON);
-        return;
-    }
-
-    let old_bmp = SelectObject(mem_dc, bmp);
-
-    // 将 HICON 绘制到透明的 32 位 DIB 缓存中。
-    // 此时 DrawIconEx 将会直接写入带有 Alpha 信息的预乘透明像素。
-    DrawIconEx(mem_dc, 0, 0, hicon as HICON, 16, 16, 0, null_mut(), DI_NORMAL);
-
-    SelectObject(mem_dc, old_bmp);
-    DeleteDC(mem_dc);
-    DestroyIcon(hicon as HICON);
 
     let mut mii: MENUITEMINFOW = zeroed();
     mii.cbSize = size_of::<MENUITEMINFOW>() as u32;
     mii.fMask = MIIM_BITMAP;
-    mii.hbmpItem = bmp;
+    mii.hbmpItem = hbmp as _;
     SetMenuItemInfoW(menu, position, 1, &mii);
 }
 

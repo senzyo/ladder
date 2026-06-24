@@ -4,10 +4,23 @@ use std::fs;
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 const GH_PROXY: &str = "https://gh-proxy.com/";
 const USER_AGENT: &str = "sing-box-with-xray";
 const MAX_RETRIES: u32 = 3;
+
+static HTTP: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn agent() -> &'static ureq::Agent {
+    HTTP.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(10))
+            .build()
+    })
+}
 
 pub fn update_cores(
     work_dir: &Path,
@@ -173,7 +186,7 @@ fn is_newer(local: &str, remote: &str) -> bool {
 }
 
 fn fetch_release(api_url: &str) -> Result<(String, Vec<Value>), String> {
-    let resp = ureq::get(api_url)
+    let resp = agent().get(api_url)
         .set("User-Agent", USER_AGENT)
         .call()
         .map_err(|e| format!("请求 GitHub API 失败: {e}"))?;
@@ -251,7 +264,7 @@ fn download_file(url: &str, dest: &Path) -> Result<(), String> {
         let _ = fs::remove_file(dest);
     }
 
-    let resp = ureq::get(url)
+    let resp = agent().get(url)
         .set("User-Agent", USER_AGENT)
         .call()
         .map_err(|e| format!("下载失败: {e}"))?;

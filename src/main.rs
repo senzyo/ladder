@@ -45,6 +45,9 @@ struct AppState {
     config_actions: HashMap<u16, ConfigAction>,
     sing_box_version: Option<String>,
     xray_version: Option<String>,
+    icon_green: isize,
+    icon_yellow: isize,
+    icon_red: isize,
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -75,8 +78,20 @@ fn run() -> Result<(), String> {
         config_actions: HashMap::new(),
         sing_box_version: None,
         xray_version: None,
+        icon_green: 0,
+        icon_yellow: 0,
+        icon_red: 0,
     }))
     .map_err(|_| "初始化状态失败".to_string())?;
+
+    {
+        let mut app = app_state_mut().ok_or("应用状态不可用")?;
+        unsafe {
+            app.icon_green = tray::load_icon_bitmap(&app.work_dir, "green_circle.ico");
+            app.icon_yellow = tray::load_icon_bitmap(&app.work_dir, "yellow_circle.ico");
+            app.icon_red = tray::load_icon_bitmap(&app.work_dir, "red_circle.ico");
+        }
+    }
 
     let tooltip = {
         let mut app = app_state_mut().ok_or("应用状态不可用")?;
@@ -103,6 +118,15 @@ fn run() -> Result<(), String> {
         tray::add_icon(hwnd, h_instance, &work_dir)?;
         tray::set_tooltip(&tooltip);
         tray::run_message_loop();
+    }
+
+    if let Some(app) = app_state() {
+        unsafe {
+            use windows_sys::Win32::Graphics::Gdi::DeleteObject;
+            if app.icon_green != 0 { DeleteObject(app.icon_green as _); }
+            if app.icon_yellow != 0 { DeleteObject(app.icon_yellow as _); }
+            if app.icon_red != 0 { DeleteObject(app.icon_red as _); }
+        }
     }
 
     Ok(())
@@ -150,6 +174,7 @@ fn execute_menu_command(hwnd: HWND, id: u16) {
             return;
         }
         tray::ID_EXIT => {
+            let _ = stop_all();
             unsafe { DestroyWindow(hwnd) };
             Ok(())
         }
@@ -282,7 +307,9 @@ fn randomize_tun_name(config_path: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let new_text = text.replacen(old_name, &new_name, 1);
+    let old_pattern = format!("\"interface_name\": \"{}\"", old_name);
+    let new_pattern = format!("\"interface_name\": \"{}\"", new_name);
+    let new_text = text.replacen(&old_pattern, &new_pattern, 1);
     fs::write(config_path, new_text).map_err(|e| format!("写入 sing-box 配置失败: {e}"))
 }
 
