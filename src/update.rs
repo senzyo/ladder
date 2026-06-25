@@ -1,7 +1,7 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read};
 use std::path::Path;
 use std::process::Command;
 
@@ -174,12 +174,13 @@ fn is_newer(local: &str, remote: &str) -> bool {
 
 fn fetch_release(api_url: &str) -> Result<(String, Vec<Value>), String> {
     let resp = ureq::get(api_url)
-        .set("User-Agent", USER_AGENT)
+        .header("User-Agent", USER_AGENT)
         .call()
         .map_err(|e| format!("请求 GitHub API 失败: {e}"))?;
 
     let body = resp
-        .into_string()
+        .into_body()
+        .read_to_string()
         .map_err(|e| format!("读取 GitHub API 响应失败: {e}"))?;
 
     let json: Value =
@@ -252,11 +253,11 @@ fn download_file(url: &str, dest: &Path) -> Result<(), String> {
     }
 
     let resp = ureq::get(url)
-        .set("User-Agent", USER_AGENT)
+        .header("User-Agent", USER_AGENT)
         .call()
         .map_err(|e| format!("下载失败: {e}"))?;
 
-    let mut reader = resp.into_reader();
+    let mut reader = resp.into_body().into_reader();
     let mut file = fs::File::create(dest).map_err(|e| format!("创建文件失败: {e}"))?;
 
     io::copy(&mut reader, &mut file).map_err(|e| format!("写入文件失败: {e}"))?;
@@ -265,7 +266,6 @@ fn download_file(url: &str, dest: &Path) -> Result<(), String> {
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    use std::io::Read;
     let mut file =
         fs::File::open(path).map_err(|e| format!("打开文件计算 SHA256 失败: {e}"))?;
     let mut hasher = Sha256::new();
