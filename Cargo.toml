@@ -1,5 +1,5 @@
 [package]
-name = "sing-box_with_xray"
+name = "sing-box-with-xray"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"

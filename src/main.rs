@@ -180,7 +180,7 @@ fn run() -> Result<(), String> {
 
     let work_dir = detect_work_dir();
     let exe_path = std::env::current_exe()
-        .unwrap_or_else(|_| work_dir.join("sing-box_with_xray.exe"));
+        .unwrap_or_else(|_| work_dir.join("sing-box-with-xray.exe"));
 
     init_logging(&work_dir)?;
     info!("程序启动, 工作目录: {}", work_dir.display());

@@ -11,7 +11,7 @@ use windows::Win32::UI::Shell::{
 };
 
 const AUMID: &str = "SingBoxWithXray";
-const SHORTCUT_NAME: &str = "sing-box_with_xray";
+const SHORTCUT_NAME: &str = "sing-box-with-xray";
 
 static ICON_URI: OnceLock<String> = OnceLock::new();
 
