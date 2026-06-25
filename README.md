@@ -11,7 +11,9 @@
 
 sing-box 负责 TUN、路由和大部分流量处理。直连流量由 sing-box 直接出站, 代理流量由 sing-box 转发到本地 socks 出站, 再交给 Xray 与 VPS 通信。
 
-本项目已由 [PowerShell](https://github.com/senzyo/sing-box_with_xray/tree/powershell) 迁移到 Rust, 以位于系统托盘的程序为主入口, 不提供软件主界面。运行后常驻系统托盘, 单击托盘图标即可打开菜单。
+本项目已由 PowerShell 迁移到 Rust, 原脚本方案见 [powershell](https://github.com/senzyo/sing-box_with_xray/tree/powershell) 分支。
+
+main 分支为新方案, 程序不提供软件主界面, 运行后常驻系统托盘, 单击托盘图标即可打开菜单。
 
 ## 功能
 
