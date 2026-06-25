@@ -1,2 +1,4 @@
 # 强制所有文本文件在检出时使用CRLF
 * text eol=crlf
+# 明确指定 .ico 文件为二进制，防止任何换行符转换
+*.ico binary
