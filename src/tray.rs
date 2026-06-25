@@ -78,10 +78,10 @@ pub unsafe fn create_window(h_instance: isize) -> Result<isize, String> {
     Ok(hwnd.0 as isize)
 }
 
-pub unsafe fn add_icon(hwnd: isize, h_instance: isize, work_dir: &Path) -> Result<(), String> {
+pub unsafe fn add_icon(hwnd: isize, h_instance: isize, exe_dir: &Path) -> Result<(), String> {
     let hwnd = HWND(hwnd as _);
     let h_instance = HINSTANCE(h_instance as _);
-    let icon = load_app_icon(Some(h_instance), work_dir);
+    let icon = load_app_icon(Some(h_instance), exe_dir);
     let nid = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -133,8 +133,8 @@ pub fn set_tooltip(text: &str) {
     }
 }
 
-pub(crate) unsafe fn load_icon_bitmap(work_dir: &Path, icon_name: &str) -> isize {
-    let icon_path = work_dir.join("icons").join(icon_name);
+pub(crate) unsafe fn load_icon_bitmap(exe_dir: &Path, icon_name: &str) -> isize {
+    let icon_path = exe_dir.join("icons").join(icon_name);
     if !icon_path.exists() {
         return 0;
     }
@@ -229,8 +229,8 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-unsafe fn load_app_icon(h_instance: Option<HINSTANCE>, work_dir: &Path) -> HICON {
-    let icon_path = work_dir.join("icons").join("ladder.ico");
+unsafe fn load_app_icon(h_instance: Option<HINSTANCE>, exe_dir: &Path) -> HICON {
+    let icon_path = exe_dir.join("icons").join("ladder.ico");
     if icon_path.exists() {
         let icon_path_w: Vec<u16> = icon_path.to_string_lossy().encode_utf16().chain(Some(0)).collect();
         let icon = LoadImageW(
@@ -267,7 +267,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> u16 {
 
     let sing_state = crate::sing_box_state(&app);
     let xray_state = crate::xray_state(&app);
-    let work_dir = app.work_dir.clone();
+    let exe_dir = app.exe_dir.clone();
 
     let status_hbmp = |s: ProcessState| match s {
         ProcessState::Running => app.icon_green,
@@ -308,14 +308,14 @@ unsafe fn show_tray_menu(hwnd: HWND) -> u16 {
         sing_menu,
         ConfigKind::SingBox,
         ID_SING_CONFIG_BASE,
-        &[work_dir.join("configs").join("sing-box")],
+        &[exe_dir.join("configs").join("sing-box")],
     );
     append_config_items(
         &mut app,
         xray_menu,
         ConfigKind::Xray,
         ID_XRAY_CONFIG_BASE,
-        &[work_dir.join("configs").join("xray")],
+        &[exe_dir.join("configs").join("xray")],
     );
 
     append_submenu(menu, restart_menu, "重新启动");

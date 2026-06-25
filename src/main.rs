@@ -55,7 +55,7 @@ struct ConfigAction {
 }
 
 struct AppState {
-    work_dir: PathBuf,
+    exe_dir: PathBuf,
     config_actions: HashMap<u16, ConfigAction>,
     sing_box_version: Option<String>,
     xray_version: Option<String>,
@@ -120,7 +120,8 @@ where
     }
 }
 
-fn init_logging(work_dir: &Path) -> Result<(), String> {
+fn init_logging(exe_dir: &Path) -> Result<(), String> {
+    let _ = exe_dir;
     unsafe {
         let Ok(handle) = GetStdHandle(STD_ERROR_HANDLE) else { return Ok(()); };
         let mut mode = CONSOLE_MODE::default();
@@ -140,9 +141,8 @@ fn init_logging(work_dir: &Path) -> Result<(), String> {
 
     #[cfg(debug_assertions)]
     {
-        let log_dir = work_dir.join("logs");
-        fs::create_dir_all(&log_dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
-        let file = std::fs::File::create(log_dir.join("app.log"))
+        let log_path = exe_dir.join("app.log");
+        let file = std::fs::File::create(log_path)
             .map_err(|e| format!("创建日志文件失败: {e}"))?;
         let file_layer = tracing_subscriber::fmt::layer()
             .with_ansi(false)
@@ -178,19 +178,19 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("初始化 COM 失败: {e}"))?;
     }
 
-    let work_dir = detect_work_dir();
-    let exe_path = std::env::current_exe()
-        .unwrap_or_else(|_| work_dir.join("sing-box-with-xray.exe"));
+    let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_dir = exe_path.parent().ok_or("无法获取exe目录")?.to_path_buf();
 
-    init_logging(&work_dir)?;
-    info!("程序启动, 工作目录: {}", work_dir.display());
+    init_logging(&exe_dir)?;
+    info!("程序启动, exe目录: {}", exe_dir.display());
     toast::setup(&exe_path).map_err(|e| format!("初始化 Toast 通知失败: {e}"))?;
 
-    fs::create_dir_all(work_dir.join("configs").join("sing-box")).map_err(|e| e.to_string())?;
-    fs::create_dir_all(work_dir.join("configs").join("xray")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(exe_dir.join("core")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(exe_dir.join("configs").join("sing-box")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(exe_dir.join("configs").join("xray")).map_err(|e| e.to_string())?;
 
     APP.set(Mutex::new(AppState {
-        work_dir: work_dir.clone(),
+        exe_dir: exe_dir.clone(),
         config_actions: HashMap::new(),
         sing_box_version: None,
         xray_version: None,
@@ -203,15 +203,15 @@ fn run() -> Result<(), String> {
     {
         let mut app = app_state_mut().ok_or("应用状态不可用")?;
         unsafe {
-            app.icon_green = tray::load_icon_bitmap(&app.work_dir, "green_circle.ico");
-            app.icon_yellow = tray::load_icon_bitmap(&app.work_dir, "yellow_circle.ico");
-            app.icon_red = tray::load_icon_bitmap(&app.work_dir, "red_circle.ico");
+            app.icon_green = tray::load_icon_bitmap(&exe_dir, "green_circle.ico");
+            app.icon_yellow = tray::load_icon_bitmap(&exe_dir, "yellow_circle.ico");
+            app.icon_red = tray::load_icon_bitmap(&exe_dir, "red_circle.ico");
         }
     }
 
     let tooltip = {
         let mut app = app_state_mut().ok_or("应用状态不可用")?;
-        let (sing_ver, xray_ver) = detect_versions(&app.work_dir);
+        let (sing_ver, xray_ver) = detect_versions(&app.exe_dir);
         app.sing_box_version = sing_ver;
         app.xray_version = xray_ver;
         format_tooltip(app.sing_box_version.as_deref(), app.xray_version.as_deref())
@@ -222,7 +222,7 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("获取模块句柄失败: {e}"))?
             .0 as isize;
         let hwnd = tray::create_window(h_instance)?;
-        tray::add_icon(hwnd, h_instance, &work_dir)?;
+        tray::add_icon(hwnd, h_instance, &exe_dir)?;
         tray::set_tooltip(&tooltip);
         tray::run_message_loop();
     }
@@ -244,7 +244,7 @@ fn execute_menu_command(hwnd: isize, id: u16) {
     let result = match id {
         tray::ID_RESTART_SING | tray::ID_RESTART_XRAY | tray::ID_RESTART_ALL |
         tray::ID_STOP_SING | tray::ID_STOP_XRAY | tray::ID_STOP_ALL => {
-            let work_dir = match work_dir() {
+            let exe_dir = match exe_dir() {
                 Ok(d) => d,
                 Err(e) => {
                     tray::show_error(hwnd, "操作失败", &e);
@@ -266,9 +266,9 @@ fn execute_menu_command(hwnd: isize, id: u16) {
                 };
                 info!("{label}");
                 let result = match id {
-                    tray::ID_RESTART_SING => restart_sing_box_at(&work_dir),
-                    tray::ID_RESTART_XRAY => restart_xray_at(&work_dir),
-                    tray::ID_RESTART_ALL => restart_all_at(&work_dir),
+                    tray::ID_RESTART_SING => restart_sing_box_at(&exe_dir),
+                    tray::ID_RESTART_XRAY => restart_xray_at(&exe_dir),
+                    tray::ID_RESTART_ALL => restart_all_at(&exe_dir),
                     tray::ID_STOP_SING => stop_processes(&["sing-box.exe"]),
                     tray::ID_STOP_XRAY => stop_processes(&["xray.exe"]),
                     tray::ID_STOP_ALL => stop_all(),
@@ -284,7 +284,7 @@ fn execute_menu_command(hwnd: isize, id: u16) {
             return;
         }
         tray::ID_UPDATE_ALL | tray::ID_UPDATE_SING | tray::ID_UPDATE_XRAY => {
-            let work_dir = match work_dir() {
+            let exe_dir = match exe_dir() {
                 Ok(d) => d,
                 Err(e) => {
                     tray::show_error(hwnd, "操作失败", &e);
@@ -308,12 +308,12 @@ fn execute_menu_command(hwnd: isize, id: u16) {
                 };
                 info!("{label}");
                 let result = match id {
-                    tray::ID_UPDATE_ALL => update::update_cores(&work_dir, sing_ver.as_deref(), xray_ver.as_deref()),
-                    tray::ID_UPDATE_SING => update::update_sing_box(&work_dir, sing_ver.as_deref()),
-                    tray::ID_UPDATE_XRAY => update::update_xray(&work_dir, xray_ver.as_deref()),
+                    tray::ID_UPDATE_ALL => update::update_cores(&exe_dir, sing_ver.as_deref(), xray_ver.as_deref()),
+                    tray::ID_UPDATE_SING => update::update_sing_box(&exe_dir, sing_ver.as_deref()),
+                    tray::ID_UPDATE_XRAY => update::update_xray(&exe_dir, xray_ver.as_deref()),
                     _ => unreachable!(),
                 };
-                refresh_versions_and_tooltip(&work_dir);
+                refresh_versions_and_tooltip(&exe_dir);
                 if let Err(e) = result {
                     toast::show_toast("更新失败", &e);
                 }
@@ -337,20 +337,20 @@ fn execute_menu_command(hwnd: isize, id: u16) {
     }
 }
 
-fn restart_all_at(work_dir: &Path) -> Result<(), String> {
+fn restart_all_at(exe_dir: &Path) -> Result<(), String> {
     stop_all()?;
-    start_sing_box_at(work_dir)?;
-    start_xray_at(work_dir)
+    start_sing_box_at(exe_dir)?;
+    start_xray_at(exe_dir)
 }
 
-fn restart_sing_box_at(work_dir: &Path) -> Result<(), String> {
+fn restart_sing_box_at(exe_dir: &Path) -> Result<(), String> {
     stop_processes(&["sing-box.exe"])?;
-    start_sing_box_at(work_dir)
+    start_sing_box_at(exe_dir)
 }
 
-fn restart_xray_at(work_dir: &Path) -> Result<(), String> {
+fn restart_xray_at(exe_dir: &Path) -> Result<(), String> {
     stop_processes(&["xray.exe"])?;
-    start_xray_at(work_dir)
+    start_xray_at(exe_dir)
 }
 
 fn stop_all() -> Result<(), String> {
@@ -396,11 +396,11 @@ fn kill_processes_by_name(exe_name: &str) {
     }
 }
 
-fn start_sing_box_at(work_dir: &Path) -> Result<(), String> {
+fn start_sing_box_at(exe_dir: &Path) -> Result<(), String> {
     cleanup_orphaned_wintun();
 
-    let exe = work_dir.join("sing-box.exe");
-    let config = work_dir.join("sing-box.json");
+    let exe = exe_dir.join("core").join("sing-box.exe");
+    let config = exe_dir.join("sing-box.json");
 
     ensure_exists(&exe)?;
     ensure_exists(&config)?;
@@ -409,10 +409,10 @@ fn start_sing_box_at(work_dir: &Path) -> Result<(), String> {
     info!("启动 sing-box");
     let mut child = hidden_command(exe)
         .args(["run", "-D"])
-        .arg(work_dir)
+        .arg(exe_dir)
         .arg("-c")
         .arg(config)
-        .current_dir(work_dir)
+        .current_dir(exe_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -429,9 +429,9 @@ fn start_sing_box_at(work_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn start_xray_at(work_dir: &Path) -> Result<(), String> {
-    let exe = work_dir.join("xray.exe");
-    let config = work_dir.join("xray.json");
+fn start_xray_at(exe_dir: &Path) -> Result<(), String> {
+    let exe = exe_dir.join("core").join("xray.exe");
+    let config = exe_dir.join("xray.json");
 
     ensure_exists(&exe)?;
     ensure_exists(&config)?;
@@ -440,7 +440,7 @@ fn start_xray_at(work_dir: &Path) -> Result<(), String> {
     let mut child = hidden_command(exe)
         .args(["run", "-c"])
         .arg(config)
-        .current_dir(work_dir)
+        .current_dir(exe_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -467,18 +467,18 @@ fn run_config_action(id: u16) -> Result<(), String> {
         return Ok(());
     };
 
-    let work_dir = work_dir()?;
+    let exe_dir = exe_dir()?;
     info!("切换配置: {}", action.path.display());
     match action.kind {
         ConfigKind::SingBox => {
-            fs::copy(&action.path, work_dir.join("sing-box.json"))
+            fs::copy(&action.path, exe_dir.join("sing-box.json"))
                 .map_err(|e| format!("切换 sing-box 配置失败: {e}"))?;
-            restart_sing_box_at(&work_dir)
+            restart_sing_box_at(&exe_dir)
         }
         ConfigKind::Xray => {
-            fs::copy(&action.path, work_dir.join("xray.json"))
+            fs::copy(&action.path, exe_dir.join("xray.json"))
                 .map_err(|e| format!("切换 xray 配置失败: {e}"))?;
-            restart_xray_at(&work_dir)
+            restart_xray_at(&exe_dir)
         }
     }
 }
@@ -549,7 +549,7 @@ enum ProcessState {
 }
 
 fn sing_box_state(app: &AppState) -> ProcessState {
-    if !app.work_dir.join("sing-box.exe").exists() {
+    if !app.exe_dir.join("core").join("sing-box.exe").exists() {
         return ProcessState::NotInstalled;
     }
     if is_process_running("sing-box.exe") {
@@ -560,7 +560,7 @@ fn sing_box_state(app: &AppState) -> ProcessState {
 }
 
 fn xray_state(app: &AppState) -> ProcessState {
-    if !app.work_dir.join("xray.exe").exists() {
+    if !app.exe_dir.join("core").join("xray.exe").exists() {
         return ProcessState::NotInstalled;
     }
     if is_process_running("xray.exe") {
@@ -692,45 +692,9 @@ fn find_json_configs(dirs: &[PathBuf]) -> Vec<PathBuf> {
     paths
 }
 
-fn detect_work_dir() -> PathBuf {
-    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if let Some(dir) = find_work_dir_from(&current_dir) {
-        return dir;
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if let Some(dir) = find_work_dir_from(dir) {
-                return dir;
-            }
-        }
-    }
-
-    if let Some(user_profile) = std::env::var_os("USERPROFILE") {
-        let app_dir = PathBuf::from(user_profile)
-            .join("Apps")
-            .join("sing-box-with-xray");
-        if app_dir.exists() {
-            return app_dir;
-        }
-    }
-
-    current_dir
-}
-
-fn find_work_dir_from(start: &Path) -> Option<PathBuf> {
-    start.ancestors().find_map(|dir| {
-        if dir.join("sing-box.json").exists() || dir.join("Restart.ps1").exists() {
-            Some(dir.to_path_buf())
-        } else {
-            None
-        }
-    })
-}
-
-fn work_dir() -> Result<PathBuf, String> {
+fn exe_dir() -> Result<PathBuf, String> {
     app_state()
-        .map(|app| app.work_dir.clone())
+        .map(|app| app.exe_dir.clone())
         .ok_or_else(|| "应用状态不可用".to_string())
 }
 
@@ -760,9 +724,9 @@ mod tests {
     }
 }
 
-fn detect_versions(work_dir: &Path) -> (Option<String>, Option<String>) {
-    let sing_exe = work_dir.join("sing-box.exe");
-    let xray_exe = work_dir.join("xray.exe");
+fn detect_versions(exe_dir: &Path) -> (Option<String>, Option<String>) {
+    let sing_exe = exe_dir.join("core").join("sing-box.exe");
+    let xray_exe = exe_dir.join("core").join("xray.exe");
     let sing_ver = if sing_exe.exists() {
         let v = update::get_local_version(&sing_exe, "version");
         if v != "0.0.0" { Some(v) } else { None }
@@ -786,9 +750,9 @@ fn format_tooltip(sing_ver: Option<&str>, xray_ver: Option<&str>) -> String {
     format!("{}\n{}", sing, xray)
 }
 
-fn refresh_versions_and_tooltip(work_dir: &Path) {
+fn refresh_versions_and_tooltip(exe_dir: &Path) {
     if let Some(mut app) = app_state_mut() {
-        let (sing_ver, xray_ver) = detect_versions(work_dir);
+        let (sing_ver, xray_ver) = detect_versions(exe_dir);
         app.sing_box_version = sing_ver;
         app.xray_version = xray_ver;
         let tooltip = format_tooltip(app.sing_box_version.as_deref(), app.xray_version.as_deref());
