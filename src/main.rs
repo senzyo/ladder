@@ -12,23 +12,23 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::ptr::{null, null_mut};
+use std::ptr::null;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+use windows::Win32::Foundation::{CloseHandle, HWND};
+use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::{
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, OpenProcess, TerminateProcess, PROCESS_TERMINATE,
 };
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Status, CM_Get_Device_ID_ListW, CM_Get_Device_ID_List_SizeW,
     CM_Locate_DevNodeW, CR_SUCCESS, DN_HAS_PROBLEM, DN_STARTED,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow;
+use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
 
 #[derive(Clone)]
 enum ConfigKind {
@@ -56,7 +56,7 @@ static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
 
 fn main() {
     if let Err(err) = run() {
-        tray::show_error(null_mut(), "启动失败", &err);
+        tray::show_error(0, "启动失败", &err);
     }
 }
 
@@ -104,7 +104,9 @@ fn run() -> Result<(), String> {
     };
 
     unsafe {
-        let h_instance = GetModuleHandleW(null());
+        let h_instance = GetModuleHandleW(None)
+            .map_err(|e| format!("获取模块句柄失败: {e}"))?
+            .0 as isize;
         let hwnd = tray::create_window(h_instance)?;
         tray::add_icon(hwnd, h_instance, &work_dir)?;
         tray::set_tooltip(&tooltip);
@@ -123,7 +125,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn execute_menu_command(hwnd: HWND, id: u16) {
+fn execute_menu_command(hwnd: isize, id: u16) {
     let result = match id {
         tray::ID_RESTART_SING => restart_sing_box(),
         tray::ID_RESTART_XRAY => restart_xray(),
@@ -166,7 +168,7 @@ fn execute_menu_command(hwnd: HWND, id: u16) {
         }
         tray::ID_EXIT => {
             let _ = stop_all();
-            unsafe { DestroyWindow(hwnd) };
+            unsafe { let _ = DestroyWindow(HWND(hwnd as *mut std::ffi::c_void)); }
             Ok(())
         }
         _ => run_config_action(id),
@@ -207,33 +209,31 @@ fn stop_processes(processes: &[&str]) -> Result<(), String> {
 
 fn kill_processes_by_name(exe_name: &str) {
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return;
-        }
+        };
 
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
 
-        if Process32FirstW(snapshot, &mut entry) != 0 {
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
             loop {
                 let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
                 let name_bytes = &entry.szExeFile[..end];
                 let name = String::from_utf16_lossy(name_bytes);
                 if name.eq_ignore_ascii_case(exe_name) {
-                    let handle = OpenProcess(PROCESS_TERMINATE, 0, entry.th32ProcessID);
-                    if !handle.is_null() {
-                        TerminateProcess(handle, 1);
-                        CloseHandle(handle);
+                    if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, entry.th32ProcessID) {
+                        let _ = TerminateProcess(handle, 1);
+                        let _ = CloseHandle(handle);
                     }
                 }
-                if Process32NextW(snapshot, &mut entry) == 0 {
+                if Process32NextW(snapshot, &mut entry).is_err() {
                     break;
                 }
             }
         }
 
-        CloseHandle(snapshot);
+        let _ = CloseHandle(snapshot);
     }
 }
 
@@ -344,7 +344,7 @@ fn random_hex_name() -> String {
 
 fn run_hidden_program(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
-    command.creation_flags(CREATE_NO_WINDOW);
+    command.creation_flags(CREATE_NO_WINDOW.0);
     command
 }
 
@@ -392,30 +392,29 @@ fn xray_state(app: &AppState) -> ProcessState {
 
 fn is_process_running(exe_name: &str) -> bool {
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return false;
-        }
+        };
 
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
 
-        if Process32FirstW(snapshot, &mut entry) != 0 {
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
             loop {
                 let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
                 let name_bytes = &entry.szExeFile[..end];
                 let name = String::from_utf16_lossy(name_bytes);
                 if name.eq_ignore_ascii_case(exe_name) {
-                    CloseHandle(snapshot);
+                    let _ = CloseHandle(snapshot);
                     return true;
                 }
-                if Process32NextW(snapshot, &mut entry) == 0 {
+                if Process32NextW(snapshot, &mut entry).is_err() {
                     break;
                 }
             }
         }
 
-        CloseHandle(snapshot);
+        let _ = CloseHandle(snapshot);
         false
     }
 }

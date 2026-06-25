@@ -43,7 +43,8 @@ pub const ID_EXIT: u16 = 999;
 pub const ID_SING_CONFIG_BASE: u16 = 1000;
 pub const ID_XRAY_CONFIG_BASE: u16 = 2000;
 
-pub unsafe fn create_window(h_instance: HINSTANCE) -> Result<HWND, String> {
+pub unsafe fn create_window(h_instance: isize) -> Result<isize, String> {
+    let h_instance = h_instance as HINSTANCE;
     let class_name = crate::wide("SingBoxWithXrayTrayWindow");
 
     let wnd_class = WNDCLASSW {
@@ -77,10 +78,12 @@ pub unsafe fn create_window(h_instance: HINSTANCE) -> Result<HWND, String> {
         return Err("创建托盘窗口失败".to_string());
     }
 
-    Ok(hwnd)
+    Ok(hwnd as isize)
 }
 
-pub unsafe fn add_icon(hwnd: HWND, h_instance: HINSTANCE, work_dir: &Path) -> Result<(), String> {
+pub unsafe fn add_icon(hwnd: isize, h_instance: isize, work_dir: &Path) -> Result<(), String> {
+    let hwnd = hwnd as HWND;
+    let h_instance = h_instance as HINSTANCE;
     let icon = load_app_icon(h_instance, work_dir);
     let mut nid: NOTIFYICONDATAW = zeroed();
     nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
@@ -107,7 +110,8 @@ pub unsafe fn run_message_loop() {
     }
 }
 
-pub fn show_error(hwnd: HWND, title: &str, message: &str) {
+pub fn show_error(hwnd: isize, title: &str, message: &str) {
+    let hwnd = hwnd as HWND;
     unsafe {
         let title = crate::wide(title);
         let message = crate::wide(message);
@@ -142,7 +146,7 @@ unsafe extern "system" fn wnd_proc(
             if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
                 let selected = show_tray_menu(hwnd);
                 if selected != 0 {
-                    crate::execute_menu_command(hwnd, selected);
+                    crate::execute_menu_command(hwnd as isize, selected);
                 }
             }
             0
