@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod error;
+mod settings;
 mod toast;
 mod tray;
 mod update;
@@ -62,6 +63,7 @@ struct AppState {
     icon_green: isize,
     icon_yellow: isize,
     icon_red: isize,
+    settings: settings::Settings,
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -120,8 +122,7 @@ where
     }
 }
 
-fn init_logging(exe_dir: &Path) -> Result<(), String> {
-    let _ = exe_dir;
+fn init_logging(exe_dir: &Path, log_level: &str) -> Result<(), String> {
     unsafe {
         let Ok(handle) = GetStdHandle(STD_ERROR_HANDLE) else { return Ok(()); };
         let mut mode = CONSOLE_MODE::default();
@@ -131,7 +132,7 @@ fn init_logging(exe_dir: &Path) -> Result<(), String> {
     }
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("debug"));
+        .unwrap_or_else(|_| EnvFilter::new(log_level));
 
     let console_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
@@ -139,34 +140,22 @@ fn init_logging(exe_dir: &Path) -> Result<(), String> {
         .event_format(BracketedLevel)
         .with_writer(std::io::stderr);
 
-    #[cfg(debug_assertions)]
-    {
-        let log_path = exe_dir.join("app.log");
-        let file = std::fs::File::create(log_path)
-            .map_err(|e| format!("创建日志文件失败: {e}"))?;
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_target(false)
-            .compact()
-            .event_format(BracketedLevel)
-            .with_writer(file);
+    let log_path = exe_dir.join("app.log");
+    let file = std::fs::File::create(log_path)
+        .map_err(|e| format!("创建日志文件失败: {e}"))?;
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(false)
+        .compact()
+        .event_format(BracketedLevel)
+        .with_writer(file);
 
-        tracing_subscriber::registry()
-            .with(file_layer)
-            .with(console_layer)
-            .with(filter)
-            .try_init()
-            .map_err(|e| format!("初始化日志系统失败: {e}"))?;
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        tracing_subscriber::registry()
-            .with(console_layer)
-            .with(filter)
-            .try_init()
-            .map_err(|e| format!("初始化日志系统失败: {e}"))?;
-    }
+    tracing_subscriber::registry()
+        .with(file_layer)
+        .with(console_layer)
+        .with(filter)
+        .try_init()
+        .map_err(|e| format!("初始化日志系统失败: {e}"))?;
 
     Ok(())
 }
@@ -181,13 +170,15 @@ fn run() -> Result<(), String> {
     let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe_dir = exe_path.parent().ok_or("无法获取exe目录")?.to_path_buf();
 
-    init_logging(&exe_dir)?;
-    info!("程序启动, exe目录: {}", exe_dir.display());
-    toast::setup(&exe_path).map_err(|e| format!("初始化 Toast 通知失败: {e}"))?;
-
     fs::create_dir_all(exe_dir.join("core")).map_err(|e| e.to_string())?;
     fs::create_dir_all(exe_dir.join("configs").join("sing-box")).map_err(|e| e.to_string())?;
     fs::create_dir_all(exe_dir.join("configs").join("xray")).map_err(|e| e.to_string())?;
+
+    let app_settings = settings::Settings::load(&exe_dir);
+
+    init_logging(&exe_dir, &app_settings.log.level)?;
+    info!("程序启动, exe目录: {}", exe_dir.display());
+    toast::setup(&exe_path).map_err(|e| format!("初始化 Toast 通知失败: {e}"))?;
 
     APP.set(Mutex::new(AppState {
         exe_dir: exe_dir.clone(),
@@ -197,6 +188,7 @@ fn run() -> Result<(), String> {
         icon_green: 0,
         icon_yellow: 0,
         icon_red: 0,
+        settings: app_settings,
     }))
     .map_err(|_| "初始化状态失败".to_string())?;
 
@@ -295,6 +287,11 @@ fn execute_menu_command(hwnd: isize, id: u16) {
                 let app = app_state().expect("应用状态不可用");
                 (app.sing_box_version.clone(), app.xray_version.clone())
             };
+            let (gh_enabled, gh_url, max_retries, retry_delay) = {
+                let app = app_state().expect("应用状态不可用");
+                let s = &app.settings;
+                (s.gh_proxy.enabled, s.gh_proxy.url.clone(), s.download.max_retries, s.download.retry_delay_secs)
+            };
             let _ = stop_all();
             std::thread::spawn(move || {
                 unsafe {
@@ -308,9 +305,9 @@ fn execute_menu_command(hwnd: isize, id: u16) {
                 };
                 info!("{label}");
                 let result = match id {
-                    tray::ID_UPDATE_ALL => update::update_cores(&exe_dir, sing_ver.as_deref(), xray_ver.as_deref()),
-                    tray::ID_UPDATE_SING => update::update_sing_box(&exe_dir, sing_ver.as_deref()),
-                    tray::ID_UPDATE_XRAY => update::update_xray(&exe_dir, xray_ver.as_deref()),
+                    tray::ID_UPDATE_ALL => update::update_cores(&exe_dir, sing_ver.as_deref(), xray_ver.as_deref(), gh_enabled, &gh_url, max_retries, retry_delay),
+                    tray::ID_UPDATE_SING => update::update_sing_box(&exe_dir, sing_ver.as_deref(), gh_enabled, &gh_url, max_retries, retry_delay),
+                    tray::ID_UPDATE_XRAY => update::update_xray(&exe_dir, xray_ver.as_deref(), gh_enabled, &gh_url, max_retries, retry_delay),
                     _ => unreachable!(),
                 };
                 refresh_versions_and_tooltip(&exe_dir);

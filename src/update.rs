@@ -5,21 +5,23 @@ use std::io::{self, BufReader, Read};
 use std::path::Path;
 use std::process::Command;
 
-const GH_PROXY: &str = "https://gh-proxy.com/";
-const USER_AGENT: &str = "sing-box-with-xray";
-const MAX_RETRIES: u32 = 3;
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0";
 
 pub fn update_cores(
     exe_dir: &Path,
     sing_ver: Option<&str>,
     xray_ver: Option<&str>,
+    gh_proxy_enabled: bool,
+    gh_proxy_url: &str,
+    max_retries: u32,
+    retry_delay_secs: u64,
 ) -> Result<(), String> {
     let exe_dir = exe_dir.to_path_buf();
-    update_sing_box(&exe_dir, sing_ver)?;
-    update_xray(&exe_dir, xray_ver)
+    update_sing_box(&exe_dir, sing_ver, gh_proxy_enabled, gh_proxy_url, max_retries, retry_delay_secs)?;
+    update_xray(&exe_dir, xray_ver, gh_proxy_enabled, gh_proxy_url, max_retries, retry_delay_secs)
 }
 
-pub fn update_sing_box(exe_dir: &Path, local_version: Option<&str>) -> Result<(), String> {
+pub fn update_sing_box(exe_dir: &Path, local_version: Option<&str>, gh_proxy_enabled: bool, gh_proxy_url: &str, max_retries: u32, retry_delay_secs: u64) -> Result<(), String> {
     let exe_path = exe_dir.join("core").join("sing-box.exe");
     let api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
 
@@ -53,6 +55,10 @@ pub fn update_sing_box(exe_dir: &Path, local_version: Option<&str>) -> Result<()
         &download_url,
         &zip_path,
         expected_hash.as_deref(),
+        gh_proxy_enabled,
+        gh_proxy_url,
+        max_retries,
+        retry_delay_secs,
     )
     .is_err()
     {
@@ -68,7 +74,7 @@ pub fn update_sing_box(exe_dir: &Path, local_version: Option<&str>) -> Result<()
     Ok(())
 }
 
-pub fn update_xray(exe_dir: &Path, local_version: Option<&str>) -> Result<(), String> {
+pub fn update_xray(exe_dir: &Path, local_version: Option<&str>, gh_proxy_enabled: bool, gh_proxy_url: &str, max_retries: u32, retry_delay_secs: u64) -> Result<(), String> {
     let exe_path = exe_dir.join("core").join("xray.exe");
     let api_url = "https://api.github.com/repos/XTLS/Xray-core/releases/latest";
 
@@ -102,6 +108,10 @@ pub fn update_xray(exe_dir: &Path, local_version: Option<&str>) -> Result<(), St
         &download_url,
         &zip_path,
         expected_hash.as_deref(),
+        gh_proxy_enabled,
+        gh_proxy_url,
+        max_retries,
+        retry_delay_secs,
     )
     .is_err()
     {
@@ -222,15 +232,23 @@ fn download_with_retry(
     download_url: &str,
     dest: &Path,
     expected_hash: Option<&str>,
+    gh_proxy_enabled: bool,
+    gh_proxy_url: &str,
+    max_retries: u32,
+    retry_delay_secs: u64,
 ) -> Result<(), String> {
-    let proxy_url = format!("{GH_PROXY}{download_url}");
+    let url = if gh_proxy_enabled {
+        format!("{gh_proxy_url}{download_url}")
+    } else {
+        download_url.to_string()
+    };
 
-    for attempt in 1..=MAX_RETRIES {
+    for attempt in 1..=max_retries {
         if attempt > 1 {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(std::time::Duration::from_secs(retry_delay_secs));
         }
 
-        download_file(&proxy_url, dest)?;
+        download_file(&url, dest)?;
 
         match expected_hash {
             Some(expected) => {
