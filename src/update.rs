@@ -323,3 +323,50 @@ fn replace_exe_from_zip(
 
     Err(format!("在 zip 中未找到: {exe_name_in_zip}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_version_simple() {
+        assert_eq!(extract_version("sing-box version 1.13.13"), Some("1.13.13".into()));
+        assert_eq!(extract_version("Xray 24.12.18"), Some("24.12.18".into()));
+        assert_eq!(extract_version("v1.0.0"), Some("1.0.0".into()));
+    }
+
+    #[test]
+    fn test_extract_version_edge_cases() {
+        assert_eq!(extract_version("no version here"), None);
+        assert_eq!(extract_version("123"), None);
+        assert_eq!(extract_version("version 1.2.3-beta"), Some("1.2.3".into()));
+        assert_eq!(extract_version("1.2.3.4"), Some("1.2.3.4".into()));
+    }
+
+    #[test]
+    fn test_is_newer_true() {
+        assert!(is_newer("1.0.0", "1.0.1"));
+        assert!(is_newer("1.0.0", "1.1.0"));
+        assert!(is_newer("1.0.0", "2.0.0"));
+        assert!(is_newer("1.0.9", "1.0.10"));
+        assert!(is_newer("0.0.0", "1.0.0"));
+    }
+
+    #[test]
+    fn test_is_newer_false_equal() {
+        assert!(!is_newer("1.0.0", "1.0.0"));
+        assert!(!is_newer("2.0.0", "2.0.0"));
+    }
+
+    #[test]
+    fn test_is_newer_false_older() {
+        assert!(!is_newer("2.0.0", "1.0.0"));
+        assert!(!is_newer("1.0.1", "1.0.0"));
+    }
+
+    #[test]
+    fn test_is_newer_different_lengths() {
+        assert!(is_newer("1.0", "1.0.1"));
+        assert!(!is_newer("1.0.1", "1.0"));
+    }
+}

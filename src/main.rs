@@ -622,6 +622,20 @@ fn wide(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain(Some(0)).collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_random_hex_name() {
+        let name1 = random_hex_name();
+        let name2 = random_hex_name();
+        assert_eq!(name1.len(), 6);
+        assert!(name1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(name1, name2);
+    }
+}
+
 fn detect_versions(work_dir: &Path) -> (Option<String>, Option<String>) {
     let sing_exe = work_dir.join("sing-box.exe");
     let xray_exe = work_dir.join("xray.exe");
