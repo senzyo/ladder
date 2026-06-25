@@ -265,12 +265,20 @@ fn download_file(url: &str, dest: &Path) -> Result<(), String> {
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
+    use std::io::Read;
     let mut file =
         fs::File::open(path).map_err(|e| format!("打开文件计算 SHA256 失败: {e}"))?;
     let mut hasher = Sha256::new();
-    io::copy(&mut file, &mut hasher).map_err(|e| format!("计算 SHA256 失败: {e}"))?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("读取文件计算 SHA256 失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        Digest::update(&mut hasher, &buf[..n]);
+    }
     let hash = hasher.finalize();
-    Ok(format!("{hash:x}"))
+    Ok(hash.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn replace_exe_from_zip(
