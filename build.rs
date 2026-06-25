@@ -28,9 +28,17 @@ fn main() {
 
         let mut resource = winresource::WindowsResource::new();
         resource.set_manifest(manifest);
-        resource.set_icon("icon/ladder.ico");
+        resource.set_icon("icons/ladder.ico");
         resource
             .compile()
             .expect("failed to compile Windows resources");
+
+        let out_dir = std::env::var("OUT_DIR").unwrap();
+        let profile_dir = std::path::Path::new(&out_dir)
+            .parent().and_then(|p| p.parent()).and_then(|p| p.parent())
+            .expect("failed to resolve target profile dir");
+        let icons_dest = profile_dir.join("icons");
+        let _ = std::fs::create_dir_all(&icons_dest);
+        let _ = std::fs::copy("icons/ladder.ico", icons_dest.join("ladder.ico"));
     }
 }

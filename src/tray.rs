@@ -134,7 +134,7 @@ pub fn set_tooltip(text: &str) {
 }
 
 pub(crate) unsafe fn load_icon_bitmap(work_dir: &Path, icon_name: &str) -> isize {
-    let icon_path = work_dir.join("icon").join(icon_name);
+    let icon_path = work_dir.join("icons").join(icon_name);
     if !icon_path.exists() {
         return 0;
     }
@@ -230,7 +230,7 @@ unsafe extern "system" fn wnd_proc(
 }
 
 unsafe fn load_app_icon(h_instance: Option<HINSTANCE>, work_dir: &Path) -> HICON {
-    let icon_path = work_dir.join("icon").join("ladder.ico");
+    let icon_path = work_dir.join("icons").join("ladder.ico");
     if icon_path.exists() {
         let icon_path_w: Vec<u16> = icon_path.to_string_lossy().encode_utf16().chain(Some(0)).collect();
         let icon = LoadImageW(

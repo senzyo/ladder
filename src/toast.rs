@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use windows::core::{HSTRING, Interface};
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
@@ -10,6 +11,9 @@ use windows::Win32::UI::Shell::{
 };
 
 const AUMID: &str = "SingBoxWithXray";
+const SHORTCUT_NAME: &str = "sing-box_with_xray";
+
+static ICON_URI: OnceLock<String> = OnceLock::new();
 
 // ═══════════════════════════════════════════════
 // Public API
@@ -20,14 +24,19 @@ pub fn setup(exe_path: &std::path::Path) -> Result<(), String> {
         SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(AUMID))
             .map_err(|e| format!("设置 AUMID 失败: {e}"))?;
     }
-    ensure_shortcut(exe_path)?;
+    let icon_path = exe_path.parent().unwrap_or(exe_path).join("icons").join("ladder.ico");
+    let _ = ICON_URI.set(format!(
+        "file:///{}",
+        icon_path.to_string_lossy().replace('\\', "/")
+    ));
+    ensure_shortcut(exe_path, &icon_path)?;
     Ok(())
 }
 
 pub fn show_toast(title: &str, message: &str) {
     let xml = format!(
-        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual><audio silent=\"true\"/></toast>",
-        xml_escape(title), xml_escape(message),
+        "<toast><visual><binding template=\"ToastGeneric\">{}<text>{}</text><text>{}</text></binding></visual><audio silent=\"true\"/></toast>",
+        icon_element(), xml_escape(title), xml_escape(message),
     );
     if let Err(e) = show_toast_xml(&xml, None) {
         fallback_msgbox(title, &e);
@@ -36,8 +45,8 @@ pub fn show_toast(title: &str, message: &str) {
 
 pub fn show_toast_tagged(title: &str, message: &str, tag: &str) {
     let xml = format!(
-        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual><audio silent=\"true\"/></toast>",
-        xml_escape(title), xml_escape(message),
+        "<toast><visual><binding template=\"ToastGeneric\">{}<text>{}</text><text>{}</text></binding></visual><audio silent=\"true\"/></toast>",
+        icon_element(), xml_escape(title), xml_escape(message),
     );
     if let Err(e) = show_toast_xml(&xml, Some(tag)) {
         fallback_msgbox(title, &e);
@@ -46,8 +55,8 @@ pub fn show_toast_tagged(title: &str, message: &str, tag: &str) {
 
 pub fn show_progress_toast(title: &str, tag: &str) {
     let xml = format!(
-        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><progress title=\"下载中\" value=\"indeterminate\" valueStringOverride=\"准备下载...\" status=\"\"/></binding></visual><audio silent=\"true\"/></toast>",
-        xml_escape(title),
+        "<toast><visual><binding template=\"ToastGeneric\">{}<text>{}</text><progress title=\"下载中\" value=\"indeterminate\" valueStringOverride=\"准备下载...\" status=\"\"/></binding></visual><audio silent=\"true\"/></toast>",
+        icon_element(), xml_escape(title),
     );
     if let Err(e) = show_toast_xml(&xml, Some(tag)) {
         fallback_msgbox(title, &e);
@@ -57,6 +66,14 @@ pub fn show_progress_toast(title: &str, tag: &str) {
 // ═══════════════════════════════════════════════
 // Internal helpers
 // ═══════════════════════════════════════════════
+
+fn icon_element() -> String {
+    let uri = ICON_URI.get().map(|s| s.as_str()).unwrap_or("");
+    if uri.is_empty() {
+        return String::new();
+    }
+    format!("<image placement=\"appLogoOverride\" src=\"{}\"/>", uri)
+}
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -101,16 +118,23 @@ fn fallback_msgbox(title: &str, err: &str) {
 // Shortcut (windows crate IShellLinkW + windows-sys property store)
 // ═══════════════════════════════════════════════
 
-fn ensure_shortcut(exe_path: &std::path::Path) -> Result<(), String> {
+fn ensure_shortcut(exe_path: &std::path::Path, icon_path: &std::path::Path) -> Result<(), String> {
     let programs_dir = get_programs_dir()?;
-    let lnk_path = programs_dir.join(format!("{}.lnk", AUMID));
+    let lnk_path = programs_dir.join(format!("{}.lnk", SHORTCUT_NAME));
+
+    let old_lnk = programs_dir.join(format!("{}.lnk", AUMID));
+    if old_lnk.exists() && old_lnk != lnk_path {
+        let _ = std::fs::remove_file(&old_lnk);
+    }
+
     std::fs::create_dir_all(&programs_dir)
         .map_err(|e| format!("创建 Programs 目录失败: {e}"))?;
-    create_shortcut(exe_path, &lnk_path)
+    create_shortcut(exe_path, icon_path, &lnk_path)
 }
 
 fn create_shortcut(
     exe_path: &std::path::Path,
+    icon_path: &std::path::Path,
     lnk_path: &std::path::Path,
 ) -> Result<(), String> {
     unsafe {
@@ -125,6 +149,9 @@ fn create_shortcut(
                 .SetWorkingDirectory(&HSTRING::from(parent.to_string_lossy().as_ref()))
                 .map_err(|e| format!("设置工作目录失败: {e}"))?;
         }
+        shell_link
+            .SetIconLocation(&HSTRING::from(icon_path.to_string_lossy().as_ref()), 0)
+            .map_err(|e| format!("设置图标路径失败: {e}"))?;
         let persist: IPersistFile = shell_link.cast()
             .map_err(|e| format!("获取 IPersistFile 失败: {e}"))?;
         persist
