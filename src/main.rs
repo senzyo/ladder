@@ -142,10 +142,11 @@ where
 fn init_logging(exe_dir: &Path, log_level: &str) -> Result<(), String> {
     // 启用 Windows Terminal 的 ANSI 转义码处理，否则颜色代码会显示为乱码
     unsafe {
-        let Ok(handle) = GetStdHandle(STD_ERROR_HANDLE) else { return Ok(()); };
-        let mut mode = CONSOLE_MODE::default();
-        if GetConsoleMode(handle, &mut mode).is_ok() {
-            let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        if let Ok(handle) = GetStdHandle(STD_ERROR_HANDLE) {
+            let mut mode = CONSOLE_MODE::default();
+            if GetConsoleMode(handle, &mut mode).is_ok() {
+                let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
         }
     }
 
