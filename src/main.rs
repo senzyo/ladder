@@ -365,6 +365,18 @@ fn execute_menu_command(hwnd: isize, id: u16) {
             });
             return;
         }
+        tray::ID_OPEN_DIR => {
+            let exe_dir = match exe_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    error!("获取 exe 目录失败: {e}");
+                    return;
+                }
+            };
+            debug!("打开程序目录: {}", exe_dir.display());
+            let _ = Command::new("explorer").arg(&exe_dir).spawn();
+            return;
+        }
         tray::ID_EXIT => {
             info!("退出程序");
             if let Err(e) = stop_all() {

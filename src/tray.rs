@@ -50,6 +50,7 @@ pub const ID_STOP_ALL: u16 = 203;
 pub const ID_UPDATE_ALL: u16 = 301;
 pub const ID_UPDATE_SING: u16 = 302;
 pub const ID_UPDATE_XRAY: u16 = 303;
+pub const ID_OPEN_DIR: u16 = 998;
 pub const ID_EXIT: u16 = 999;
 pub const ID_SING_CONFIG_BASE: u16 = 1000;
 pub const ID_XRAY_CONFIG_BASE: u16 = 2000;
@@ -352,6 +353,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> u16 {
     append_submenu(menu, sing_menu, "切换 sing-box 配置");
     append_submenu(menu, xray_menu, "切换 xray 配置");
     append_separator(menu);
+    append_item(menu, ID_OPEN_DIR, "打开程序目录");
     append_item(menu, ID_EXIT, "退出并终止");
 
     let mut point = POINT::default();
