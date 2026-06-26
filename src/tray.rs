@@ -24,9 +24,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMenuItemCount, GetMessageW,
     HICON, HMENU, IDI_APPLICATION, IMAGE_ICON, LoadIconW, LoadImageW,
     LR_DEFAULTSIZE, LR_LOADFROMFILE, MB_ICONERROR, MB_OK, MENUITEMINFOW, MIIM_BITMAP,
-    MessageBoxW, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage,
+    MessageBoxW, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
     RegisterClassW, SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenu, TranslateMessage,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONUP,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
     WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED, DI_NORMAL,
 };
 
@@ -365,6 +365,8 @@ unsafe fn show_tray_menu(hwnd: HWND) -> u16 {
         hwnd,
         None,
     );
+    // 必须发送 WM_NULL 以正确结束菜单交互，否则点击外部时菜单可能卡住
+    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
 
     let _ = DestroyMenu(menu);
 
