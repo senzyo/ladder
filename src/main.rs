@@ -378,7 +378,7 @@ fn execute_menu_command(hwnd: isize, id: u16) {
 
     if let Err(err) = result {
         error!("菜单命令执行失败: {err}");
-        tray::show_error(hwnd, "操作失败", &err);
+        toast::show_toast("操作失败", &err);
     }
 }
 
@@ -609,10 +609,10 @@ extern "system" {
 /// 刷新 DNS 缓存。代理进程终止后，残留的 DNS 缓存可能导致解析失败。
 fn flush_dns() {
     let result = unsafe { DnsFlushResolverCache() };
-    if result == 0 {
+    if result != 0 {
         debug!("DNS 缓存刷新成功");
     } else {
-        warn!("DNS 缓存刷新失败: 返回码 {result}");
+        warn!("DNS 缓存刷新失败");
     }
 }
 
