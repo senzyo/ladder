@@ -1,6 +1,6 @@
 [package]
 name = "sing-box_with_xray"
-version = "2.3.3"
+version = "2.3.4"
 edition = "2024"
 build = "build.rs"
 
