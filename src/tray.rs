@@ -26,7 +26,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR};
 
-use crate::{AppError, ConfigAction, ConfigKind, ProcessState};
+use crate::error::AppError;
+use crate::state::{self, ConfigAction, ConfigKind, ProcessState};
 use tracing::warn;
 
 /// 托盘图标的自定义消息 ID，当托盘收到鼠标事件时通过此消息通知窗口。
@@ -55,7 +56,7 @@ pub const ID_XRAY_CONFIG_BASE: u16 = 2000;
 pub unsafe fn create_window(h_instance: isize) -> Result<isize, AppError> {
     unsafe {
         let h_instance = HINSTANCE(h_instance as _);
-        let class_name = crate::wide("SingBoxWithXrayTrayWindow");
+        let class_name = state::wide("SingBoxWithXrayTrayWindow");
 
         let wnd_class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -69,7 +70,7 @@ pub unsafe fn create_window(h_instance: isize) -> Result<isize, AppError> {
             return Err(AppError::Msg("注册托盘窗口类失败".into()));
         }
 
-        let title = crate::wide("sing-box_with_xray");
+        let title = state::wide("sing-box_with_xray");
         let hwnd = CreateWindowExW(
             Default::default(),
             PCWSTR(class_name.as_ptr()),
@@ -297,13 +298,13 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
     unsafe {
         let (sing_state, xray_state, exe_dir, icon_green, icon_yellow, icon_red) = {
-            let app = match crate::app_state() {
+            let app = match state::app_state() {
                 Some(app) => app,
                 None => return (0, HashMap::new()),
             };
             (
-                crate::sing_box_state(&app),
-                crate::xray_state(&app),
+                state::sing_box_state(&app),
+                state::xray_state(&app),
                 app.exe_dir.clone(),
                 app.icon_green,
                 app.icon_yellow,
@@ -405,14 +406,14 @@ unsafe fn append_separator(menu: HMENU) {
 
 unsafe fn append_item(menu: HMENU, id: u16, label: &str) {
     unsafe {
-        let w = crate::wide(label);
+        let w = state::wide(label);
         let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(w.as_ptr()));
     }
 }
 
 unsafe fn append_disabled_item(menu: HMENU, label: &str) {
     unsafe {
-        let w = crate::wide(label);
+        let w = state::wide(label);
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(w.as_ptr()));
     }
 }
@@ -422,7 +423,7 @@ unsafe fn append_disabled_item(menu: HMENU, label: &str) {
 /// 这是 Win32 菜单项附加位图的标准做法。
 unsafe fn append_status_item(menu: HMENU, label: &str, hbmp: isize) {
     unsafe {
-        let w = crate::wide(label);
+        let w = state::wide(label);
         let position = GetMenuItemCount(Some(menu)) as u32;
         let _ = AppendMenuW(menu, MF_STRING, 0, PCWSTR(w.as_ptr()));
 
@@ -442,7 +443,7 @@ unsafe fn append_status_item(menu: HMENU, label: &str, hbmp: isize) {
 
 unsafe fn append_submenu(menu: HMENU, submenu: HMENU, label: &str) {
     unsafe {
-        let w = crate::wide(label);
+        let w = state::wide(label);
         let _ = AppendMenuW(menu, MF_STRING | MF_POPUP, submenu.0 as usize, PCWSTR(w.as_ptr()));
     }
 }
@@ -452,7 +453,7 @@ unsafe fn append_config_items(map: &mut HashMap<u16, ConfigAction>, menu: HMENU,
     unsafe {
         let mut added = 0;
 
-        for (id, path) in (base_id..).zip(crate::find_json_configs(dirs)) {
+        for (id, path) in (base_id..).zip(state::find_json_configs(dirs)) {
             if id >= base_id + 900 {
                 break;
             }
@@ -480,7 +481,7 @@ unsafe fn append_config_items(map: &mut HashMap<u16, ConfigAction>, menu: HMENU,
 /// NOTIFYICONDATAW.szTip 要求 128 个 u16 的固定长度数组。
 fn to_wide_padded<const N: usize>(s: &str) -> [u16; N] {
     let mut buf = [0u16; N];
-    let wide = crate::wide(s);
+    let wide = state::wide(s);
     let len = wide.len().saturating_sub(1).min(N - 1);
     buf[..len].copy_from_slice(&wide[..len]);
     buf
