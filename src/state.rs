@@ -143,9 +143,34 @@ pub fn find_pids_by_name(exe_name: &str) -> Vec<u32> {
     pids
 }
 
-/// 检查指定名称的进程是否正在运行。
+/// 检查指定名称的进程是否正在运行（找到第一个即返回）。
 pub fn is_process_running(exe_name: &str) -> bool {
-    !find_pids_by_name(exe_name).is_empty()
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return false;
+        };
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                if name.eq_ignore_ascii_case(exe_name) {
+                    let _ = CloseHandle(snapshot);
+                    return true;
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    false
 }
 
 /// 查询 sing-box 进程运行状态。

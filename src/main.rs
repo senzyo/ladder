@@ -20,7 +20,6 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
-use time::OffsetDateTime;
 use tracing::{Event, debug, error, info, warn};
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
@@ -90,23 +89,78 @@ where
     N: for<'a> FormatFields<'a> + 'static,
 {
     fn format_event(&self, ctx: &FmtContext<'_, S, N>, mut writer: Writer<'_>, event: &Event<'_>) -> std::fmt::Result {
-        let now = OffsetDateTime::now_utc();
         let level = event.metadata().level();
         let color = level_color(level);
         let reset = if writer.has_ansi_escapes() { ANSI_RESET } else { "" };
         let lc = if writer.has_ansi_escapes() { color } else { "" };
-        write!(
-            &mut writer,
-            "{}{:03}Z [{lc}{level}{reset}] ",
-            now.format(time::macros::format_description!(
-                "[year]-[month]-[day]T[hour]:[minute]:[second]"
-            ))
-            .map_err(|_| std::fmt::Error)?,
-            now.millisecond(),
-        )?;
+        let ts = format_utc_timestamp();
+        write!(&mut writer, "{ts} [{lc}{level}{reset}] ")?;
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }
+}
+
+/// 将当前 UTC 时间格式化为 `YYYY-MM-DDTHH:MM:SS.mmmZ`。
+fn format_utc_timestamp() -> String {
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    let millis = dur.subsec_millis();
+
+    // 秒 → UTC 时间组件（简化算法，适用于 1970-2100）
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+
+    // 天数 → 年/月/日
+    let (year, month, day) = days_to_ymd(days);
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// 将自 UNIX 纪元以来的天数转换为年、月、日。
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    // 先估算年份
+    let mut year = 1970 + days / 365;
+    // 微调：计算该年之前的总天数
+    loop {
+        let prev_days = days_before_year(year);
+        if prev_days > days {
+            year -= 1;
+        } else {
+            days -= prev_days;
+            break;
+        }
+    }
+
+    // 月份天数（非闰年）
+    let month_days = [31u64, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let leap = is_leap(year);
+
+    let mut month = 1u64;
+    for (i, &md) in month_days.iter().enumerate() {
+        let dim = if i == 1 && leap { 29 } else { md };
+        if days < dim {
+            month = i as u64 + 1;
+            break;
+        }
+        days -= dim;
+    }
+
+    (year, month, days + 1)
+}
+
+/// 1970-01-01 到指定年份 01-01 的天数。
+fn days_before_year(year: u64) -> u64 {
+    let y = year - 1970;
+    y * 365 + y / 4 - y / 100 + y / 400
+}
+
+fn is_leap(year: u64) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 /// 初始化日志系统。
@@ -188,26 +242,21 @@ fn run() -> Result<(), AppError> {
     );
     toast::setup(&exe_path).map_err(|e| AppError::Msg(format!("初始化 Toast 通知失败: {e}")))?;
 
+    let icon_green = unsafe { tray::load_icon_bitmap(&exe_dir, "green_circle.ico") };
+    let icon_yellow = unsafe { tray::load_icon_bitmap(&exe_dir, "yellow_circle.ico") };
+    let icon_red = unsafe { tray::load_icon_bitmap(&exe_dir, "red_circle.ico") };
+
     state::APP
         .set(Mutex::new(state::AppState {
             exe_dir: exe_dir.clone(),
-            icon_green: 0,
-            icon_yellow: 0,
-            icon_red: 0,
+            icon_green,
+            icon_yellow,
+            icon_red,
             settings: app_settings,
             child_sing_box: None,
             child_xray: None,
         }))
         .map_err(|_| AppError::Msg("初始化状态失败".into()))?;
-
-    {
-        let mut app = state::app_state_mut().ok_or(AppError::Msg("应用状态不可用".into()))?;
-        unsafe {
-            app.icon_green = tray::load_icon_bitmap(&exe_dir, "green_circle.ico");
-            app.icon_yellow = tray::load_icon_bitmap(&exe_dir, "yellow_circle.ico");
-            app.icon_red = tray::load_icon_bitmap(&exe_dir, "red_circle.ico");
-        }
-    }
 
     unsafe {
         let h_instance = GetModuleHandleW(None)

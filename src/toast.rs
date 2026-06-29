@@ -43,19 +43,11 @@ pub fn setup(exe_path: &std::path::Path) -> Result<(), AppError> {
 
 /// 显示 Toast 通知，失败时回退到 MessageBox。
 pub fn show_toast(title: &str, message: &str) {
-    let xml = format!(
-        "<toast><visual><binding template=\"ToastGeneric\">{}<text>{}</text><text>{}</text></binding></visual><audio silent=\"true\"/></toast>",
-        icon_element(),
-        xml_escape(title),
-        xml_escape(message),
-    );
-    if let Err(e) = show_toast_xml(&xml, None) {
-        error!("Toast 通知失败: {e}");
-        fallback_msgbox(title, &e.to_string());
-    }
+    show_toast_tagged(title, message, "");
 }
 
 /// 显示带 tag 的 Toast 通知，相同 tag 会替换之前的通知。
+/// tag 为空字符串时不设置 tag。
 pub fn show_toast_tagged(title: &str, message: &str, tag: &str) {
     let xml = format!(
         "<toast><visual><binding template=\"ToastGeneric\">{}<text>{}</text><text>{}</text></binding></visual><audio silent=\"true\"/></toast>",
@@ -63,8 +55,8 @@ pub fn show_toast_tagged(title: &str, message: &str, tag: &str) {
         xml_escape(title),
         xml_escape(message),
     );
-    if let Err(e) = show_toast_xml(&xml, Some(tag)) {
-        error!("Toast 通知失败 (tag={tag}): {e}");
+    if let Err(e) = show_toast_xml(&xml, if tag.is_empty() { None } else { Some(tag) }) {
+        error!("Toast 通知失败: {e}");
         fallback_msgbox(title, &e.to_string());
     }
 }
@@ -124,8 +116,8 @@ fn show_toast_xml(xml_str: &str, tag: Option<&str>) -> Result<(), AppError> {
 fn fallback_msgbox(title: &str, err: &str) {
     let msg = format!("Toast 通知失败: {err}");
     unsafe {
-        let title_wide: Vec<u16> = std::ffi::OsStr::new(title).encode_wide().chain(Some(0)).collect();
-        let msg_wide: Vec<u16> = std::ffi::OsStr::new(&msg).encode_wide().chain(Some(0)).collect();
+        let title_wide = crate::state::wide(title);
+        let msg_wide = crate::state::wide(&msg);
         windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
             std::ptr::null_mut(),
             msg_wide.as_ptr(),

@@ -41,6 +41,19 @@ pub fn hidden_command(program: impl AsRef<OsStr>) -> Command {
 // 进程启动
 // ═══════════════════════════════════════════════
 
+/// 将子进程的 stderr 重定向到日志输出。
+fn forward_stderr(child: &mut std::process::Child, label: &str) {
+    if let Some(stderr) = child.stderr.take() {
+        let label = label.to_owned();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                warn!("[{label}] {line}");
+            }
+        });
+    }
+}
+
 /// 启动 sing-box 子进程。启动前清理孤立 WinTUN 设备并随机化 TUN 接口名。
 pub fn start_sing_box_at(exe_dir: &Path) -> Result<(), AppError> {
     cleanup_orphaned_wintun();
@@ -63,14 +76,7 @@ pub fn start_sing_box_at(exe_dir: &Path) -> Result<(), AppError> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| AppError::Msg(format!("启动 sing-box 失败: {e}")))?;
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                warn!("[sing-box] {line}");
-            }
-        });
-    }
+    forward_stderr(&mut child, "sing-box");
     if let Some(mut app) = state::app_state_mut() {
         app.child_sing_box = Some(child);
     }
@@ -95,14 +101,7 @@ pub fn start_xray_at(exe_dir: &Path) -> Result<(), AppError> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| AppError::Msg(format!("启动 xray 失败: {e}")))?;
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                warn!("[xray] {line}");
-            }
-        });
-    }
+    forward_stderr(&mut child, "xray");
     if let Some(mut app) = state::app_state_mut() {
         app.child_xray = Some(child);
     }
@@ -122,27 +121,29 @@ pub fn stop_all() -> Result<(), AppError> {
 /// 终止指定进程列表。先通过保存的 Child 句柄直接 kill，
 /// 再通过进程名枚举兜底（覆盖其他来源启动的同名进程）。
 pub fn stop_processes(processes: &[&str]) -> Result<(), AppError> {
-    // 先通过保存的 Child 句柄直接 kill
-    if let Some(mut app) = state::app_state_mut() {
-        for process in processes {
-            match *process {
-                "sing-box.exe" => {
-                    if let Some(ref mut child) = app.child_sing_box {
-                        let _ = child.kill();
-                    }
-                    app.child_sing_box = None;
-                }
-                "xray.exe" => {
-                    if let Some(ref mut child) = app.child_xray {
-                        let _ = child.kill();
-                    }
-                    app.child_xray = None;
-                }
-                _ => {}
-            }
+    // 阶段 1：从 mutex 中取出 Child 句柄（持锁时间极短）
+    let children: Vec<(String, Option<std::process::Child>)> = match state::app_state_mut() {
+        Some(mut app) => processes
+            .iter()
+            .map(|&p| {
+                let child = match p {
+                    "sing-box.exe" => app.child_sing_box.take(),
+                    "xray.exe" => app.child_xray.take(),
+                    _ => None,
+                };
+                (p.to_string(), child)
+            })
+            .collect(),
+        None => processes.iter().map(|&p| (p.to_string(), None)).collect(),
+    };
+    // 阶段 2：kill（锁已释放，不阻塞其他线程）
+    for (name, child) in children {
+        if let Some(mut c) = child {
+            info!("终止子进程: {name}");
+            let _ = c.kill();
         }
     }
-    // 再通过进程名枚举兜底（覆盖其他来源启动的同名进程）
+    // 阶段 3：通过进程名枚举兜底（覆盖其他来源启动的同名进程）
     for process in processes {
         info!("终止进程: {process}");
         kill_processes_by_name(process);
@@ -336,10 +337,8 @@ fn cleanup_orphaned_wintun() {
         }
     }
 
-    if !instance_ids.is_empty() {
-        debug!("扫描硬件变更 ({} 个设备已移除)", instance_ids.len());
-        let _ = hidden_command("pnputil").arg("/scan-devices").status();
-    }
+    debug!("扫描硬件变更 ({} 个设备已移除)", instance_ids.len());
+    let _ = hidden_command("pnputil").arg("/scan-devices").status();
 }
 
 // ═══════════════════════════════════════════════

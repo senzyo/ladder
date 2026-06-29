@@ -224,6 +224,7 @@ pub(crate) unsafe fn load_icon_bitmap(exe_dir: &Path, icon_name: &str) -> isize 
         let old_bmp = SelectObject(mem_dc, HGDIOBJ(bmp.0));
         let _ = DrawIconEx(mem_dc, 0, 0, hicon, 16, 16, 0, None, DI_NORMAL);
         SelectObject(mem_dc, old_bmp);
+        let _ = ReleaseDC(None, screen_dc);
         let _ = DeleteDC(mem_dc);
         let _ = DestroyIcon(hicon);
 
@@ -481,8 +482,8 @@ unsafe fn append_config_items(map: &mut HashMap<u16, ConfigAction>, menu: HMENU,
 /// NOTIFYICONDATAW.szTip 要求 128 个 u16 的固定长度数组。
 fn to_wide_padded<const N: usize>(s: &str) -> [u16; N] {
     let mut buf = [0u16; N];
-    let wide = state::wide(s);
-    let len = wide.len().saturating_sub(1).min(N - 1);
+    let wide: Vec<u16> = s.encode_utf16().collect();
+    let len = wide.len().min(N - 1);
     buf[..len].copy_from_slice(&wide[..len]);
     buf
 }

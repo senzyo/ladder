@@ -80,14 +80,14 @@ pub fn update_sing_box(
     let zip_name = format!("sing-box-{}-windows-{}.zip", remote_ver, SINGBOX_ARCH_SUFFIX);
     let zip_path = exe_dir.join(&zip_name);
 
-    let download_url = match find_asset_url(&assets, &zip_name) {
+    let (download_url, expected_hash) = find_asset(&assets, &zip_name);
+    let download_url = match download_url {
         Some(url) => url,
         None => {
             error!("[sing-box] 未找到发布文件: {zip_name}");
             return Err(AppError::Msg(format!("未找到发布文件: {zip_name}")));
         }
     };
-    let expected_hash = find_asset_digest(&assets, &zip_name);
     debug!(
         "[sing-box] 下载链接: {download_url}, SHA256: {}",
         expected_hash.as_deref().unwrap_or("无")
@@ -147,14 +147,14 @@ pub fn update_xray(
     let zip_name = XRAY_ZIP_NAME;
     let zip_path = exe_dir.join(zip_name);
 
-    let download_url = match find_asset_url(&assets, zip_name) {
+    let (download_url, expected_hash) = find_asset(&assets, zip_name);
+    let download_url = match download_url {
         Some(url) => url,
         None => {
             error!("[xray] 未找到发布文件: {zip_name}");
             return Err(AppError::Msg(format!("未找到发布文件: {zip_name}")));
         }
     };
-    let expected_hash = find_asset_digest(&assets, zip_name);
     debug!(
         "[xray] 下载链接: {download_url}, SHA256: {}",
         expected_hash.as_deref().unwrap_or("无")
@@ -285,24 +285,17 @@ fn fetch_release(api_url: &str) -> Result<(String, Vec<Value>), AppError> {
     Ok((version, assets))
 }
 
-/// 从 release assets 中查找指定文件名的下载 URL。
-fn find_asset_url(assets: &[Value], file_name: &str) -> Option<String> {
-    assets
-        .iter()
-        .find(|a| a["name"].as_str() == Some(file_name))
+/// 从 release assets 中查找指定文件名的下载 URL 和 digest 哈希值。
+fn find_asset(assets: &[Value], file_name: &str) -> (Option<String>, Option<String>) {
+    let asset = assets.iter().find(|a| a["name"].as_str() == Some(file_name));
+    let url = asset
         .and_then(|a| a["browser_download_url"].as_str())
-        .map(|s| s.to_string())
-}
-
-/// 从 release asset 的 digest 字段提取十六进制哈希值。
-/// digest 格式为 "sha256:<hex>"，取冒号后面的部分。
-fn find_asset_digest(assets: &[Value], file_name: &str) -> Option<String> {
-    assets
-        .iter()
-        .find(|a| a["name"].as_str() == Some(file_name))
+        .map(|s| s.to_string());
+    let hash = asset
         .and_then(|a| a["digest"].as_str())
         .and_then(|d| d.split(':').next_back())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string());
+    (url, hash)
 }
 
 /// 带重试的下载。启用代理时将代理 URL 前缀拼接到下载链接。
