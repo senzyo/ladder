@@ -34,8 +34,6 @@ const XRAY_ZIP_NAME: &str = if cfg!(target_arch = "aarch64") {
 /// 依次更新 sing-box 和 xray。
 pub fn update_cores(
     exe_dir: &Path,
-    sing_ver: Option<&str>,
-    xray_ver: Option<&str>,
     gh_proxy_enabled: bool,
     gh_proxy_url: &str,
     max_retries: u32,
@@ -44,7 +42,6 @@ pub fn update_cores(
     let exe_dir = exe_dir.to_path_buf();
     update_sing_box(
         &exe_dir,
-        sing_ver,
         gh_proxy_enabled,
         gh_proxy_url,
         max_retries,
@@ -52,7 +49,6 @@ pub fn update_cores(
     )?;
     update_xray(
         &exe_dir,
-        xray_ver,
         gh_proxy_enabled,
         gh_proxy_url,
         max_retries,
@@ -60,10 +56,9 @@ pub fn update_cores(
     )
 }
 
-/// 检查并更新 sing-box。本地版本已知时可跳过版本检测。
+/// 检查并更新 sing-box。
 pub fn update_sing_box(
     exe_dir: &Path,
-    local_version: Option<&str>,
     gh_proxy_enabled: bool,
     gh_proxy_url: &str,
     max_retries: u32,
@@ -72,10 +67,7 @@ pub fn update_sing_box(
     let exe_path = exe_dir.join("sing-box_core").join("sing-box.exe");
     let api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
 
-    let local = match local_version {
-        Some(v) if v != "0.0.0" => v.to_string(),
-        _ => get_local_version(&exe_path, "version"),
-    };
+    let local = get_local_version(&exe_path, "version");
     let (remote_ver, assets) = fetch_release(api_url)?;
     debug!("[sing-box] 版本比较: local={local}, remote={remote_ver}");
 
@@ -131,10 +123,9 @@ pub fn update_sing_box(
     Ok(())
 }
 
-/// 检查并更新 xray。本地版本已知时可跳过版本检测。
+/// 检查并更新 xray。
 pub fn update_xray(
     exe_dir: &Path,
-    local_version: Option<&str>,
     gh_proxy_enabled: bool,
     gh_proxy_url: &str,
     max_retries: u32,
@@ -143,10 +134,7 @@ pub fn update_xray(
     let exe_path = exe_dir.join("xray_core").join("xray.exe");
     let api_url = "https://api.github.com/repos/XTLS/Xray-core/releases/latest";
 
-    let local = match local_version {
-        Some(v) if v != "0.0.0" => v.to_string(),
-        _ => get_local_version(&exe_path, "version"),
-    };
+    let local = get_local_version(&exe_path, "version");
     let (remote_ver, assets) = fetch_release(api_url)?;
     debug!("[xray] 版本比较: local={local}, remote={remote_ver}");
 

@@ -41,8 +41,6 @@ pub enum ProcessState {
 pub struct AppState {
     /// 可执行文件所在目录，所有相对路径以此为基准。
     pub exe_dir: PathBuf,
-    pub sing_box_version: Option<String>,
-    pub xray_version: Option<String>,
     /// GDI 位图句柄：绿色（运行中）、黄色（未运行）、红色（未安装）。
     pub icon_green: isize,
     pub icon_yellow: isize,
@@ -174,35 +172,4 @@ pub fn xray_state(app: &AppState) -> ProcessState {
     }
 }
 
-/// 检测本地 sing-box 和 xray 的版本。
-/// 版本号为 "0.0.0" 表示可执行文件存在但无法获取版本，视为未安装。
-pub fn detect_versions(exe_dir: &Path) -> (Option<String>, Option<String>) {
-    let sing_exe = exe_dir.join("sing-box_core").join("sing-box.exe");
-    let xray_exe = exe_dir.join("xray_core").join("xray.exe");
-    let sing_ver = if sing_exe.exists() {
-        let v = crate::update::get_local_version(&sing_exe, "version");
-        if v != "0.0.0" { Some(v) } else { None }
-    } else {
-        None
-    };
-    let xray_ver = if xray_exe.exists() {
-        let v = crate::update::get_local_version(&xray_exe, "version");
-        if v != "0.0.0" { Some(v) } else { None }
-    } else {
-        None
-    };
-    (sing_ver, xray_ver)
-}
 
-/// 格式化托盘提示文本，显示两个核心的版本状态。
-pub fn format_tooltip(sing_ver: Option<&str>, xray_ver: Option<&str>) -> String {
-    let sing = match sing_ver {
-        Some(v) => format!("sing-box v{}", v),
-        None => "sing-box 未安装".to_string(),
-    };
-    let xray = match xray_ver {
-        Some(v) => format!("xray v{}", v),
-        None => "xray 未安装".to_string(),
-    };
-    format!("{}\n{}", sing, xray)
-}

@@ -191,8 +191,6 @@ fn run() -> Result<(), AppError> {
     state::APP
         .set(Mutex::new(state::AppState {
             exe_dir: exe_dir.clone(),
-            sing_box_version: None,
-            xray_version: None,
             icon_green: 0,
             icon_yellow: 0,
             icon_red: 0,
@@ -211,21 +209,13 @@ fn run() -> Result<(), AppError> {
         }
     }
 
-    let tooltip = {
-        let mut app = state::app_state_mut().ok_or(AppError::Msg("应用状态不可用".into()))?;
-        let (sing_ver, xray_ver) = state::detect_versions(&app.exe_dir);
-        app.sing_box_version = sing_ver;
-        app.xray_version = xray_ver;
-        state::format_tooltip(app.sing_box_version.as_deref(), app.xray_version.as_deref())
-    };
-
     unsafe {
         let h_instance = GetModuleHandleW(None)
             .map_err(|e| AppError::Msg(format!("获取模块句柄失败: {e}")))?
             .0 as isize;
         let hwnd = tray::create_window(h_instance)?;
         tray::add_icon(hwnd, h_instance, &exe_dir)?;
-        tray::set_tooltip(&tooltip);
+        tray::set_tooltip("sing-box with xray");
         tray::run_message_loop();
     }
 
@@ -304,17 +294,6 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                     return;
                 }
             };
-            let (sing_ver, xray_ver) = {
-                let app = match state::app_state() {
-                    Some(a) => a,
-                    None => {
-                        error!("应用状态不可用");
-                        tray::show_error(hwnd, "操作失败", "应用状态不可用");
-                        return;
-                    }
-                };
-                (app.sing_box_version.clone(), app.xray_version.clone())
-            };
             let (gh_enabled, gh_url, max_retries, retry_delay) = {
                 let app = match state::app_state() {
                     Some(a) => a,
@@ -347,8 +326,6 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                 let result = match id {
                     tray::ID_UPDATE_ALL => update::update_cores(
                         &exe_dir,
-                        sing_ver.as_deref(),
-                        xray_ver.as_deref(),
                         gh_enabled,
                         &gh_url,
                         max_retries,
@@ -356,7 +333,6 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                     ),
                     tray::ID_UPDATE_SING => update::update_sing_box(
                         &exe_dir,
-                        sing_ver.as_deref(),
                         gh_enabled,
                         &gh_url,
                         max_retries,
@@ -364,7 +340,6 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                     ),
                     tray::ID_UPDATE_XRAY => update::update_xray(
                         &exe_dir,
-                        xray_ver.as_deref(),
                         gh_enabled,
                         &gh_url,
                         max_retries,
@@ -372,7 +347,6 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                     ),
                     _ => unreachable!(),
                 };
-                refresh_versions_and_tooltip(&exe_dir);
                 if let Err(e) = result {
                     error!("更新失败: {e}");
                     toast::show_toast("更新失败", &e.to_string());
@@ -432,17 +406,5 @@ fn run_config_action(id: u16, config_actions: &HashMap<u16, ConfigAction>) -> Re
             fs::copy(&action.path, dest).map_err(|e| AppError::Msg(format!("切换 xray 配置失败: {e}")))?;
             process::restart_xray_at(&exe_dir)
         }
-    }
-}
-
-/// 重新检测版本并更新托盘提示文本。
-fn refresh_versions_and_tooltip(exe_dir: &Path) {
-    if let Some(mut app) = state::app_state_mut() {
-        let (sing_ver, xray_ver) = state::detect_versions(exe_dir);
-        app.sing_box_version = sing_ver;
-        app.xray_version = xray_ver;
-        let tooltip = state::format_tooltip(app.sing_box_version.as_deref(), app.xray_version.as_deref());
-        drop(app);
-        tray::set_tooltip(&tooltip);
     }
 }
