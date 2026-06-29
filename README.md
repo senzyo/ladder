@@ -1,5 +1,5 @@
 <p align="center">
-    <img src="https://raw.githubusercontent.com/microsoft/fluentui-emoji/62ecdc0d7ca5c6df32148c169556bc8d3782fca4/assets/Ladder/3D/ladder_3d.png" width="100px" align="center" />
+    <img src="icons/ladder.ico" width="100px" align="center" />
     <h2 align="center">sing-box_with_xray</h2>
     <p align="center">
         一个极简的、管理 sing-box 和 Xray 核心的 Windows 托盘程序。
@@ -26,7 +26,7 @@ flowchart LR
 
 当然, 你可以根据自身需求仅运行其中一个核心, 比如使用 `configs\xray\olny_xray_上行[xhttp+reality]下行[xhttp+tls+cdn].json`, 这取决于你自己怎样修改配置文件。
 
-![运行截图](main.png)
+![运行截图](screenshots/main.png)
 
 ## 目录结构
 
