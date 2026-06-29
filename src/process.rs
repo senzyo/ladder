@@ -194,34 +194,51 @@ pub fn restart_xray_at(exe_dir: &Path) -> Result<(), AppError> {
 /// 未完全释放会导致冲突。通过每次启动时生成随机 6 位十六进制名称来避免。
 ///
 /// 使用字符串替换而非 JSON 序列化来保留原始配置的格式和注释。
+/// 如果配置中没有 type=tun 的 inbound，静默跳过（用户可能不使用 TUN 功能）。
+/// 如果 tun inbound 缺少 interface_name 字段，自动写入随机化后的值。
 fn randomize_tun_name(config_path: &Path) -> Result<(), AppError> {
     let text = fs::read_to_string(config_path).map_err(|e| AppError::Msg(format!("读取 sing-box 配置失败: {e}")))?;
     let json: Value = serde_json::from_str(&text).map_err(|e| AppError::Msg(format!("解析 sing-box 配置失败: {e}")))?;
     let new_name = random_hex_name();
 
-    let old_name = json
+    // 找 tun inbound，找不到直接跳过
+    let tun_inbound = json
         .get("inbounds")
         .and_then(Value::as_array)
         .and_then(|inbounds| {
-            inbounds.iter().find_map(|inbound| {
-                if inbound.get("type").and_then(Value::as_str) == Some("tun") {
-                    inbound.get("interface_name").and_then(Value::as_str)
-                } else {
-                    None
-                }
-            })
-        })
-        .ok_or(AppError::Msg("未在 sing-box.json 中找到 type=tun 的 inbound".into()))?;
+            inbounds.iter().find(|inbound| inbound.get("type").and_then(Value::as_str) == Some("tun"))
+        });
 
-    if old_name == new_name {
-        return Ok(());
+    let tun_inbound = match tun_inbound {
+        Some(inbound) => inbound,
+        None => {
+            debug!("未发现 type=tun 的 inbound，跳过 TUN 接口名随机化");
+            return Ok(());
+        }
+    };
+
+    // 有 interface_name → 替换
+    if let Some(old_name) = tun_inbound.get("interface_name").and_then(Value::as_str) {
+        if old_name == new_name {
+            return Ok(());
+        }
+        debug!("随机化 TUN 接口名: {old_name} -> {new_name}");
+        let old_pattern = format!("\"interface_name\": \"{}\"", old_name);
+        let new_pattern = format!("\"interface_name\": \"{}\"", new_name);
+        let new_text = text.replacen(&old_pattern, &new_pattern, 1);
+        return fs::write(config_path, new_text).map_err(|e| AppError::Msg(format!("写入 sing-box 配置失败: {e}")));
     }
 
-    debug!("随机化 TUN 接口名: {old_name} -> {new_name}");
-
-    let old_pattern = format!("\"interface_name\": \"{}\"", old_name);
-    let new_pattern = format!("\"interface_name\": \"{}\"", new_name);
-    let new_text = text.replacen(&old_pattern, &new_pattern, 1);
+    // 无 interface_name → 在 "type": "tun" 行后插入
+    debug!("写入 TUN 接口名: {new_name}");
+    let type_pattern = "\"type\": \"tun\"";
+    let pos = text.find(type_pattern).ok_or(AppError::Msg("未在 sing-box.json 中找到 type=tun 的 inbound".into()))?;
+    let line_end = text[pos..].find('\n').map(|p| pos + p).unwrap_or(text.len());
+    let line_start = text[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let indent = &text[line_start..pos];
+    let insert = format!("{indent}\"interface_name\": \"{new_name}\",\n");
+    let mut new_text = text;
+    new_text.insert_str(line_end + 1, &insert);
     fs::write(config_path, new_text).map_err(|e| AppError::Msg(format!("写入 sing-box 配置失败: {e}")))
 }
 
