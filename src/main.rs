@@ -34,6 +34,7 @@ use windows::Win32::System::Console::{
     CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, SetConsoleMode,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetSystemTime;
 use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
 
 use crate::state::ConfigAction;
@@ -102,67 +103,14 @@ where
     }
 }
 
-/// 将当前 UTC 时间格式化为 `YYYY-MM-DDTHH:MM:SS.mmmZ`。
 fn format_utc_timestamp() -> String {
-    let dur = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = dur.as_secs();
-    let millis = dur.subsec_millis();
-
-    // 秒 → UTC 时间组件（简化算法，适用于 1970-2100）
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hour = time_of_day / 3600;
-    let minute = (time_of_day % 3600) / 60;
-    let second = time_of_day % 60;
-
-    // 天数 → 年/月/日
-    let (year, month, day) = days_to_ymd(days);
-
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
-}
-
-/// 将自 UNIX 纪元以来的天数转换为年、月、日。
-fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
-    // 先估算年份
-    let mut year = 1970 + days / 365;
-    // 微调：计算该年之前的总天数
-    loop {
-        let prev_days = days_before_year(year);
-        if prev_days > days {
-            year -= 1;
-        } else {
-            days -= prev_days;
-            break;
-        }
+    unsafe {
+        let t = GetSystemTime();
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+        )
     }
-
-    // 月份天数（非闰年）
-    let month_days = [31u64, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let leap = is_leap(year);
-
-    let mut month = 1u64;
-    for (i, &md) in month_days.iter().enumerate() {
-        let dim = if i == 1 && leap { 29 } else { md };
-        if days < dim {
-            month = i as u64 + 1;
-            break;
-        }
-        days -= dim;
-    }
-
-    (year, month, days + 1)
-}
-
-/// 1970-01-01 到指定年份 01-01 的天数。
-fn days_before_year(year: u64) -> u64 {
-    let y = year - 1970;
-    y * 365 + y / 4 - y / 100 + y / 400
-}
-
-fn is_leap(year: u64) -> bool {
-    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 /// 初始化日志系统。
