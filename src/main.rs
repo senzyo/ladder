@@ -344,6 +344,34 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
             });
             return;
         }
+        tray::ID_SWITCH_CORE_XRAY | tray::ID_SWITCH_CORE_SING | tray::ID_SWITCH_CORE_BOTH => {
+            let new_mode = match id {
+                tray::ID_SWITCH_CORE_XRAY => settings::CoreMode::Xray,
+                tray::ID_SWITCH_CORE_SING => settings::CoreMode::SingBox,
+                tray::ID_SWITCH_CORE_BOTH => settings::CoreMode::Both,
+                _ => unreachable!(),
+            };
+            if let Err(e) = process::stop_all() {
+                warn!("切换核心前终止进程失败: {e}");
+            }
+            {
+                let mut app = match state::app_state_mut() {
+                    Some(a) => a,
+                    None => {
+                        error!("应用状态不可用");
+                        return;
+                    }
+                };
+                app.settings.core.mode = new_mode;
+                if let Err(e) = app.settings.save(&app.exe_dir) {
+                    error!("保存核心模式失败: {e}");
+                    tray::show_error(hwnd, "操作失败", &e.to_string());
+                    return;
+                }
+            }
+            info!("核心模式已切换为: {new_mode:?}");
+            return;
+        }
         tray::ID_OPEN_DIR => {
             let exe_dir = match state::exe_dir() {
                 Ok(d) => d,

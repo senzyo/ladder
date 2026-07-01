@@ -425,12 +425,11 @@ checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
 name = "sing-box_with_xray"
-version = "2.7.2"
+version = "2.8.0"
 dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "toml",
  "tracing",
  "tracing-subscriber",
  "ureq",

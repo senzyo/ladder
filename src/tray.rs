@@ -27,6 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, PCWSTR};
 
 use crate::error::AppError;
+use crate::settings::CoreMode;
 use crate::state::{self, ConfigAction, ConfigKind, ProcessState};
 use tracing::warn;
 
@@ -47,6 +48,9 @@ pub const ID_STOP_ALL: u16 = 203;
 pub const ID_UPDATE_ALL: u16 = 301;
 pub const ID_UPDATE_SING: u16 = 302;
 pub const ID_UPDATE_XRAY: u16 = 303;
+pub const ID_SWITCH_CORE_XRAY: u16 = 401;
+pub const ID_SWITCH_CORE_SING: u16 = 402;
+pub const ID_SWITCH_CORE_BOTH: u16 = 403;
 pub const ID_OPEN_DIR: u16 = 998;
 pub const ID_EXIT: u16 = 999;
 pub const ID_SING_CONFIG_BASE: u16 = 1000;
@@ -294,11 +298,12 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 
 /// 构建并显示右键弹出菜单，返回用户选择的菜单项 ID 和配置项映射。
 ///
+/// 菜单根据当前核心模式（xray / sing-box / both）动态构建。
 /// Mutex 仅在读取状态时持有，TrackPopupMenu 在锁外执行，
 /// 避免模态消息循环重入窗口过程时因 Mutex 不可重入导致死锁。
 unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
     unsafe {
-        let (sing_state, xray_state, exe_dir, icon_green, icon_yellow, icon_red) = {
+        let (sing_state, xray_state, exe_dir, icon_green, icon_yellow, icon_red, core_mode) = {
             let app = match state::app_state() {
                 Some(app) => app,
                 None => return (0, HashMap::new()),
@@ -310,6 +315,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
                 app.icon_green,
                 app.icon_yellow,
                 app.icon_red,
+                app.settings.core.mode,
             )
         };
 
@@ -328,49 +334,104 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
             ProcessState::NotInstalled => format!("{name} 未安装"),
         };
 
-        append_status_item(menu, &status_label(sing_state, "sing-box"), status_hbmp(sing_state));
-        append_status_item(menu, &status_label(xray_state, "xray"), status_hbmp(xray_state));
+        // ── 状态项：仅显示已启用核心 ──
+        if core_mode.runs_sing_box() {
+            append_status_item(menu, &status_label(sing_state, "sing-box"), status_hbmp(sing_state));
+        }
+        if core_mode.runs_xray() {
+            append_status_item(menu, &status_label(xray_state, "xray"), status_hbmp(xray_state));
+        }
         append_separator(menu);
 
-        let restart_menu = new_submenu();
-        let stop_menu = new_submenu();
-        let update_menu = new_submenu();
-        let sing_menu = new_submenu();
-        let xray_menu = new_submenu();
-
-        append_item(restart_menu, ID_RESTART_SING, "重启 sing-box");
-        append_item(restart_menu, ID_RESTART_XRAY, "重启 xray");
-        append_item(restart_menu, ID_RESTART_ALL, "重启 sing-box 和 xray");
-
-        append_item(stop_menu, ID_STOP_SING, "终止 sing-box");
-        append_item(stop_menu, ID_STOP_XRAY, "终止 xray");
-        append_item(stop_menu, ID_STOP_ALL, "终止 sing-box 和 xray");
-
-        append_item(update_menu, ID_UPDATE_SING, "更新 sing-box");
-        append_item(update_menu, ID_UPDATE_XRAY, "更新 xray");
-        append_item(update_menu, ID_UPDATE_ALL, "更新 sing-box 和 xray");
-
+        // ── 操作项 ──
         let mut config_actions = HashMap::new();
-        append_config_items(
-            &mut config_actions,
-            sing_menu,
-            ConfigKind::SingBox,
-            ID_SING_CONFIG_BASE,
-            &[exe_dir.join("configs").join("sing-box")],
-        );
-        append_config_items(
-            &mut config_actions,
-            xray_menu,
-            ConfigKind::Xray,
-            ID_XRAY_CONFIG_BASE,
-            &[exe_dir.join("configs").join("xray")],
-        );
 
-        append_submenu(menu, restart_menu, "重新启动");
-        append_submenu(menu, stop_menu, "终止运行");
-        append_submenu(menu, update_menu, "更新核心");
-        append_submenu(menu, sing_menu, "切换 sing-box 配置");
-        append_submenu(menu, xray_menu, "切换 xray 配置");
+        if core_mode == CoreMode::Both {
+            // 双核模式：重新启动/终止运行/更新核心 均为子菜单
+            let restart_menu = new_submenu();
+            let stop_menu = new_submenu();
+            let update_menu = new_submenu();
+
+            append_item(restart_menu, ID_RESTART_SING, "重启 sing-box");
+            append_item(restart_menu, ID_RESTART_XRAY, "重启 xray");
+            append_item(restart_menu, ID_RESTART_ALL, "重启 sing-box 和 xray");
+
+            append_item(stop_menu, ID_STOP_SING, "终止 sing-box");
+            append_item(stop_menu, ID_STOP_XRAY, "终止 xray");
+            append_item(stop_menu, ID_STOP_ALL, "终止 sing-box 和 xray");
+
+            append_item(update_menu, ID_UPDATE_SING, "更新 sing-box");
+            append_item(update_menu, ID_UPDATE_XRAY, "更新 xray");
+            append_item(update_menu, ID_UPDATE_ALL, "更新 sing-box 和 xray");
+
+            let sing_menu = new_submenu();
+            let xray_menu = new_submenu();
+            append_config_items(
+                &mut config_actions,
+                sing_menu,
+                ConfigKind::SingBox,
+                ID_SING_CONFIG_BASE,
+                &[exe_dir.join("configs").join("sing-box")],
+            );
+            append_config_items(
+                &mut config_actions,
+                xray_menu,
+                ConfigKind::Xray,
+                ID_XRAY_CONFIG_BASE,
+                &[exe_dir.join("configs").join("xray")],
+            );
+
+            append_submenu(menu, restart_menu, "重新启动");
+            append_submenu(menu, stop_menu, "终止运行");
+            append_submenu(menu, update_menu, "更新核心");
+            append_submenu(menu, sing_menu, "切换 sing-box 配置");
+            append_submenu(menu, xray_menu, "切换 xray 配置");
+        } else {
+            // 单核模式：操作项为直接可点击的一级菜单
+            let (restart_id, stop_id, update_id, config_kind, config_base, config_dir) =
+                if core_mode.runs_xray() {
+                    (
+                        ID_RESTART_XRAY,
+                        ID_STOP_XRAY,
+                        ID_UPDATE_XRAY,
+                        ConfigKind::Xray,
+                        ID_XRAY_CONFIG_BASE,
+                        exe_dir.join("configs").join("xray"),
+                    )
+                } else {
+                    (
+                        ID_RESTART_SING,
+                        ID_STOP_SING,
+                        ID_UPDATE_SING,
+                        ConfigKind::SingBox,
+                        ID_SING_CONFIG_BASE,
+                        exe_dir.join("configs").join("sing-box"),
+                    )
+                };
+
+            append_item(menu, restart_id, "重新启动");
+            append_item(menu, stop_id, "终止运行");
+            append_item(menu, update_id, "更新核心");
+
+            let config_menu = new_submenu();
+            append_config_items(
+                &mut config_actions,
+                config_menu,
+                config_kind,
+                config_base,
+                &[config_dir],
+            );
+            append_submenu(menu, config_menu, "切换配置");
+        }
+
+        // ── 切换核心子菜单（始终显示） ──
+        append_separator(menu);
+        let switch_menu = new_submenu();
+        append_item_or_disabled(switch_menu, ID_SWITCH_CORE_XRAY, "仅用 xray", core_mode == CoreMode::Xray);
+        append_item_or_disabled(switch_menu, ID_SWITCH_CORE_SING, "仅用 sing-box", core_mode == CoreMode::SingBox);
+        append_item_or_disabled(switch_menu, ID_SWITCH_CORE_BOTH, "全部启用", core_mode == CoreMode::Both);
+        append_submenu(menu, switch_menu, "切换核心");
+
         append_separator(menu);
         append_item(menu, ID_OPEN_DIR, "打开程序目录");
         append_item(menu, ID_EXIT, "退出并终止");
@@ -416,6 +477,16 @@ unsafe fn append_disabled_item(menu: HMENU, label: &str) {
     unsafe {
         let w = state::wide(label);
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(w.as_ptr()));
+    }
+}
+
+/// 添加菜单项，`disabled` 为 true 时灰掉禁用。
+unsafe fn append_item_or_disabled(menu: HMENU, id: u16, label: &str, disabled: bool) {
+    unsafe {
+        let w = state::wide(label);
+        let flags = if disabled { MF_STRING | MF_GRAYED } else { MF_STRING };
+        let item_id = if disabled { 0 } else { id as usize };
+        let _ = AppendMenuW(menu, flags, item_id, PCWSTR(w.as_ptr()));
     }
 }
 

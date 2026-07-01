@@ -1,16 +1,41 @@
-//! 配置文件加载。
-//!
-//! 从 `settings.toml` 读取用户配置（GitHub 代理、日志级别、下载重试参数）。
-//! 文件缺失或解析失败时静默回退到默认值，不中断程序运行。
-
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
 
-/// 应用配置，对应 `settings.toml`。
+use crate::error::AppError;
+
+/// 核心运行模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoreMode {
+    #[default]
+    Xray,
+    #[serde(rename = "sing-box")]
+    SingBox,
+    Both,
+}
+
+impl CoreMode {
+    pub fn runs_sing_box(&self) -> bool {
+        matches!(self, Self::SingBox | Self::Both)
+    }
+
+    pub fn runs_xray(&self) -> bool {
+        matches!(self, Self::Xray | Self::Both)
+    }
+}
+
+/// 核心配置。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Core {
+    #[serde(default)]
+    pub mode: CoreMode,
+}
+
+/// 应用配置，对应 `settings.json`。
 ///
 /// 所有字段均提供默认值，配置文件缺失或解析失败时自动回退。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Settings {
     #[serde(default = "default_gh_proxy")]
     pub gh_proxy: GhProxy,
@@ -18,13 +43,15 @@ pub struct Settings {
     pub log: Log,
     #[serde(default)]
     pub download: Download,
+    #[serde(default)]
+    pub core: Core,
 }
 
 /// 加载期间收集的警告信息，供 init_logging 之后通过 tracing 输出。
 static LOAD_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// GitHub CDN 代理配置。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GhProxy {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -34,7 +61,7 @@ pub struct GhProxy {
 }
 
 /// 日志配置。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Log {
     /// 日志级别，可选值: "debug", "info", "warn", "error"。
     #[serde(default = "default_log_level")]
@@ -42,7 +69,7 @@ pub struct Log {
 }
 
 /// 下载重试配置。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Download {
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
@@ -55,7 +82,6 @@ fn default_true() -> bool {
 }
 
 fn default_proxy_url() -> String {
-    // 默认 GitHub CDN 代理，用于网络受限地区加速下载
     "https://gh-proxy.com/".to_string()
 }
 
@@ -104,10 +130,10 @@ impl Default for Download {
 const ALLOWED_LEVELS: &[&str] = &["debug", "info", "warn", "error"];
 
 impl Settings {
-    /// 从 `exe_dir/settings.toml` 加载配置。
+    /// 从 `exe_dir/settings.json` 加载配置。
     /// 文件不存在或格式错误时打印警告并返回默认值。
     pub fn load(exe_dir: &Path) -> Self {
-        let path = exe_dir.join("settings.toml");
+        let path = exe_dir.join("settings.json");
 
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
@@ -117,7 +143,7 @@ impl Settings {
             }
         };
 
-        match toml::from_str::<Settings>(&text) {
+        match serde_json::from_str::<Settings>(&text) {
             Ok(mut s) => {
                 s.validate();
                 s
@@ -127,6 +153,14 @@ impl Settings {
                 Self::default()
             }
         }
+    }
+
+    /// 将当前配置写入 `exe_dir/settings.json`。
+    pub fn save(&self, exe_dir: &Path) -> Result<(), AppError> {
+        let path = exe_dir.join("settings.json");
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| AppError::Msg(format!("序列化配置失败: {e}")))?;
+        std::fs::write(&path, json).map_err(|e| AppError::Msg(format!("写入配置文件失败: {e}")))
     }
 
     /// 取出加载期间收集的警告。调用后清空，仅首次调用返回内容。

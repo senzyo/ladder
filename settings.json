@@ -1,0 +1,16 @@
+{
+  "gh_proxy": {
+    "enabled": true,
+    "url": "https://gh-proxy.com/"
+  },
+  "log": {
+    "level": "debug"
+  },
+  "download": {
+    "max_retries": 3,
+    "retry_delay_secs": 2
+  },
+  "core": {
+    "mode": "xray"
+  }
+}
