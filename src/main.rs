@@ -8,6 +8,7 @@
 mod dns;
 mod error;
 mod process;
+mod scheduler;
 mod settings;
 mod state;
 mod toast;
@@ -243,6 +244,7 @@ fn run() -> Result<(), AppError> {
     );
     process::cleanup_network_registry();
     dns::restore_dns_to_dhcp();
+    scheduler::ensure_boot_dns_reset_task(&exe_dir);
     toast::setup(&exe_path).map_err(|e| AppError::Msg(format!("初始化 Toast 通知失败: {e}")))?;
 
     let icon_green = unsafe { tray::load_icon_bitmap(&exe_dir, "green_circle.ico") };
