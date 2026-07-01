@@ -230,12 +230,11 @@ fn randomize_sing_box_tun_name(config_path: &Path) -> Result<(), AppError> {
     let new_name = random_tun_name();
 
     // 找 tun inbound，找不到直接跳过
-    let tun_inbound = json
-        .get("inbounds")
-        .and_then(Value::as_array)
-        .and_then(|inbounds| {
-            inbounds.iter().find(|inbound| inbound.get("type").and_then(Value::as_str) == Some("tun"))
-        });
+    let tun_inbound = json.get("inbounds").and_then(Value::as_array).and_then(|inbounds| {
+        inbounds
+            .iter()
+            .find(|inbound| inbound.get("type").and_then(Value::as_str) == Some("tun"))
+    });
 
     let tun_inbound = match tun_inbound {
         Some(inbound) => inbound,
@@ -260,7 +259,9 @@ fn randomize_sing_box_tun_name(config_path: &Path) -> Result<(), AppError> {
     // 无 interface_name → 在 "type": "tun" 行后插入
     debug!("写入 TUN 接口名: {new_name}");
     let type_pattern = "\"type\": \"tun\"";
-    let pos = text.find(type_pattern).ok_or(AppError::Msg("未在 sing-box.json 中找到 type=tun 的 inbound".into()))?;
+    let pos = text
+        .find(type_pattern)
+        .ok_or(AppError::Msg("未在 sing-box.json 中找到 type=tun 的 inbound".into()))?;
     let line_end = text[pos..].find('\n').map(|p| pos + p).unwrap_or(text.len());
     let line_start = text[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
     let indent = &text[line_start..pos];
@@ -285,7 +286,9 @@ fn randomize_xray_tun_name(config_path: &Path, text: &str, json: &Value) -> Resu
         .get("inbounds")
         .and_then(Value::as_array)
         .and_then(|inbounds| {
-            inbounds.iter().find(|inbound| inbound.get("protocol").and_then(Value::as_str) == Some("tun"))
+            inbounds
+                .iter()
+                .find(|inbound| inbound.get("protocol").and_then(Value::as_str) == Some("tun"))
         })
         .expect("xray 配置中应存在 TUN inbound");
 
@@ -308,7 +311,9 @@ fn randomize_xray_tun_name(config_path: &Path, text: &str, json: &Value) -> Resu
     // 无 settings.name → 在 "settings": { 行后插入
     debug!("写入 xray TUN 接口名: {new_name}");
     let settings_pattern = "\"settings\": {";
-    let pos = text.find(settings_pattern).ok_or(AppError::Msg("未在 xray.json 中找到 tun inbound 的 settings 块".into()))?;
+    let pos = text
+        .find(settings_pattern)
+        .ok_or(AppError::Msg("未在 xray.json 中找到 tun inbound 的 settings 块".into()))?;
     let line_end = text[pos..].find('\n').map(|p| pos + p).unwrap_or(text.len());
     let line_start = text[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
     let indent = &text[line_start..pos];

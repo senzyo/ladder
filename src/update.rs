@@ -40,20 +40,8 @@ pub fn update_cores(
     retry_delay_secs: u64,
 ) -> Result<(), AppError> {
     let exe_dir = exe_dir.to_path_buf();
-    update_sing_box(
-        &exe_dir,
-        gh_proxy_enabled,
-        gh_proxy_url,
-        max_retries,
-        retry_delay_secs,
-    )?;
-    update_xray(
-        &exe_dir,
-        gh_proxy_enabled,
-        gh_proxy_url,
-        max_retries,
-        retry_delay_secs,
-    )
+    update_sing_box(&exe_dir, gh_proxy_enabled, gh_proxy_url, max_retries, retry_delay_secs)?;
+    update_xray(&exe_dir, gh_proxy_enabled, gh_proxy_url, max_retries, retry_delay_secs)
 }
 
 /// 检查并更新 sing-box。

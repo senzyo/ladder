@@ -78,18 +78,10 @@ fn register_task(exe_dir: &Path) -> Result<(), String> {
     }
 
     let xml_path = exe_dir.join("_dns_task.xml");
-    fs::write(&xml_path, TASK_XML)
-        .map_err(|e| format!("写入任务 XML 失败: {e}"))?;
+    fs::write(&xml_path, TASK_XML).map_err(|e| format!("写入任务 XML 失败: {e}"))?;
 
     let result = process::hidden_command("schtasks")
-        .args([
-            "/Create",
-            "/TN",
-            TASK_NAME,
-            "/XML",
-            &xml_path.to_string_lossy(),
-            "/F",
-        ])
+        .args(["/Create", "/TN", TASK_NAME, "/XML", &xml_path.to_string_lossy(), "/F"])
         .output()
         .map_err(|e| format!("执行 schtasks 失败: {e}"))?;
 

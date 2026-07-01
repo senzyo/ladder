@@ -450,7 +450,13 @@ unsafe fn append_submenu(menu: HMENU, submenu: HMENU, label: &str) {
 }
 
 /// 扫描配置目录并将每个 .json 文件添加为菜单项，最多 900 项。
-unsafe fn append_config_items(map: &mut HashMap<u16, ConfigAction>, menu: HMENU, kind: ConfigKind, base_id: u16, dirs: &[PathBuf]) {
+unsafe fn append_config_items(
+    map: &mut HashMap<u16, ConfigAction>,
+    menu: HMENU,
+    kind: ConfigKind,
+    base_id: u16,
+    dirs: &[PathBuf],
+) {
     unsafe {
         let mut added = 0;
 
@@ -474,8 +480,6 @@ unsafe fn append_config_items(map: &mut HashMap<u16, ConfigAction>, menu: HMENU,
         }
     }
 }
-
-
 
 /// 将字符串转为 UTF-16 并填充到固定长度缓冲区。
 /// `N` 是缓冲区长度（含 null 终止符），超出部分被截断。

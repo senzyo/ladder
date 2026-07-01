@@ -196,5 +196,3 @@ pub fn xray_state(app: &AppState) -> ProcessState {
         ProcessState::NotRunning
     }
 }
-
-
