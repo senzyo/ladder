@@ -12,28 +12,28 @@
       "dns.alidns.com": ["223.5.5.5", "223.6.6.6"]
     },
     "servers": [
-      "https://8.8.8.8/dns-query",
+      "8.8.8.8",
       {
         "address": "https+local://dns.alidns.com/dns-query",
         "domains": [
           "geosite:private",
           "geosite:category-games@cn",
           "geosite:kaspersky",
-          "domain:cf.godns.cc",
-          "domain:cf.tencentapp.cn",
-          "domain:cfyx.tencentapp.cn",
-          "domain:1749991941.bilibiliapp.cn",
-          "domain:freeyx.cloudflare88.eu.org",
-          "domain:cfcn-a-proctusa.chinabaidu.pp.ua",
-          "domain:dnew.cc",
-          "domain:cloudflare.182682.xyz",
-          "domain:baota.me",
-          "domain:cloudflare-ip.mofashi.ltd"
+          "cf.godns.cc",
+          "cf.tencentapp.cn",
+          "cfyx.tencentapp.cn",
+          "1749991941.bilibiliapp.cn",
+          "freeyx.cloudflare88.eu.org",
+          "cfcn-a-proctusa.chinabaidu.pp.ua",
+          "dnew.cc",
+          "cloudflare.182682.xyz",
+          "baota.me",
+          "cloudflare-ip.mofashi.ltd"
         ],
         "skipFallback": true
       },
       {
-        "address": "https://8.8.8.8/dns-query",
+        "address": "8.8.8.8",
         "domains": ["geosite:geolocation-!cn"],
         "skipFallback": true
       },
@@ -54,9 +54,14 @@
       "settings": {
         "name": "xray0",
         "mtu": 1500,
-        "gateway": ["10.0.0.1/16"],
-        "dns": ["1.1.1.1", "1.0.0.1"],
-        "autoSystemRoutingTable": ["0.0.0.0/0"],
+        "gateway": ["172.18.0.1/24", "fdfe:dcba:9876::1/64"],
+        "dns": [
+          "1.1.1.1",
+          "1.0.0.1",
+          "2606:4700:4700::1111",
+          "2606:4700:4700::1001"
+        ],
+        "autoSystemRoutingTable": ["0.0.0.0/0", "::/0"],
         "autoOutboundsInterface": "auto"
       },
       "sniffing": {

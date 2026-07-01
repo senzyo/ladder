@@ -11,7 +11,7 @@
       "tag": "in-socks",
       "listen": "127.0.0.1",
       "port": 10808,
-      "protocol": "mixed",
+      "protocol": "socks",
       "settings": {
         "auth": "noauth",
         "udp": true,
