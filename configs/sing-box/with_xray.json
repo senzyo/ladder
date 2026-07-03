@@ -44,16 +44,12 @@
     "rules": [
       {
         "domain_suffix": [
-          "cf.godns.cc",
-          "cf.tencentapp.cn",
-          "cfyx.tencentapp.cn",
-          "1749991941.bilibiliapp.cn",
-          "freeyx.cloudflare88.eu.org",
           "cfcn-a-proctusa.chinabaidu.pp.ua",
-          "dnew.cc",
-          "cloudflare.182682.xyz",
-          "baota.me",
-          "cloudflare-ip.mofashi.ltd"
+          "cf-cname.xingpingcn.top",
+          "singgcdn.singgnetworkcdn.com",
+          "www.shopify.com",
+          "store.ubi.com",
+          "staticdelivery.nexusmods.com"
         ],
         "server": "dns-direct"
       },

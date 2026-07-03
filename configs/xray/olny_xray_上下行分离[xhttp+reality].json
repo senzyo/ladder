@@ -19,16 +19,12 @@
           "geosite:private",
           "geosite:category-games@cn",
           "geosite:kaspersky",
-          "cf.godns.cc",
-          "cf.tencentapp.cn",
-          "cfyx.tencentapp.cn",
-          "1749991941.bilibiliapp.cn",
-          "freeyx.cloudflare88.eu.org",
           "cfcn-a-proctusa.chinabaidu.pp.ua",
-          "dnew.cc",
-          "cloudflare.182682.xyz",
-          "baota.me",
-          "cloudflare-ip.mofashi.ltd"
+          "cf-cname.xingpingcn.top",
+          "singgcdn.singgnetworkcdn.com",
+          "www.shopify.com",
+          "store.ubi.com",
+          "staticdelivery.nexusmods.com"
         ],
         "skipFallback": true
       },
@@ -177,30 +173,20 @@
         "outboundTag": "out-block"
       },
       {
-        "domain": [
-          "cf.godns.cc",
-          "cf.tencentapp.cn",
-          "cfyx.tencentapp.cn",
-          "1749991941.bilibiliapp.cn",
-          "freeyx.cloudflare88.eu.org",
-          "cfcn-a-proctusa.chinabaidu.pp.ua",
-          "dnew.cc",
-          "cloudflare.182682.xyz",
-          "baota.me",
-          "cloudflare-ip.mofashi.ltd"
-        ],
-        "outboundTag": "out-direct"
-      },
-      {
         "protocol": ["bittorrent"],
         "outboundTag": "out-direct"
       },
       {
-        "domain": ["geosite:category-games@cn"],
-        "outboundTag": "out-direct"
-      },
-      {
-        "domain": ["geosite:kaspersky"],
+        "domain": [
+          "geosite:category-games@cn",
+          "geosite:kaspersky",
+          "cfcn-a-proctusa.chinabaidu.pp.ua",
+          "cf-cname.xingpingcn.top",
+          "singgcdn.singgnetworkcdn.com",
+          "www.shopify.com",
+          "store.ubi.com",
+          "staticdelivery.nexusmods.com"
+        ],
         "outboundTag": "out-direct"
       },
       {
