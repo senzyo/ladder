@@ -89,14 +89,16 @@ flowchart LR
 
 编辑 `settings.json` 可调整以下设置:
 
-| 配置项                      | 默认值                  | 说明                                    |
-| --------------------------- | ----------------------- | --------------------------------------- |
-| `gh_proxy.enabled`          | `true`                  | 是否启用 GitHub CDN 代理                |
-| `gh_proxy.url`              | `https://gh-proxy.com/` | GitHub CDN 代理地址前缀                 |
-| `log.level`                 | `debug`                 | 日志级别                                |
-| `download.max_retries`      | `3`                     | 下载重试次数                            |
-| `download.retry_delay_secs` | `2`                     | 重试间隔 (秒)                           |
-| `core.mode`                 | `xray`                  | 核心模式 (`xray` / `sing-box` / `both`) |
+| 配置项                               | 默认值           | 说明                                         |
+| ------------------------------------ | ---------------- | -------------------------------------------- |
+| `log.level`                          | `debug`          | 日志级别                                     |
+| `download.core.gh_proxy`             | 为空时表示不启用 | GitHub CDN 代理地址前缀                      |
+| `download.ruleset`                   |                  | Xray 的规则集文件                            |
+| `download.ruleset.geoip.last_update` |                  | `geoip.dat` 的上次更新时间, 使用 unix 时间戳 |
+| `download.ruleset.interval_days`     | `3`              | 更新间隔 (天)                                |
+| `download.retry.max_retries`         | `3`              | 下载重试次数                                 |
+| `download.retry.delay_secs`          | `2`              | 重试间隔 (秒)                                |
+| `core.mode`                          | `xray`           | 核心模式 (`xray` / `sing-box` / `both`)      |
 
 修改后需重启程序生效。`core.mode` 也可通过菜单中的"切换核心"实时切换。
 
