@@ -436,6 +436,157 @@ fn backup_and_extract(zip_path: &Path, core_dir: &Path, strip_prefix: Option<&st
     Ok(())
 }
 
+// ═══════════════════════════════════════════════
+// 规则集更新
+// ═══════════════════════════════════════════════
+
+/// 检查并更新规则集文件。
+///
+/// 遍历 `ruleset.entries`，对每个规则集：
+/// 1. 检查 `last_update` 是否超过 `interval_days` 天
+/// 2. 下载 sha256sum 文件，解析出期望哈希值
+/// 3. 下载 dat 文件到临时位置，校验 SHA256
+/// 4. 校验通过后移动到 `xray_core/{name}.dat`
+///
+/// 返回成功更新的规则集名称列表（供调用方更新 `last_update`）。
+pub fn update_ruleset(exe_dir: &Path, ruleset: &crate::settings::Ruleset, max_retries: u32, delay_secs: u64) -> Vec<String> {
+    let interval_secs = ruleset.interval_days * 86400;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut updated_names = Vec::new();
+
+    for (name, entry) in &ruleset.entries {
+        if let Some(last) = entry.last_update
+            && now.saturating_sub(last) < interval_secs
+        {
+            debug!("[ruleset] {name}: 未超过更新间隔，跳过");
+            continue;
+        }
+
+        info!("[ruleset] {name}: 开始更新");
+
+        let expected_hash = match download_and_parse_sha256sum(&entry.sha256sum, max_retries, delay_secs) {
+            Ok(hash) => hash,
+            Err(e) => {
+                warn!("[ruleset] {name}: 获取 SHA256 校验和失败: {e}");
+                continue;
+            }
+        };
+
+        let dat_path = exe_dir.join("xray_core").join(format!("{name}.dat"));
+        let tmp_path = exe_dir.join("xray_core").join(format!("{name}.dat.tmp"));
+
+        match download_dat_with_retry(&entry.dat, &tmp_path, &expected_hash, max_retries, delay_secs) {
+            Ok(_) => {
+                if let Err(e) = fs::rename(&tmp_path, &dat_path) {
+                    warn!("[ruleset] {name}: 移动文件失败: {e}");
+                    let _ = fs::remove_file(&tmp_path);
+                    continue;
+                }
+                info!("[ruleset] {name}: 更新成功");
+                updated_names.push(name.clone());
+            }
+            Err(e) => {
+                warn!("[ruleset] {name}: 下载失败: {e}");
+                let _ = fs::remove_file(&tmp_path);
+            }
+        }
+    }
+
+    updated_names
+}
+
+/// 带重试地下载 sha256sum 文件并解析出哈希值。
+///
+/// 文件格式：`<hash>  <filename>`
+fn download_and_parse_sha256sum(url: &str, max_retries: u32, delay_secs: u64) -> Result<String, AppError> {
+    for attempt in 1..=max_retries {
+        if attempt > 1 {
+            debug!("SHA256 校验和下载第 {attempt}/{max_retries} 次重试, 等待 {delay_secs}s...");
+            std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+        }
+
+        debug!("下载 SHA256 校验和: {url}");
+        let resp = match ureq::get(url).header("User-Agent", USER_AGENT).call() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("SHA256 校验和下载失败 (第 {attempt}/{max_retries} 次): {e}");
+                continue;
+            }
+        };
+
+        let body = match resp.into_body().read_to_string() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("SHA256 校验和读取失败 (第 {attempt}/{max_retries} 次): {e}");
+                continue;
+            }
+        };
+
+        match parse_sha256sum(&body) {
+            Some(hash) => {
+                debug!("SHA256 校验和获取成功: {hash}");
+                return Ok(hash);
+            }
+            None => {
+                warn!("SHA256 校验和解析失败 (第 {attempt}/{max_retries} 次): 内容格式无效");
+                continue;
+            }
+        }
+    }
+
+    Err(AppError::Msg("获取 SHA256 校验和失败，已达到最大重试次数".into()))
+}
+
+/// 解析 sha256sum 文件内容，返回哈希值。
+///
+/// 格式：`<hash>  <filename>`
+fn parse_sha256sum(content: &str) -> Option<String> {
+    let hash = content.split_whitespace().next()?;
+    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hash.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/// 带重试的 dat 文件下载。
+///
+/// 下载到临时文件后校验 SHA256，下载失败或校验不匹配均删除并重试。
+fn download_dat_with_retry(
+    url: &str,
+    dest: &Path,
+    expected_hash: &str,
+    max_retries: u32,
+    delay_secs: u64,
+) -> Result<(), AppError> {
+    for attempt in 1..=max_retries {
+        if attempt > 1 {
+            debug!("dat 文件下载第 {attempt}/{max_retries} 次重试, 等待 {delay_secs}s...");
+            std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+        }
+
+        if let Err(e) = download_file(url, dest) {
+            warn!("dat 文件下载失败 (第 {attempt}/{max_retries} 次): {e}");
+            let _ = fs::remove_file(dest);
+            continue;
+        }
+
+        let actual = sha256_file(dest)?;
+        if actual.eq_ignore_ascii_case(expected_hash) {
+            debug!("SHA256 校验通过: {actual}");
+            return Ok(());
+        }
+        warn!("SHA256 校验失败: expected={expected_hash}, actual={actual}");
+        let _ = fs::remove_file(dest);
+    }
+
+    Err(AppError::Msg("下载文件校验失败，已达到最大重试次数".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,11 +7,21 @@
       "gh_proxy": "https://gh-proxy.com/"
     },
     "ruleset": {
-      "ruleset_url": [
-        "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/geoip-only-cn-private.dat",
-        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
-        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-      ],
+      "geoip-only-cn-private": {
+        "dat": "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/geoip-only-cn-private.dat",
+        "sha256sum": "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/geoip-only-cn-private.dat.sha256sum",
+        "last_update": null
+      },
+      "geoip": {
+        "dat": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geoip.dat",
+        "sha256sum": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geoip.dat.sha256sum",
+        "last_update": null
+      },
+      "geosite": {
+        "dat": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite.dat",
+        "sha256sum": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite.dat.sha256sum",
+        "last_update": null
+      },
       "interval_days": 3
     },
     "retry": {

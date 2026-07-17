@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -64,6 +65,23 @@ pub struct Log {
     pub level: String,
 }
 
+/// 单个规则集配置。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RulesetEntry {
+    pub dat: String,
+    pub sha256sum: String,
+    pub last_update: Option<u64>,
+}
+
+/// 规则集下载配置。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Ruleset {
+    #[serde(flatten)]
+    pub entries: HashMap<String, RulesetEntry>,
+    #[serde(default = "default_interval_days")]
+    pub interval_days: u64,
+}
+
 /// 下载配置。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Download {
@@ -71,6 +89,8 @@ pub struct Download {
     pub core: CoreDownload,
     #[serde(default)]
     pub retry: Retry,
+    #[serde(default)]
+    pub ruleset: Ruleset,
 }
 
 /// 下载重试配置。
@@ -103,6 +123,10 @@ fn default_retry_delay() -> u64 {
     2
 }
 
+fn default_interval_days() -> u64 {
+    3
+}
+
 impl Default for Log {
     fn default() -> Self {
         Log {
@@ -119,6 +143,7 @@ impl Default for Download {
                 max_retries: default_max_retries(),
                 delay_secs: default_retry_delay(),
             },
+            ruleset: Ruleset::default(),
         }
     }
 }

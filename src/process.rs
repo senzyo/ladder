@@ -23,6 +23,7 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 
 use crate::dns;
 use crate::error::AppError;
+use crate::update;
 use crate::state::{self};
 
 // dnsapi.dll 导入，用于刷新系统 DNS 缓存。
@@ -193,11 +194,54 @@ fn kill_processes_by_name(exe_name: &str) {
 // 重启
 // ═══════════════════════════════════════════════
 
+/// 执行规则集更新（静默，失败仅 warn）。
+///
+/// 分两阶段获取锁：下载前克隆数据释放锁，下载完成后再获取锁更新 `last_update`，
+/// 避免长时间持锁阻塞托盘菜单。
+fn run_ruleset_update() {
+    let (exe_dir, ruleset, max_retries, delay_secs) = {
+        let app = match state::app_state() {
+            Some(a) => a,
+            None => return,
+        };
+        (
+            app.exe_dir.clone(),
+            app.settings.download.ruleset.clone(),
+            app.settings.download.retry.max_retries,
+            app.settings.download.retry.delay_secs,
+        )
+    };
+
+    debug!("[ruleset] 等待 5 秒让网络就绪...");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    let updated = update::update_ruleset(&exe_dir, &ruleset, max_retries, delay_secs);
+
+    if !updated.is_empty() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(mut app) = state::app_state_mut() {
+            for name in &updated {
+                if let Some(entry) = app.settings.download.ruleset.entries.get_mut(name) {
+                    entry.last_update = Some(now);
+                }
+            }
+            if let Err(e) = app.settings.save(&exe_dir) {
+                warn!("[ruleset] 保存配置失败: {e}");
+            }
+        }
+    }
+}
+
 pub fn restart_all_at(exe_dir: &Path) -> Result<(), AppError> {
     stop_all()?;
     cleanup_orphaned_wintun();
     start_sing_box_at(exe_dir)?;
-    start_xray_at(exe_dir)
+    start_xray_at(exe_dir)?;
+    run_ruleset_update();
+    Ok(())
 }
 
 pub fn restart_sing_box_at(exe_dir: &Path) -> Result<(), AppError> {
@@ -209,7 +253,9 @@ pub fn restart_sing_box_at(exe_dir: &Path) -> Result<(), AppError> {
 pub fn restart_xray_at(exe_dir: &Path) -> Result<(), AppError> {
     stop_processes(&["xray.exe"])?;
     cleanup_orphaned_wintun();
-    start_xray_at(exe_dir)
+    start_xray_at(exe_dir)?;
+    run_ruleset_update();
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════
