@@ -51,10 +51,9 @@ pub fn update_sing_box(
     delay_secs: u64,
 ) -> Result<(), AppError> {
     let exe_path = exe_dir.join("sing-box_core").join("sing-box.exe");
-    let api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
 
     let local = get_local_version(&exe_path, "version");
-    let (remote_ver, assets) = fetch_release(api_url)?;
+    let (remote_ver, assets) = fetch_sing_box_release()?;
     debug!("[sing-box] 版本比较: local={local}, remote={remote_ver}");
 
     if !is_newer(&local, &remote_ver) {
@@ -116,10 +115,9 @@ pub fn update_xray(
     delay_secs: u64,
 ) -> Result<(), AppError> {
     let exe_path = exe_dir.join("xray_core").join("xray.exe");
-    let api_url = "https://api.github.com/repos/XTLS/Xray-core/releases/latest";
 
     let local = get_local_version(&exe_path, "version");
-    let (remote_ver, assets) = fetch_release(api_url)?;
+    let (remote_ver, assets) = fetch_xray_release(XRAY_ZIP_NAME)?;
     debug!("[xray] 版本比较: local={local}, remote={remote_ver}");
 
     if !is_newer(&local, &remote_ver) {
@@ -240,8 +238,9 @@ fn is_newer(local: &str, remote: &str) -> bool {
     false
 }
 
-/// 调用 GitHub Releases API 获取最新版本号和 assets 列表。
-fn fetch_release(api_url: &str) -> Result<(String, Vec<Value>), AppError> {
+/// 调用 GitHub Releases API 获取 sing-box 最新正式版的版本号和 assets 列表。
+fn fetch_sing_box_release() -> Result<(String, Vec<Value>), AppError> {
+    let api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
     debug!("请求 GitHub API: {api_url}");
     let resp = ureq::get(api_url)
         .header("User-Agent", USER_AGENT)
@@ -266,6 +265,44 @@ fn fetch_release(api_url: &str) -> Result<(String, Vec<Value>), AppError> {
 
     debug!("GitHub API 响应: tag={tag}, assets 数量={}", assets.len());
     Ok((version, assets))
+}
+
+/// 调用 GitHub Releases API 获取 xray 最新版本（含 pre-release）的版本号和 assets 列表。
+///
+/// 遍历 `/releases` 返回的列表，跳过 draft，返回第一个包含 `zip_name` 的 release。
+fn fetch_xray_release(zip_name: &str) -> Result<(String, Vec<Value>), AppError> {
+    let api_url = "https://api.github.com/repos/XTLS/Xray-core/releases";
+    debug!("请求 GitHub API: {api_url}");
+    let resp = ureq::get(api_url)
+        .header("User-Agent", USER_AGENT)
+        .call()
+        .map_err(|e| AppError::Msg(format!("请求 GitHub API 失败: {e}")))?;
+
+    let body = resp
+        .into_body()
+        .read_to_string()
+        .map_err(|e| AppError::Msg(format!("读取 GitHub API 响应失败: {e}")))?;
+
+    let releases: Vec<Value> =
+        serde_json::from_str(&body).map_err(|e| AppError::Msg(format!("解析 GitHub API 响应失败: {e}")))?;
+
+    for release in &releases {
+        if release["draft"].as_bool() == Some(true) {
+            continue;
+        }
+        let assets = release["assets"].as_array().cloned().unwrap_or_default();
+        if assets.iter().any(|a| a["name"].as_str() == Some(zip_name)) {
+            let tag = release["tag_name"]
+                .as_str()
+                .ok_or(AppError::Msg("GitHub API 响应缺少 tag_name".into()))?
+                .to_string();
+            let version = tag.trim_start_matches('v').to_string();
+            debug!("GitHub API 响应: tag={tag}, assets 数量={}", assets.len());
+            return Ok((version, assets));
+        }
+    }
+
+    Err(AppError::Msg(format!("未找到包含 {zip_name} 的 release")))
 }
 
 /// 从 release assets 中查找指定文件名的下载 URL 和 digest 哈希值。
@@ -443,7 +480,7 @@ fn backup_and_extract(zip_path: &Path, core_dir: &Path, strip_prefix: Option<&st
         }
     }
 
-    info!("解压完成: {} -> {}", zip_path.display(), core_dir.display());
+    debug!("解压完成: {} -> {}", zip_path.display(), core_dir.display());
     Ok(())
 }
 
