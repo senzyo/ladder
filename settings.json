@@ -1,14 +1,23 @@
 {
-  "gh_proxy": {
-    "enabled": true,
-    "url": "https://gh-proxy.com/"
-  },
   "log": {
     "level": "debug"
   },
   "download": {
-    "max_retries": 3,
-    "retry_delay_secs": 2
+    "core": {
+      "gh_proxy": "https://gh-proxy.com/"
+    },
+    "ruleset": {
+      "ruleset_url": [
+        "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/geoip-only-cn-private.dat",
+        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+      ],
+      "interval_days": 3
+    },
+    "retry": {
+      "max_retries": 3,
+      "delay_secs": 2
+    }
   },
   "core": {
     "mode": "xray"

@@ -37,8 +37,6 @@ pub struct Core {
 /// 所有字段均提供默认值，配置文件缺失或解析失败时自动回退。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Settings {
-    #[serde(default = "default_gh_proxy")]
-    pub gh_proxy: GhProxy,
     #[serde(default)]
     pub log: Log,
     #[serde(default)]
@@ -50,14 +48,12 @@ pub struct Settings {
 /// 加载期间收集的警告信息，供 init_logging 之后通过 tracing 输出。
 static LOAD_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// GitHub CDN 代理配置。
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct GhProxy {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// 代理 URL 前缀，会拼接在 GitHub 原始下载链接前面。
-    #[serde(default = "default_proxy_url")]
-    pub url: String,
+/// 核心下载配置。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CoreDownload {
+    /// GitHub CDN 代理 URL 前缀，空字符串表示不启用代理。
+    #[serde(default)]
+    pub gh_proxy: String,
 }
 
 /// 日志配置。
@@ -68,21 +64,31 @@ pub struct Log {
     pub level: String,
 }
 
-/// 下载重试配置。
+/// 下载配置。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Download {
+    #[serde(default)]
+    pub core: CoreDownload,
+    #[serde(default)]
+    pub retry: Retry,
+}
+
+/// 下载重试配置。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Retry {
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     #[serde(default = "default_retry_delay")]
-    pub retry_delay_secs: u64,
+    pub delay_secs: u64,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn default_proxy_url() -> String {
-    "https://gh-proxy.com/".to_string()
+impl Default for Retry {
+    fn default() -> Self {
+        Retry {
+            max_retries: default_max_retries(),
+            delay_secs: default_retry_delay(),
+        }
+    }
 }
 
 fn default_log_level() -> String {
@@ -97,19 +103,6 @@ fn default_retry_delay() -> u64 {
     2
 }
 
-fn default_gh_proxy() -> GhProxy {
-    GhProxy {
-        enabled: true,
-        url: default_proxy_url(),
-    }
-}
-
-impl Default for GhProxy {
-    fn default() -> Self {
-        default_gh_proxy()
-    }
-}
-
 impl Default for Log {
     fn default() -> Self {
         Log {
@@ -121,8 +114,11 @@ impl Default for Log {
 impl Default for Download {
     fn default() -> Self {
         Download {
-            max_retries: default_max_retries(),
-            retry_delay_secs: default_retry_delay(),
+            core: CoreDownload::default(),
+            retry: Retry {
+                max_retries: default_max_retries(),
+                delay_secs: default_retry_delay(),
+            },
         }
     }
 }
@@ -184,25 +180,20 @@ impl Settings {
             self.log.level = "debug".to_string();
         }
 
-        if self.download.max_retries == 0 {
+        if self.download.retry.max_retries == 0 {
             push_warning("max_retries 不能为 0, 回退到默认值 3".to_string());
-            self.download.max_retries = 3;
-        } else if self.download.max_retries > 10 {
+            self.download.retry.max_retries = 3;
+        } else if self.download.retry.max_retries > 10 {
             push_warning("max_retries 超出上限 10, 已自动限制".to_string());
-            self.download.max_retries = 10;
+            self.download.retry.max_retries = 10;
         }
 
-        if self.download.retry_delay_secs == 0 {
-            push_warning("retry_delay_secs 不能为 0, 回退到默认值 2".to_string());
-            self.download.retry_delay_secs = 2;
-        } else if self.download.retry_delay_secs > 30 {
-            push_warning("retry_delay_secs 超出上限 30, 已自动限制".to_string());
-            self.download.retry_delay_secs = 30;
-        }
-
-        if self.gh_proxy.enabled && self.gh_proxy.url.is_empty() {
-            push_warning("gh_proxy 已启用但 url 为空, 自动关闭代理".to_string());
-            self.gh_proxy.enabled = false;
+        if self.download.retry.delay_secs == 0 {
+            push_warning("delay_secs 不能为 0, 回退到默认值 2".to_string());
+            self.download.retry.delay_secs = 2;
+        } else if self.download.retry.delay_secs > 30 {
+            push_warning("delay_secs 超出上限 30, 已自动限制".to_string());
+            self.download.retry.delay_secs = 30;
         }
     }
 }

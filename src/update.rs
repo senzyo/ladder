@@ -34,23 +34,21 @@ const XRAY_ZIP_NAME: &str = if cfg!(target_arch = "aarch64") {
 /// 依次更新 sing-box 和 xray。
 pub fn update_cores(
     exe_dir: &Path,
-    gh_proxy_enabled: bool,
     gh_proxy_url: &str,
     max_retries: u32,
-    retry_delay_secs: u64,
+    delay_secs: u64,
 ) -> Result<(), AppError> {
     let exe_dir = exe_dir.to_path_buf();
-    update_sing_box(&exe_dir, gh_proxy_enabled, gh_proxy_url, max_retries, retry_delay_secs)?;
-    update_xray(&exe_dir, gh_proxy_enabled, gh_proxy_url, max_retries, retry_delay_secs)
+    update_sing_box(&exe_dir, gh_proxy_url, max_retries, delay_secs)?;
+    update_xray(&exe_dir, gh_proxy_url, max_retries, delay_secs)
 }
 
 /// 检查并更新 sing-box。
 pub fn update_sing_box(
     exe_dir: &Path,
-    gh_proxy_enabled: bool,
     gh_proxy_url: &str,
     max_retries: u32,
-    retry_delay_secs: u64,
+    delay_secs: u64,
 ) -> Result<(), AppError> {
     let exe_path = exe_dir.join("sing-box_core").join("sing-box.exe");
     let api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
@@ -91,10 +89,9 @@ pub fn update_sing_box(
         &download_url,
         &zip_path,
         expected_hash.as_deref(),
-        gh_proxy_enabled,
         gh_proxy_url,
         max_retries,
-        retry_delay_secs,
+        delay_secs,
     ) {
         error!("[sing-box] 下载失败: {e}");
         crate::toast::show_toast_tagged("sing-box", "下载失败，请稍后重试", tag);
@@ -114,10 +111,9 @@ pub fn update_sing_box(
 /// 检查并更新 xray。
 pub fn update_xray(
     exe_dir: &Path,
-    gh_proxy_enabled: bool,
     gh_proxy_url: &str,
     max_retries: u32,
-    retry_delay_secs: u64,
+    delay_secs: u64,
 ) -> Result<(), AppError> {
     let exe_path = exe_dir.join("xray_core").join("xray.exe");
     let api_url = "https://api.github.com/repos/XTLS/Xray-core/releases/latest";
@@ -158,10 +154,9 @@ pub fn update_xray(
         &download_url,
         &zip_path,
         expected_hash.as_deref(),
-        gh_proxy_enabled,
         gh_proxy_url,
         max_retries,
-        retry_delay_secs,
+        delay_secs,
     ) {
         error!("[xray] 下载失败: {e}");
         crate::toast::show_toast_tagged("xray", "下载失败，请稍后重试", tag);
@@ -292,26 +287,25 @@ fn download_with_retry(
     download_url: &str,
     dest: &Path,
     expected_hash: Option<&str>,
-    gh_proxy_enabled: bool,
     gh_proxy_url: &str,
     max_retries: u32,
-    retry_delay_secs: u64,
+    delay_secs: u64,
 ) -> Result<(), AppError> {
-    let url = if gh_proxy_enabled {
-        format!("{gh_proxy_url}{download_url}")
-    } else {
+    let url = if gh_proxy_url.is_empty() {
         download_url.to_string()
+    } else {
+        format!("{gh_proxy_url}{download_url}")
     };
     debug!(
         "下载准备: url={url}, 代理={}, hash={}",
-        if gh_proxy_enabled { "启用" } else { "禁用" },
+        if gh_proxy_url.is_empty() { "禁用" } else { "启用" },
         expected_hash.unwrap_or("无")
     );
 
     for attempt in 1..=max_retries {
         if attempt > 1 {
-            debug!("第 {attempt}/{max_retries} 次重试, 等待 {retry_delay_secs}s...");
-            std::thread::sleep(std::time::Duration::from_secs(retry_delay_secs));
+            debug!("第 {attempt}/{max_retries} 次重试, 等待 {delay_secs}s...");
+            std::thread::sleep(std::time::Duration::from_secs(delay_secs));
         } else {
             debug!("第 1/{max_retries} 次尝试下载...");
         }

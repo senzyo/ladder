@@ -179,16 +179,15 @@ fn run() -> Result<(), AppError> {
     }
     info!("程序启动, exe目录: {}", exe_dir.display());
     debug!(
-        "生效配置: proxy={}({}), log_level={}, max_retries={}, retry_delay={}s",
-        if app_settings.gh_proxy.enabled {
-            "enabled"
-        } else {
+        "生效配置: gh_proxy={}, log_level={}, max_retries={}, delay_secs={}",
+        if app_settings.download.core.gh_proxy.is_empty() {
             "disabled"
+        } else {
+            &app_settings.download.core.gh_proxy
         },
-        app_settings.gh_proxy.url,
         app_settings.log.level,
-        app_settings.download.max_retries,
-        app_settings.download.retry_delay_secs,
+        app_settings.download.retry.max_retries,
+        app_settings.download.retry.delay_secs,
     );
     process::cleanup_network_registry();
     dns::restore_dns_to_dhcp();
@@ -296,7 +295,7 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                     return;
                 }
             };
-            let (gh_enabled, gh_url, max_retries, retry_delay) = {
+            let (gh_proxy, max_retries, delay_secs) = {
                 let app = match state::app_state() {
                     Some(a) => a,
                     None => {
@@ -307,10 +306,9 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                 };
                 let s = &app.settings;
                 (
-                    s.gh_proxy.enabled,
-                    s.gh_proxy.url.clone(),
-                    s.download.max_retries,
-                    s.download.retry_delay_secs,
+                    s.download.core.gh_proxy.clone(),
+                    s.download.retry.max_retries,
+                    s.download.retry.delay_secs,
                 )
             };
             if let Err(e) = process::stop_all() {
@@ -327,13 +325,13 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                 info!("{label}");
                 let result = match id {
                     tray::ID_UPDATE_ALL => {
-                        update::update_cores(&exe_dir, gh_enabled, &gh_url, max_retries, retry_delay)
+                        update::update_cores(&exe_dir, &gh_proxy, max_retries, delay_secs)
                     }
                     tray::ID_UPDATE_SING => {
-                        update::update_sing_box(&exe_dir, gh_enabled, &gh_url, max_retries, retry_delay)
+                        update::update_sing_box(&exe_dir, &gh_proxy, max_retries, delay_secs)
                     }
                     tray::ID_UPDATE_XRAY => {
-                        update::update_xray(&exe_dir, gh_enabled, &gh_url, max_retries, retry_delay)
+                        update::update_xray(&exe_dir, &gh_proxy, max_retries, delay_secs)
                     }
                     _ => unreachable!(),
                 };
