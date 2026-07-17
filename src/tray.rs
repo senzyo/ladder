@@ -1,6 +1,6 @@
 //! Windows 系统托盘 UI。
 //!
-//! 负责创建隐藏窗口、注册托盘图标、构建右键弹出菜单（重启/终止/更新/切换配置/退出），
+//! 负责创建隐藏窗口、注册托盘图标、构建右键弹出菜单 (重启/终止/更新/切换配置/退出) ,
 //! 处理鼠标消息并将菜单事件分发给 `main::execute_menu_command`。
 
 use std::collections::HashMap;
@@ -31,14 +31,14 @@ use crate::settings::CoreMode;
 use crate::state::{self, ConfigAction, ConfigKind, ProcessState};
 use tracing::warn;
 
-/// 托盘图标的自定义消息 ID，当托盘收到鼠标事件时通过此消息通知窗口。
+/// 托盘图标的自定义消息 ID, 当托盘收到鼠标事件时通过此消息通知窗口。
 pub const WM_TRAY_ICON: u32 = WM_APP + 1;
 const TRAY_UID: u32 = 1;
 
 static TRAY_HWND: OnceLock<isize> = OnceLock::new();
 
-// 菜单 ID 分段规划：101-199 重启，201-299 终止，301-399 更新，999 退出，
-// 1000-1999 sing-box 配置，2000-2999 xray 配置。
+// 菜单 ID 分段规划: 101-199 重启, 201-299 终止, 301-399 更新, 999 退出,
+// 1000-1999 sing-box 配置, 2000-2999 xray 配置。
 pub const ID_RESTART_SING: u16 = 101;
 pub const ID_RESTART_XRAY: u16 = 102;
 pub const ID_RESTART_ALL: u16 = 103;
@@ -124,7 +124,7 @@ pub unsafe fn add_icon(hwnd: isize, h_instance: isize, exe_dir: &Path) -> Result
     }
 }
 
-/// 运行 Windows 消息循环，阻塞直到窗口被销毁。
+/// 运行 Windows 消息循环, 阻塞直到窗口被销毁。
 pub unsafe fn run_message_loop() {
     unsafe {
         let mut msg: MSG = Default::default();
@@ -168,9 +168,9 @@ pub fn set_tooltip(text: &str) {
 
 /// 从 ICO 文件加载图标并转换为 32 位 DIB 位图句柄。
 ///
-/// 流程：LoadImageW 加载 ICO → 创建兼容 DC → 创建 DIB Section →
+/// 流程: LoadImageW 加载 ICO → 创建兼容 DC → 创建 DIB Section →
 /// DrawIconEx 绘制到位图 → 清理中间资源 → 返回位图句柄。
-/// 菜单项需要位图句柄（而非图标句柄）来显示状态图标。
+/// 菜单项需要位图句柄 (而非图标句柄) 来显示状态图标。
 pub(crate) unsafe fn load_icon_bitmap(exe_dir: &Path, icon_name: &str) -> isize {
     unsafe {
         let icon_path = exe_dir.join("icons").join(icon_name);
@@ -236,7 +236,7 @@ pub(crate) unsafe fn load_icon_bitmap(exe_dir: &Path, icon_name: &str) -> isize 
     }
 }
 
-/// 窗口过程：处理托盘图标鼠标事件和窗口销毁。
+/// 窗口过程: 处理托盘图标鼠标事件和窗口销毁。
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
@@ -276,9 +276,9 @@ unsafe fn load_app_icon(h_instance: Option<HINSTANCE>, exe_dir: &Path) -> HICON 
             if let Ok(icon) = icon {
                 return HICON(icon.0);
             }
-            warn!("加载托盘图标失败，回退到默认图标: {}", icon_path.display());
+            warn!("加载托盘图标失败, 回退到默认图标: {}", icon_path.display());
         } else {
-            warn!("托盘图标不存在，回退到默认图标: {}", icon_path.display());
+            warn!("托盘图标不存在, 回退到默认图标: {}", icon_path.display());
         }
         LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
     }
@@ -296,10 +296,10 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
     }
 }
 
-/// 构建并显示右键弹出菜单，返回用户选择的菜单项 ID 和配置项映射。
+/// 构建并显示右键弹出菜单, 返回用户选择的菜单项 ID 和配置项映射。
 ///
-/// 菜单根据当前核心模式（xray / sing-box / both）动态构建。
-/// Mutex 仅在读取状态时持有，TrackPopupMenu 在锁外执行，
+/// 菜单根据当前核心模式 (xray / sing-box / both) 动态构建。
+/// Mutex 仅在读取状态时持有, TrackPopupMenu 在锁外执行,
 /// 避免模态消息循环重入窗口过程时因 Mutex 不可重入导致死锁。
 unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
     unsafe {
@@ -334,7 +334,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
             ProcessState::NotInstalled => format!("{name} 未安装"),
         };
 
-        // ── 状态项：仅显示已启用核心 ──
+        // ── 状态项: 仅显示已启用核心 ──
         if core_mode.runs_sing_box() {
             append_status_item(menu, &status_label(sing_state, "sing-box"), status_hbmp(sing_state));
         }
@@ -347,7 +347,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
         let mut config_actions = HashMap::new();
 
         if core_mode == CoreMode::Both {
-            // 双核模式：重新启动/终止运行/更新核心 均为子菜单
+            // 双核模式: 重新启动/终止运行/更新核心 均为子菜单
             let restart_menu = new_submenu();
             let stop_menu = new_submenu();
             let update_menu = new_submenu();
@@ -387,7 +387,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
             append_submenu(menu, sing_menu, "切换 sing-box 配置");
             append_submenu(menu, xray_menu, "切换 xray 配置");
         } else {
-            // 单核模式：操作项为直接可点击的一级菜单
+            // 单核模式: 操作项为直接可点击的一级菜单
             let (restart_id, stop_id, update_id, config_kind, config_base, config_dir) = if core_mode.runs_xray() {
                 (
                     ID_RESTART_XRAY,
@@ -423,7 +423,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
             append_submenu(menu, config_menu, "切换配置");
         }
 
-        // ── 切换核心子菜单（始终显示） ──
+        // ── 切换核心子菜单 (始终显示)  ──
         append_separator(menu);
         let switch_menu = new_submenu();
         append_item_or_disabled(
@@ -493,7 +493,7 @@ unsafe fn append_disabled_item(menu: HMENU, label: &str) {
     }
 }
 
-/// 添加菜单项，`disabled` 为 true 时灰掉禁用。
+/// 添加菜单项, `disabled` 为 true 时灰掉禁用。
 unsafe fn append_item_or_disabled(menu: HMENU, id: u16, label: &str, disabled: bool) {
     unsafe {
         let w = state::wide(label);
@@ -503,8 +503,8 @@ unsafe fn append_item_or_disabled(menu: HMENU, id: u16, label: &str, disabled: b
     }
 }
 
-/// 添加带状态位图的菜单项（仅显示，不可点击）。
-/// 先 AppendMenuW 创建文本项，再 SetMenuItemInfoW 设置位图——
+/// 添加带状态位图的菜单项 (仅显示, 不可点击) 。
+/// 先 AppendMenuW 创建文本项, 再 SetMenuItemInfoW 设置位图——
 /// 这是 Win32 菜单项附加位图的标准做法。
 unsafe fn append_status_item(menu: HMENU, label: &str, hbmp: isize) {
     unsafe {
@@ -533,7 +533,7 @@ unsafe fn append_submenu(menu: HMENU, submenu: HMENU, label: &str) {
     }
 }
 
-/// 扫描配置目录并将每个 .json 文件添加为菜单项，最多 900 项。
+/// 扫描配置目录并将每个 .json 文件添加为菜单项, 最多 900 项。
 unsafe fn append_config_items(
     map: &mut HashMap<u16, ConfigAction>,
     menu: HMENU,
@@ -566,7 +566,7 @@ unsafe fn append_config_items(
 }
 
 /// 将字符串转为 UTF-16 并填充到固定长度缓冲区。
-/// `N` 是缓冲区长度（含 null 终止符），超出部分被截断。
+/// `N` 是缓冲区长度 (含 null 终止符) , 超出部分被截断。
 /// NOTIFYICONDATAW.szTip 要求 128 个 u16 的固定长度数组。
 fn to_wide_padded<const N: usize>(s: &str) -> [u16; N] {
     let mut buf = [0u16; N];

@@ -1,8 +1,8 @@
 //! 核心更新逻辑。
 //!
-//! 通过 GitHub Releases API 检查 sing-box / xray 的最新版本，
+//! 通过 GitHub Releases API 检查 sing-box / xray 的最新版本,
 //! 与本地版本比较后决定是否下载更新。支持 CDN 代理、SHA256 校验、
-//! 自动重试，下载完成后从 zip 中提取 exe 并替换。
+//! 自动重试, 下载完成后从 zip 中提取 exe 并替换。
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -14,11 +14,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::AppError;
 
-/// GitHub API 要求的 User-Agent 头，缺少会返回 403。
+/// GitHub API 要求的 User-Agent 头, 缺少会返回 403。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0";
 
 // 编译时根据目标架构确定下载文件名。
-// amd64 编译产物只下载 amd64 核心，arm64 编译产物只下载 arm64 核心。
+// amd64 编译产物只下载 amd64 核心, arm64 编译产物只下载 arm64 核心。
 const SINGBOX_ARCH_SUFFIX: &str = if cfg!(target_arch = "aarch64") {
     "arm64"
 } else {
@@ -58,7 +58,7 @@ pub fn update_sing_box(
     debug!("[sing-box] 版本比较: local={local}, remote={remote_ver}");
 
     if !is_newer(&local, &remote_ver) {
-        info!("[sing-box] 已是最新版本，跳过更新");
+        info!("[sing-box] 已是最新版本, 跳过更新");
         crate::toast::show_toast("sing-box", "当前已是最新版本");
         return Ok(());
     }
@@ -94,7 +94,7 @@ pub fn update_sing_box(
         delay_secs,
     ) {
         error!("[sing-box] 下载失败: {e}");
-        crate::toast::show_toast_tagged("sing-box", "下载失败，请稍后重试", tag);
+        crate::toast::show_toast_tagged("sing-box", "下载失败, 请稍后重试", tag);
         return Ok(());
     }
 
@@ -123,7 +123,7 @@ pub fn update_xray(
     debug!("[xray] 版本比较: local={local}, remote={remote_ver}");
 
     if !is_newer(&local, &remote_ver) {
-        info!("[xray] 已是最新版本，跳过更新");
+        info!("[xray] 已是最新版本, 跳过更新");
         crate::toast::show_toast("xray", "当前已是最新版本");
         return Ok(());
     }
@@ -159,7 +159,7 @@ pub fn update_xray(
         delay_secs,
     ) {
         error!("[xray] 下载失败: {e}");
-        crate::toast::show_toast_tagged("xray", "下载失败，请稍后重试", tag);
+        crate::toast::show_toast_tagged("xray", "下载失败, 请稍后重试", tag);
         return Ok(());
     }
 
@@ -172,7 +172,7 @@ pub fn update_xray(
     Ok(())
 }
 
-/// 运行可执行文件的版本命令并从 stdout 提取版本号，失败返回 "0.0.0"。
+/// 运行可执行文件的版本命令并从 stdout 提取版本号, 失败返回 "0.0.0"。
 pub(crate) fn get_local_version(exe_path: &Path, version_arg: &str) -> String {
     let output = match Command::new(exe_path).arg(version_arg).output() {
         Ok(out) => out,
@@ -188,9 +188,9 @@ pub(crate) fn get_local_version(exe_path: &Path, version_arg: &str) -> String {
     version
 }
 
-/// 从命令输出中提取版本号（如 "sing-box version 1.13.13" → "1.13.13"）。
+/// 从命令输出中提取版本号 (如 "sing-box version 1.13.13" → "1.13.13") 。
 ///
-/// 逐字节扫描，累积数字和点号，遇到连字符停止（跳过 "-beta" 等后缀），
+/// 逐字节扫描, 累积数字和点号, 遇到连字符停止 (跳过 "-beta" 等后缀) ,
 /// 遇到其他非数字字符终止。要求结果至少包含一个点号。
 fn extract_version(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
@@ -221,8 +221,8 @@ fn extract_version(text: &str) -> Option<String> {
     }
 }
 
-/// 比较两个版本号，remote > local 时返回 true。
-/// 缺失的段按 0 处理，因此 "1.0" 等价于 "1.0.0"。
+/// 比较两个版本号, remote > local 时返回 true。
+/// 缺失的段按 0 处理, 因此 "1.0" 等价于 "1.0.0"。
 fn is_newer(local: &str, remote: &str) -> bool {
     let local: Vec<u32> = local.split('.').filter_map(|s| s.parse().ok()).collect();
     let remote: Vec<u32> = remote.split('.').filter_map(|s| s.parse().ok()).collect();
@@ -282,7 +282,7 @@ fn find_asset(assets: &[Value], file_name: &str) -> (Option<String>, Option<Stri
 }
 
 /// 带重试的下载。启用代理时将代理 URL 前缀拼接到下载链接。
-/// 若提供 expected_hash，下载后校验 SHA256，不匹配则删除文件并重试。
+/// 若提供 expected_hash, 下载后校验 SHA256, 不匹配则删除文件并重试。
 fn download_core_with_retry(
     download_url: &str,
     dest: &Path,
@@ -337,10 +337,10 @@ fn download_core_with_retry(
         }
     }
 
-    Err(AppError::Msg("下载文件校验失败，已达到最大重试次数".into()))
+    Err(AppError::Msg("下载文件校验失败, 已达到最大重试次数".into()))
 }
 
-/// 下载单个文件到指定路径，已存在时先删除。
+/// 下载单个文件到指定路径, 已存在时先删除。
 fn download_file(url: &str, dest: &Path) -> Result<(), AppError> {
     if dest.exists() {
         let _ = fs::remove_file(dest);
@@ -360,7 +360,7 @@ fn download_file(url: &str, dest: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 计算文件的 SHA256 哈希值，返回小写十六进制字符串。
+/// 计算文件的 SHA256 哈希值, 返回小写十六进制字符串。
 fn sha256_file(path: &Path) -> Result<String, AppError> {
     let mut file = fs::File::open(path).map_err(|e| AppError::Msg(format!("打开文件计算 SHA256 失败: {e}")))?;
     let mut hasher = Sha256::new();
@@ -379,11 +379,11 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
 
 /// 备份核心目录并从 zip 解压全部内容。
 ///
-/// 1. 删除 `{core_dir}_backup`（如存在）
+/// 1. 删除 `{core_dir}_backup` (如存在)
 /// 2. 重命名 `{core_dir}` → `{core_dir}_backup`
 /// 3. 解压 zip 全部内容到 `{core_dir}`
 ///
-/// `strip_prefix` 为 Some 时，跳过 zip 中以此开头的顶层目录（用于 sing-box 的嵌套目录结构）。
+/// `strip_prefix` 为 Some 时, 跳过 zip 中以此开头的顶层目录 (用于 sing-box 的嵌套目录结构) 。
 fn backup_and_extract(zip_path: &Path, core_dir: &Path, strip_prefix: Option<&str>) -> Result<(), AppError> {
     let backup_dir = PathBuf::from(format!("{}_backup", core_dir.display()));
 
@@ -428,7 +428,7 @@ fn backup_and_extract(zip_path: &Path, core_dir: &Path, strip_prefix: Option<&st
         let out_path = core_dir.join(&rel_path);
 
         if !out_path.starts_with(core_dir) {
-            warn!("zip 条目路径越界，跳过: {}", rel_path);
+            warn!("zip 条目路径越界, 跳过: {}", rel_path);
             continue;
         }
 
@@ -453,13 +453,13 @@ fn backup_and_extract(zip_path: &Path, core_dir: &Path, strip_prefix: Option<&st
 
 /// 检查并更新规则集文件。
 ///
-/// 遍历 `ruleset.entries`，对每个规则集：
+/// 遍历 `ruleset.entries`, 对每个规则集:
 /// 1. 检查 `last_update` 是否超过 `interval_days` 天
-/// 2. 下载 sha256sum 文件，解析出期望哈希值
-/// 3. 下载 dat 文件到临时位置，校验 SHA256
+/// 2. 下载 sha256sum 文件, 解析出期望哈希值
+/// 3. 下载 dat 文件到临时位置, 校验 SHA256
 /// 4. 校验通过后移动到 `xray_core/{name}.dat`
 ///
-/// 返回成功更新的规则集名称列表（供调用方更新 `last_update`）。
+/// 返回成功更新的规则集名称列表 (供调用方更新 `last_update`) 。
 pub fn update_ruleset(exe_dir: &Path, ruleset: &crate::settings::Ruleset, max_retries: u32, delay_secs: u64) -> Vec<String> {
     let interval_secs = ruleset.interval_days * 86400;
     let now = std::time::SystemTime::now()
@@ -473,7 +473,7 @@ pub fn update_ruleset(exe_dir: &Path, ruleset: &crate::settings::Ruleset, max_re
         if let Some(last) = entry.last_update
             && now.saturating_sub(last) < interval_secs
         {
-            debug!("[ruleset] {name}: 未超过更新间隔，跳过");
+            debug!("[ruleset] {name}: 未超过更新间隔, 跳过");
             continue;
         }
 
@@ -512,7 +512,7 @@ pub fn update_ruleset(exe_dir: &Path, ruleset: &crate::settings::Ruleset, max_re
 
 /// 带重试地下载 sha256sum 文件并解析出哈希值。
 ///
-/// 文件格式：`<hash>  <filename>`
+/// 文件格式: `<hash>  <filename>`
 fn download_and_parse_sha256sum(url: &str, max_retries: u32, delay_secs: u64) -> Result<String, AppError> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
@@ -549,12 +549,12 @@ fn download_and_parse_sha256sum(url: &str, max_retries: u32, delay_secs: u64) ->
         }
     }
 
-    Err(AppError::Msg("获取 SHA256 校验和失败，已达到最大重试次数".into()))
+    Err(AppError::Msg("获取 SHA256 校验和失败, 已达到最大重试次数".into()))
 }
 
-/// 解析 sha256sum 文件内容，返回哈希值。
+/// 解析 sha256sum 文件内容, 返回哈希值。
 ///
-/// 格式：`<hash>  <filename>`
+/// 格式: `<hash>  <filename>`
 fn parse_sha256sum(content: &str) -> Option<String> {
     let hash = content.split_whitespace().next()?;
     if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -566,7 +566,7 @@ fn parse_sha256sum(content: &str) -> Option<String> {
 
 /// 带重试的 dat 文件下载。
 ///
-/// 下载到临时文件后校验 SHA256，下载失败或校验不匹配均删除并重试。
+/// 下载到临时文件后校验 SHA256, 下载失败或校验不匹配均删除并重试。
 fn download_ruleset_with_retry(
     url: &str,
     dest: &Path,
@@ -602,7 +602,7 @@ fn download_ruleset_with_retry(
         let _ = fs::remove_file(dest);
     }
 
-    Err(AppError::Msg("下载文件校验失败，已达到最大重试次数".into()))
+    Err(AppError::Msg("下载文件校验失败, 已达到最大重试次数".into()))
 }
 
 #[cfg(test)]

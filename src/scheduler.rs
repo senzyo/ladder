@@ -1,6 +1,6 @@
-//! Windows 任务计划程序：开机自动恢复物理网卡 DNS 为 DHCP。
+//! Windows 任务计划程序: 开机自动恢复物理网卡 DNS 为 DHCP。
 //!
-//! 通过 `schtasks.exe` 注册 BootTrigger 任务，开机后延迟 10 秒执行 PowerShell 命令，
+//! 通过 `schtasks.exe` 注册 BootTrigger 任务, 开机后延迟 10 秒执行 PowerShell 命令,
 //! 将所有物理网卡 DNS 重置为自动获取。用于防止意外断电后 DNS 状态残留。
 
 use std::fs;
@@ -57,7 +57,7 @@ const TASK_XML: &str = r#"<Task version="1.2" xmlns="http://schemas.microsoft.co
 
 /// 确保开机恢复 DNS 的任务计划已注册。
 ///
-/// 先查询任务是否已存在，不存在才创建。失败仅记录警告，不阻断启动流程。
+/// 先查询任务是否已存在, 不存在才创建。失败仅记录警告, 不阻断启动流程。
 pub fn ensure_boot_dns_reset_task(exe_dir: &Path) {
     if let Err(e) = register_task(exe_dir) {
         warn!("注册开机 DNS 恢复任务失败: {e}");
@@ -76,7 +76,7 @@ fn task_exists() -> bool {
 
 fn register_task(exe_dir: &Path) -> Result<(), String> {
     if task_exists() {
-        debug!("开机 DNS 恢复任务已存在，跳过注册");
+        debug!("开机 DNS 恢复任务已存在, 跳过注册");
         return Ok(());
     }
 

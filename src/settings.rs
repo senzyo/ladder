@@ -33,9 +33,9 @@ pub struct Core {
     pub mode: CoreMode,
 }
 
-/// 应用配置，对应 `settings.json`。
+/// 应用配置, 对应 `settings.json`。
 ///
-/// 所有字段均提供默认值，配置文件缺失或解析失败时自动回退。
+/// 所有字段均提供默认值, 配置文件缺失或解析失败时自动回退。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Settings {
     #[serde(default)]
@@ -46,13 +46,13 @@ pub struct Settings {
     pub core: Core,
 }
 
-/// 加载期间收集的警告信息，供 init_logging 之后通过 tracing 输出。
+/// 加载期间收集的警告信息, 供 init_logging 之后通过 tracing 输出。
 static LOAD_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// 核心下载配置。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CoreDownload {
-    /// GitHub CDN 代理 URL 前缀，空字符串表示不启用代理。
+    /// GitHub CDN 代理 URL 前缀, 空字符串表示不启用代理。
     #[serde(default)]
     pub gh_proxy: String,
 }
@@ -60,7 +60,7 @@ pub struct CoreDownload {
 /// 日志配置。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Log {
-    /// 日志级别，可选值: "debug", "info", "warn", "error"。
+    /// 日志级别, 可选值: "debug", "info", "warn", "error"。
     #[serde(default = "default_log_level")]
     pub level: String,
 }
@@ -183,7 +183,7 @@ impl Settings {
         std::fs::write(&path, json).map_err(|e| AppError::Msg(format!("写入配置文件失败: {e}")))
     }
 
-    /// 取出加载期间收集的警告。调用后清空，仅首次调用返回内容。
+    /// 取出加载期间收集的警告。调用后清空, 仅首次调用返回内容。
     pub fn take_warnings() -> Vec<String> {
         LOAD_WARNINGS
             .lock()
@@ -192,7 +192,7 @@ impl Settings {
             .collect()
     }
 
-    /// 校验配置值合法性，非法值回退到默认值。
+    /// 校验配置值合法性, 非法值回退到默认值。
     fn validate(&mut self) {
         let level = self.log.level.to_lowercase();
         if ALLOWED_LEVELS.contains(&level.as_str()) {

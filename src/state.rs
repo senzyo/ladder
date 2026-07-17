@@ -1,6 +1,6 @@
 //! 共享类型定义、全局应用状态与通用工具函数。
 //!
-//! 各模块通过此文件访问全局单例 `AppState` 和公共工具函数，
+//! 各模块通过此文件访问全局单例 `AppState` 和公共工具函数,
 //! 避免模块间循环依赖。
 
 use std::ffi::OsStr;
@@ -39,19 +39,19 @@ pub enum ProcessState {
 
 /// 全局应用状态。
 pub struct AppState {
-    /// 可执行文件所在目录，所有相对路径以此为基准。
+    /// 可执行文件所在目录, 所有相对路径以此为基准。
     pub exe_dir: PathBuf,
-    /// GDI 位图句柄：绿色（运行中）、黄色（未运行）、红色（未安装）。
+    /// GDI 位图句柄: 绿色 (运行中) 、黄色 (未运行) 、红色 (未安装) 。
     pub icon_green: isize,
     pub icon_yellow: isize,
     pub icon_red: isize,
     pub settings: settings::Settings,
-    /// 子进程句柄，用于直接 kill。
+    /// 子进程句柄, 用于直接 kill。
     pub child_sing_box: Option<Child>,
     pub child_xray: Option<Child>,
 }
 
-/// 全局应用状态，通过 OnceLock + Mutex 实现线程安全的单例。
+/// 全局应用状态, 通过 OnceLock + Mutex 实现线程安全的单例。
 pub static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
 
 /// 获取只读应用状态。Mutex 中毒时恢复并继续使用。
@@ -59,7 +59,7 @@ pub fn app_state() -> Option<std::sync::MutexGuard<'static, AppState>> {
     Some(APP.get()?.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// 获取可变应用状态。语义与 `app_state()` 相同，
+/// 获取可变应用状态。语义与 `app_state()` 相同,
 /// Mutex::lock 返回 `MutexGuard` 总是可变的。
 pub fn app_state_mut() -> Option<std::sync::MutexGuard<'static, AppState>> {
     app_state()
@@ -77,7 +77,7 @@ pub fn wide(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain(Some(0)).collect()
 }
 
-/// 检查路径存在性，不存在则返回错误。
+/// 检查路径存在性, 不存在则返回错误。
 pub fn ensure_exists(path: &Path) -> Result<(), AppError> {
     if path.exists() {
         Ok(())
@@ -86,7 +86,7 @@ pub fn ensure_exists(path: &Path) -> Result<(), AppError> {
     }
 }
 
-/// 从多个目录中收集所有 .json 文件，按文件名排序去重。
+/// 从多个目录中收集所有 .json 文件, 按文件名排序去重。
 pub fn find_json_configs(dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
@@ -108,12 +108,12 @@ pub fn find_json_configs(dirs: &[PathBuf]) -> Vec<PathBuf> {
     paths
 }
 
-/// 通过 Win32 ToolHelp API 枚举所有与 `exe_name` 匹配的进程，返回 PID 列表。
+/// 通过 Win32 ToolHelp API 枚举所有与 `exe_name` 匹配的进程, 返回 PID 列表。
 pub fn find_pids_by_name(exe_name: &str) -> Vec<u32> {
     let mut pids = Vec::new();
     unsafe {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            warn!("CreateToolhelp32Snapshot 失败，无法枚举进程");
+            warn!("CreateToolhelp32Snapshot 失败, 无法枚举进程");
             return pids;
         };
 
@@ -143,7 +143,7 @@ pub fn find_pids_by_name(exe_name: &str) -> Vec<u32> {
     pids
 }
 
-/// 检查指定名称的进程是否正在运行（找到第一个即返回）。
+/// 检查指定名称的进程是否正在运行 (找到第一个即返回) 。
 pub fn is_process_running(exe_name: &str) -> bool {
     unsafe {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {

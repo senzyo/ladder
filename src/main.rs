@@ -1,7 +1,7 @@
 //! 程序入口与核心编排。
 //!
-//! 负责应用生命周期管理（启动、运行、退出）、日志初始化、
-//! 托盘菜单命令分发，以及状态刷新。
+//! 负责应用生命周期管理 (启动、运行、退出) 、日志初始化、
+//! 托盘菜单命令分发, 以及状态刷新。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -39,7 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
 
 use crate::state::ConfigAction;
 
-/// COM 初始化守卫，Drop 时自动调用 CoUninitialize。
+/// COM 初始化守卫, Drop 时自动调用 CoUninitialize。
 struct ComGuard;
 
 impl ComGuard {
@@ -67,7 +67,7 @@ fn main() {
     }
 }
 
-/// 自定义日志格式：`{时间戳}{毫秒}Z [{级别}] {消息}`，级别带 ANSI 颜色。
+/// 自定义日志格式: `{时间戳}{毫秒}Z [{级别}] {消息}`, 级别带 ANSI 颜色。
 struct BracketedLevel;
 
 const ANSI_RESET: &str = "\x1b[0m";
@@ -115,9 +115,9 @@ fn format_utc_timestamp() -> String {
 
 /// 初始化日志系统。
 ///
-/// 1. 为 Windows 控制台启用 ANSI 转义码支持（彩色输出）
-/// 2. 创建 console_layer（stderr）和 file_layer（app.log）
-/// 3. 日志级别优先使用 RUST_LOG 环境变量，否则使用 settings.json 中的配置
+/// 1. 为 Windows 控制台启用 ANSI 转义码支持 (彩色输出)
+/// 2. 创建 console_layer (stderr) 和 file_layer (app.log)
+/// 3. 日志级别优先使用 RUST_LOG 环境变量, 否则使用 settings.json 中的配置
 fn init_logging(exe_dir: &Path, log_level: &str) -> Result<(), AppError> {
     unsafe {
         if let Ok(handle) = GetStdHandle(STD_ERROR_HANDLE) {
@@ -155,7 +155,7 @@ fn init_logging(exe_dir: &Path, log_level: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 应用主入口：初始化 COM → 创建目录 → 加载配置 → 初始化日志和 Toast →
+/// 应用主入口: 初始化 COM → 创建目录 → 加载配置 → 初始化日志和 Toast →
 /// 检测版本 → 创建托盘图标 → 运行消息循环 → 退出时清理 GDI 资源。
 fn run() -> Result<(), AppError> {
     let _com = ComGuard::new()?;
@@ -228,7 +228,7 @@ fn run() -> Result<(), AppError> {
 
 /// 分发托盘菜单命令。
 ///
-/// 重启/终止/更新操作在独立线程中执行（避免阻塞 UI 线程），每个线程
+/// 重启/终止/更新操作在独立线程中执行 (避免阻塞 UI 线程) , 每个线程
 /// 独立初始化 COM。切换配置操作在当前线程同步执行。退出操作终止所有
 /// 进程并销毁窗口。
 fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, ConfigAction>) {
@@ -390,7 +390,7 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
     }
 }
 
-/// 执行配置切换操作：将选中的配置文件复制到活跃配置路径并重启对应服务。
+/// 执行配置切换操作: 将选中的配置文件复制到活跃配置路径并重启对应服务。
 fn run_config_action(id: u16, config_actions: &HashMap<u16, ConfigAction>) -> Result<(), AppError> {
     let Some(action) = config_actions.get(&id).cloned() else {
         return Ok(());

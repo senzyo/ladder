@@ -1,7 +1,7 @@
 //! Windows Toast 通知。
 //!
 //! 通过 Windows COM ToastNotification API 弹出系统通知。
-//! 首次运行时会在开始菜单创建快捷方式并设置 AUMID（AppUserModelID），
+//! 首次运行时会在开始菜单创建快捷方式并设置 AUMID (AppUserModelID) ,
 //! 这是 Windows 识别应用身份以显示 Toast 通知的必要条件。
 
 use std::ffi::c_void;
@@ -28,7 +28,7 @@ static ICON_URI: OnceLock<String> = OnceLock::new();
 
 /// 初始化 Toast 通知系统。
 ///
-/// 设置当前进程的 AUMID，并在开始菜单 Programs 目录创建快捷方式。
+/// 设置当前进程的 AUMID, 并在开始菜单 Programs 目录创建快捷方式。
 /// Windows 要求应用必须有带 AUMID 的快捷方式才能显示 Toast 通知。
 pub fn setup(exe_path: &std::path::Path) -> Result<(), AppError> {
     unsafe {
@@ -41,12 +41,12 @@ pub fn setup(exe_path: &std::path::Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 显示 Toast 通知，失败时回退到 MessageBox。
+/// 显示 Toast 通知, 失败时回退到 MessageBox。
 pub fn show_toast(title: &str, message: &str) {
     show_toast_tagged(title, message, "");
 }
 
-/// 显示带 tag 的 Toast 通知，相同 tag 会替换之前的通知。
+/// 显示带 tag 的 Toast 通知, 相同 tag 会替换之前的通知。
 /// tag 为空字符串时不设置 tag。
 pub fn show_toast_tagged(title: &str, message: &str, tag: &str) {
     let xml = format!(
@@ -61,7 +61,7 @@ pub fn show_toast_tagged(title: &str, message: &str, tag: &str) {
     }
 }
 
-/// 显示带进度条的 Toast 通知（不确定进度），用于下载过程。
+/// 显示带进度条的 Toast 通知 (不确定进度) , 用于下载过程。
 pub fn show_progress_toast(title: &str, tag: &str) {
     let xml = format!(
         "<toast><visual><binding template=\"ToastGeneric\">{}<text>{}</text><progress title=\"下载中\" value=\"indeterminate\" valueStringOverride=\"准备下载...\" status=\"\"/></binding></visual><audio silent=\"true\"/></toast>",
@@ -132,7 +132,7 @@ fn fallback_msgbox(title: &str, err: &str) {
 // Shortcut (windows crate IShellLinkW + windows-sys property store)
 // ═══════════════════════════════════════════════
 
-/// 确保开始菜单快捷方式存在。如果旧版以 AUMID 命名的快捷方式存在则删除（迁移）。
+/// 确保开始菜单快捷方式存在。如果旧版以 AUMID 命名的快捷方式存在则删除 (迁移) 。
 fn ensure_shortcut(exe_path: &std::path::Path, icon_path: &std::path::Path) -> Result<(), AppError> {
     let programs_dir = get_programs_dir()?;
     let lnk_path = programs_dir.join(format!("{}.lnk", SHORTCUT_NAME));
@@ -179,8 +179,8 @@ fn create_shortcut(
 /// 在快捷方式文件上设置 AppUserModelID 属性。
 ///
 /// Windows Toast 通知系统通过 AUMID 识别应用身份。不仅进程需要调用
-/// `SetCurrentProcessExplicitAppUserModelID`，开始菜单中的快捷方式
-/// 也需要写入相同的 AUMID，否则通知无法关联到应用图标。
+/// `SetCurrentProcessExplicitAppUserModelID`, 开始菜单中的快捷方式
+/// 也需要写入相同的 AUMID, 否则通知无法关联到应用图标。
 fn set_shortcut_aumid(lnk_path: &std::path::Path) -> Result<(), AppError> {
     unsafe {
         use windows_sys::Win32::System::Com::StructuredStorage::PROPVARIANT;
@@ -211,8 +211,8 @@ fn set_shortcut_aumid(lnk_path: &std::path::Path) -> Result<(), AppError> {
 
         let aumid_wide: Vec<u16> = std::ffi::OsStr::new(AUMID).encode_wide().chain(Some(0)).collect();
 
-        // 手动构建 PROPVARIANT 结构体：
-        // 偏移 0: VT_LPWSTR 类型标签（u16）
+        // 手动构建 PROPVARIANT 结构体:
+        // 偏移 0: VT_LPWSTR 类型标签 (u16)
         // 偏移 8: 指向 null 结尾 Unicode 字符串的指针
         let mut pv: PROPVARIANT = std::mem::zeroed();
         let pv_ptr = &mut pv as *mut PROPVARIANT as *mut u8;
@@ -250,10 +250,10 @@ fn get_programs_dir() -> Result<PathBuf, AppError> {
 // COM vtables & types for windows-sys IPropertyStore
 // ═══════════════════════════════════════════════
 
-/// COM VARIANT 类型：null 结尾 Unicode 字符串（LPWSTR）。
+/// COM VARIANT 类型: null 结尾 Unicode 字符串 (LPWSTR) 。
 const VT_LPWSTR: i32 = 31;
 
-/// PKEY_AppUserModel_ID 属性的 GUID（来自 propkey.h）。
+/// PKEY_AppUserModel_ID 属性的 GUID (来自 propkey.h) 。
 const GUID_PKEY_AUMID: windows_sys::core::GUID = windows_sys::core::GUID {
     data1: 0x9F4C2855,
     data2: 0x9F79,
@@ -276,7 +276,7 @@ struct PROPERTYKEY_S {
 }
 
 // 手动定义 IPropertyStore COM vtable。
-// windows crate 的 IPropertyStore 与 windows-sys 的 PROPVARIANT 存在跨 crate 兼容性问题，
+// windows crate 的 IPropertyStore 与 windows-sys 的 PROPVARIANT 存在跨 crate 兼容性问题,
 // 因此直接用 windows-sys 构建最小可用的 vtable 来调用 SetValue / Commit。
 #[repr(C)]
 struct IPropertyStoreVtbl {

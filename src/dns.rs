@@ -1,11 +1,11 @@
-//! 物理网卡 DNS 管理，防止 xray TUN 模式下的 DNS 泄漏。
+//! 物理网卡 DNS 管理, 防止 xray TUN 模式下的 DNS 泄漏。
 //!
-//! xray 使用 wintun.dll 时，Windows 的"多接口并发/回退"机制会导致 DNS 查询
-//! 同时通过物理网卡发送，造成 DNS 泄漏。本模块在 xray TUN 模式运行期间，
-//! 将物理网卡 DNS 设置为 127.0.0.1 和 ::1，停止后恢复为 DHCP 自动获取。
+//! xray 使用 wintun.dll 时, Windows 的"多接口并发/回退"机制会导致 DNS 查询
+//! 同时通过物理网卡发送, 造成 DNS 泄漏。本模块在 xray TUN 模式运行期间,
+//! 将物理网卡 DNS 设置为 127.0.0.1 和 ::1, 停止后恢复为 DHCP 自动获取。
 //!
-//! 使用 `GetIfTable2` API 检测物理网卡，通过 `InterfaceAndOperStatusFlags.ConnectorPresent`
-//! 标志判断，这与 `Get-NetAdapter -Physical` 使用相同的检测机制。
+//! 使用 `GetIfTable2` API 检测物理网卡, 通过 `InterfaceAndOperStatusFlags.ConnectorPresent`
+//! 标志判断, 这与 `Get-NetAdapter -Physical` 使用相同的检测机制。
 
 use tracing::{debug, info, warn};
 use windows::Win32::Foundation::NO_ERROR;
@@ -13,7 +13,7 @@ use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2};
 use windows_registry::LOCAL_MACHINE;
 
 /// MIB_IF_ROW2_0 bitfield 中 ConnectorPresent 标志的位偏移。
-/// 根据 Windows 文档：Bit 2 = ConnectorPresent。
+/// 根据 Windows 文档: Bit 2 = ConnectorPresent。
 const CONNECTOR_PRESENT_BIT: u8 = 1 << 2;
 
 /// MIB_IF_ROW2_0 bitfield 中 HardwareInterface 标志的位偏移。
@@ -22,18 +22,18 @@ const HARDWARE_INTERFACE_BIT: u8 = 1 << 0;
 
 /// 物理网卡信息。
 struct PhysicalAdapter {
-    /// 接口别名（如 "Ethernet", "Wi-Fi"），用于日志显示。
+    /// 接口别名 (如 "Ethernet", "Wi-Fi") , 用于日志显示。
     alias: String,
-    /// 接口 GUID，用于注册表路径。
+    /// 接口 GUID, 用于注册表路径。
     guid: String,
 }
 
 /// 获取物理网卡列表。
 ///
-/// 使用 `GetIfTable2` API 枚举所有网络接口，筛选条件：
-/// - `ConnectorPresent` = true（物理连接器存在）
-/// - `HardwareInterface` = true（硬件接口）
-/// - `AccessType` != `NET_IF_ACCESS_LOOPBACK`（非回环接口）
+/// 使用 `GetIfTable2` API 枚举所有网络接口, 筛选条件:
+/// - `ConnectorPresent` = true (物理连接器存在)
+/// - `HardwareInterface` = true (硬件接口)
+/// - `AccessType` != `NET_IF_ACCESS_LOOPBACK` (非回环接口)
 ///
 /// 这与 `Get-NetAdapter -Physical` 使用相同的检测机制。
 fn get_physical_adapters() -> Vec<PhysicalAdapter> {
@@ -61,13 +61,13 @@ fn get_physical_adapters() -> Vec<PhysicalAdapter> {
             continue;
         }
 
-        // 排除回环接口（AccessType = 3 = NET_IF_ACCESS_LOOPBACK）
+        // 排除回环接口 (AccessType = 3 = NET_IF_ACCESS_LOOPBACK)
         // NET_IF_ACCESS_LOOPBACK 的值是 3
         if row.AccessType.0 == 3 {
             continue;
         }
 
-        // 提取接口别名（UTF-16 字符串）
+        // 提取接口别名 (UTF-16 字符串)
         let alias_end = row.Alias.iter().position(|&c| c == 0).unwrap_or(row.Alias.len());
         let alias = String::from_utf16_lossy(&row.Alias[..alias_end]);
 
@@ -98,14 +98,14 @@ fn get_physical_adapters() -> Vec<PhysicalAdapter> {
 
 /// 设置物理网卡 DNS 防止 xray TUN 模式下的 DNS 泄漏。
 ///
-/// IPv4 DNS 设置为 `127.0.0.1`，IPv6 DNS 设置为 `::1`。
-/// 通过修改注册表 `NameServer` 值实现，Windows 会优先使用此值作为静态 DNS。
+/// IPv4 DNS 设置为 `127.0.0.1`, IPv6 DNS 设置为 `::1`。
+/// 通过修改注册表 `NameServer` 值实现, Windows 会优先使用此值作为静态 DNS。
 ///
-/// 失败仅记录警告，不阻断调用流程。
+/// 失败仅记录警告, 不阻断调用流程。
 pub fn set_physical_dns_to_local() {
     let adapters = get_physical_adapters();
     if adapters.is_empty() {
-        debug!("未发现物理网卡，跳过 DNS 设置");
+        debug!("未发现物理网卡, 跳过 DNS 设置");
         return;
     }
 
@@ -126,14 +126,14 @@ pub fn set_physical_dns_to_local() {
 
 /// 恢复物理网卡 DNS 为 DHCP 自动获取。
 ///
-/// 将 IPv4 和 IPv6 的 `NameServer` 设置为空字符串，Windows 会回退到
-/// `DhcpNameServer`（由 DHCP 客户端服务维护）。
+/// 将 IPv4 和 IPv6 的 `NameServer` 设置为空字符串, Windows 会回退到
+/// `DhcpNameServer` (由 DHCP 客户端服务维护) 。
 ///
-/// 失败仅记录警告，不阻断调用流程。
+/// 失败仅记录警告, 不阻断调用流程。
 pub fn restore_dns_to_dhcp() {
     let adapters = get_physical_adapters();
     if adapters.is_empty() {
-        debug!("未发现物理网卡，跳过 DNS 恢复");
+        debug!("未发现物理网卡, 跳过 DNS 恢复");
         return;
     }
 

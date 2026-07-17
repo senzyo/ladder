@@ -1,6 +1,6 @@
 //! 子进程生命周期管理、TUN 接口配置与 DNS 缓存刷新。
 //!
-//! 负责 sing-box / xray 子进程的启停控制、TUN 接口名随机化（`tun-` 前缀）、
+//! 负责 sing-box / xray 子进程的启停控制、TUN 接口名随机化 (`tun-` 前缀) 、
 //! 孤立 WinTUN 设备节点清理、网络注册表清理、以及 DNS 缓存刷新。
 
 use std::ffi::OsStr;
@@ -26,7 +26,7 @@ use crate::error::AppError;
 use crate::update;
 use crate::state::{self};
 
-// dnsapi.dll 导入，用于刷新系统 DNS 缓存。
+// dnsapi.dll 导入, 用于刷新系统 DNS 缓存。
 #[link(name = "dnsapi")]
 unsafe extern "system" {
     fn DnsFlushResolverCache() -> i32;
@@ -92,7 +92,7 @@ pub fn start_xray_at(exe_dir: &Path) -> Result<(), AppError> {
     state::ensure_exists(&exe)?;
     state::ensure_exists(&config)?;
 
-    // 一次性读取并解析配置，用于 TUN 检测和接口名随机化
+    // 一次性读取并解析配置, 用于 TUN 检测和接口名随机化
     let text = fs::read_to_string(&config).map_err(|e| AppError::Msg(format!("读取 xray 配置失败: {e}")))?;
     let json: Value = serde_json::from_str(&text).map_err(|e| AppError::Msg(format!("解析 xray 配置失败: {e}")))?;
 
@@ -139,10 +139,10 @@ pub fn stop_all() -> Result<(), AppError> {
     stop_processes(&["sing-box.exe", "xray.exe"])
 }
 
-/// 终止指定进程列表。先通过保存的 Child 句柄直接 kill，
-/// 再通过进程名枚举兜底（覆盖其他来源启动的同名进程）。
+/// 终止指定进程列表。先通过保存的 Child 句柄直接 kill,
+/// 再通过进程名枚举兜底 (覆盖其他来源启动的同名进程) 。
 pub fn stop_processes(processes: &[&str]) -> Result<(), AppError> {
-    // 阶段 1：从 mutex 中取出 Child 句柄（持锁时间极短）
+    // 阶段 1: 从 mutex 中取出 Child 句柄 (持锁时间极短)
     let children: Vec<(String, Option<std::process::Child>)> = match state::app_state_mut() {
         Some(mut app) => processes
             .iter()
@@ -157,19 +157,19 @@ pub fn stop_processes(processes: &[&str]) -> Result<(), AppError> {
             .collect(),
         None => processes.iter().map(|&p| (p.to_string(), None)).collect(),
     };
-    // 阶段 2：kill（锁已释放，不阻塞其他线程）
+    // 阶段 2: kill (锁已释放, 不阻塞其他线程)
     for (name, child) in children {
         if let Some(mut c) = child {
             info!("终止子进程: {name}");
             let _ = c.kill();
         }
     }
-    // 阶段 3：通过进程名枚举兜底（覆盖其他来源启动的同名进程）
+    // 阶段 3: 通过进程名枚举兜底 (覆盖其他来源启动的同名进程)
     for process in processes {
         info!("终止进程: {process}");
         kill_processes_by_name(process);
     }
-    // 如果停止的进程包含 xray，恢复物理网卡 DNS
+    // 如果停止的进程包含 xray, 恢复物理网卡 DNS
     if processes.contains(&"xray.exe") {
         dns::restore_dns_to_dhcp();
     }
@@ -194,9 +194,9 @@ fn kill_processes_by_name(exe_name: &str) {
 // 重启
 // ═══════════════════════════════════════════════
 
-/// 执行规则集更新（静默，失败仅 warn）。
+/// 执行规则集更新 (静默, 失败仅 warn) 。
 ///
-/// 分两阶段获取锁：下载前克隆数据释放锁，下载完成后再获取锁更新 `last_update`，
+/// 分两阶段获取锁: 下载前克隆数据释放锁, 下载完成后再获取锁更新 `last_update`,
 /// 避免长时间持锁阻塞托盘菜单。
 fn run_ruleset_update() {
     let (exe_dir, ruleset, max_retries, delay_secs) = {
@@ -264,18 +264,18 @@ pub fn restart_xray_at(exe_dir: &Path) -> Result<(), AppError> {
 
 /// 随机化 sing-box 配置中的 TUN 接口名。
 ///
-/// sing-box TUN 适配器在 Windows 上以固定名称注册，重启时如果旧适配器
+/// sing-box TUN 适配器在 Windows 上以固定名称注册, 重启时如果旧适配器
 /// 未完全释放会导致冲突。通过每次启动时生成带 `tun-` 前缀的随机名称来避免。
 ///
 /// 使用字符串替换而非 JSON 序列化来保留原始配置的格式和注释。
-/// 如果配置中没有 type=tun 的 inbound，静默跳过（用户可能不使用 TUN 功能）。
-/// 如果 tun inbound 缺少 interface_name 字段，自动写入随机化后的值。
+/// 如果配置中没有 type=tun 的 inbound, 静默跳过 (用户可能不使用 TUN 功能) 。
+/// 如果 tun inbound 缺少 interface_name 字段, 自动写入随机化后的值。
 fn randomize_sing_box_tun_name(config_path: &Path) -> Result<(), AppError> {
     let text = fs::read_to_string(config_path).map_err(|e| AppError::Msg(format!("读取 sing-box 配置失败: {e}")))?;
     let json: Value = serde_json::from_str(&text).map_err(|e| AppError::Msg(format!("解析 sing-box 配置失败: {e}")))?;
     let new_name = random_tun_name();
 
-    // 找 tun inbound，找不到直接跳过
+    // 找 tun inbound, 找不到直接跳过
     let tun_inbound = json.get("inbounds").and_then(Value::as_array).and_then(|inbounds| {
         inbounds
             .iter()
@@ -285,7 +285,7 @@ fn randomize_sing_box_tun_name(config_path: &Path) -> Result<(), AppError> {
     let tun_inbound = match tun_inbound {
         Some(inbound) => inbound,
         None => {
-            debug!("未发现 type=tun 的 inbound，跳过 TUN 接口名随机化");
+            debug!("未发现 type=tun 的 inbound, 跳过 TUN 接口名随机化");
             return Ok(());
         }
     };
@@ -319,15 +319,15 @@ fn randomize_sing_box_tun_name(config_path: &Path) -> Result<(), AppError> {
 
 /// 随机化 xray 配置中的 TUN 接口名。
 ///
-/// xray 的 TUN inbound 使用 `"protocol": "tun"` 标识，接口名位于
-/// `settings.name` 字段（如 `"name": "xray0"`）。逻辑与
-/// `randomize_sing_box_tun_name` 对称：字符串替换保留原始格式。
+/// xray 的 TUN inbound 使用 `"protocol": "tun"` 标识, 接口名位于
+/// `settings.name` 字段 (如 `"name": "xray0"`) 。逻辑与
+/// `randomize_sing_box_tun_name` 对称: 字符串替换保留原始格式。
 ///
-/// 调用者负责保证配置中存在 TUN inbound，并传入已读取的 `text` 和已解析的 `json`。
+/// 调用者负责保证配置中存在 TUN inbound, 并传入已读取的 `text` 和已解析的 `json`。
 fn randomize_xray_tun_name(config_path: &Path, text: &str, json: &Value) -> Result<(), AppError> {
     let new_name = random_tun_name();
 
-    // 定位 TUN inbound（调用者已保证 TUN 存在）
+    // 定位 TUN inbound (调用者已保证 TUN 存在)
     let tun_inbound = json
         .get("inbounds")
         .and_then(Value::as_array)
@@ -369,11 +369,11 @@ fn randomize_xray_tun_name(config_path: &Path, text: &str, json: &Value) -> Resu
     fs::write(config_path, new_text).map_err(|e| AppError::Msg(format!("写入 xray 配置失败: {e}")))
 }
 
-/// TUN 接口名前缀，用于在注册表中识别本程序创建的网络配置。
+/// TUN 接口名前缀, 用于在注册表中识别本程序创建的网络配置。
 const TUN_PREFIX: &str = "tun-";
 
-/// 生成带 `tun-` 前缀的随机 TUN 接口名（如 `tun-0ad1f0`）。
-/// 使用 RandomState 对时间戳做哈希，每次运行种子不同。
+/// 生成带 `tun-` 前缀的随机 TUN 接口名 (如 `tun-0ad1f0`) 。
+/// 使用 RandomState 对时间戳做哈希, 每次运行种子不同。
 fn random_tun_name() -> String {
     use std::hash::{BuildHasher, Hasher};
     let seed = std::hash::RandomState::new();
@@ -389,9 +389,9 @@ fn random_tun_name() -> String {
 /// 清理 Windows 网络配置注册表中 TUN 相关的子项。
 ///
 /// 枚举 `NetworkList\Profiles` 和 `NetworkList\Signatures\Unmanaged`
-/// 下的所有子项，删除 `Description` 值以 `tun-` 开头的条目。
+/// 下的所有子项, 删除 `Description` 值以 `tun-` 开头的条目。
 ///
-/// 需要管理员权限；若权限不足会记录警告但不阻断启动流程。
+/// 需要管理员权限; 若权限不足会记录警告但不阻断启动流程。
 pub fn cleanup_network_registry() {
     const PROFILES: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles";
     const SIGNATURES: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged";
@@ -401,7 +401,7 @@ pub fn cleanup_network_registry() {
     clean_tun_entries(SIGNATURES);
 }
 
-/// 枚举 `parent_path` 下的所有子项，删除 `Description` 值以 `TUN_PREFIX` 开头的子项。
+/// 枚举 `parent_path` 下的所有子项, 删除 `Description` 值以 `TUN_PREFIX` 开头的子项。
 fn clean_tun_entries(parent_path: &str) {
     use windows_registry::LOCAL_MACHINE;
 
@@ -442,13 +442,13 @@ fn clean_tun_entries(parent_path: &str) {
 
 /// 清理孤立或异常的 WinTUN 设备节点。
 ///
-/// sing-box TUN 模式依赖 WinTUN 驱动，异常退出后可能残留无效设备节点，
-/// 导致下次启动时 TUN 接口创建失败。此函数：
+/// sing-box TUN 模式依赖 WinTUN 驱动, 异常退出后可能残留无效设备节点,
+/// 导致下次启动时 TUN 接口创建失败。此函数:
 ///
 /// 1. 通过 `CM_Get_Device_ID_ListW` 枚举所有设备实例 ID
 /// 2. 解析双 null 结尾的多字符串缓冲区
 /// 3. 筛选包含 "WINTUN" 的设备
-/// 4. 检查设备状态：设备节点不存在（CR_NO_SUCH_DEVNODE）或未启动 / 有异常
+/// 4. 检查设备状态: 设备节点不存在 (CR_NO_SUCH_DEVNODE) 或未启动 / 有异常
 /// 5. 通过 `pnputil /remove-device` 移除问题设备
 /// 6. 最后执行 `pnputil /scan-devices` 重新扫描硬件
 fn cleanup_orphaned_wintun() {
