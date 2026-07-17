@@ -163,7 +163,7 @@ fn run() -> Result<(), AppError> {
     let exe_path = std::env::current_exe()?;
     let exe_dir = exe_path
         .parent()
-        .ok_or(AppError::Msg("无法获取exe目录".into()))?
+        .ok_or(AppError::Msg("无法获取 exe 所在目录".into()))?
         .to_path_buf();
 
     fs::create_dir_all(exe_dir.join("sing-box_core"))?;
@@ -177,18 +177,7 @@ fn run() -> Result<(), AppError> {
     for w in settings::Settings::take_warnings() {
         warn!("{w}");
     }
-    info!("程序启动, exe目录: {}", exe_dir.display());
-    debug!(
-        "生效配置: gh_proxy={}, log_level={}, max_retries={}, delay_secs={}",
-        if app_settings.download.core.gh_proxy.is_empty() {
-            "disabled"
-        } else {
-            &app_settings.download.core.gh_proxy
-        },
-        app_settings.log.level,
-        app_settings.download.retry.max_retries,
-        app_settings.download.retry.delay_secs,
-    );
+    info!("程序启动, exe 所在目录: {}", exe_dir.display());
     process::cleanup_network_registry();
     dns::restore_dns_to_dhcp();
     scheduler::ensure_boot_dns_reset_task(&exe_dir);
@@ -378,7 +367,7 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                     return;
                 }
             };
-            debug!("打开程序目录: {}", exe_dir.display());
+            info!("打开程序目录: {}", exe_dir.display());
             let _ = Command::new("explorer").arg(&exe_dir).spawn();
             return;
         }

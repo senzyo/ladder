@@ -177,7 +177,7 @@ pub(crate) fn get_local_version(exe_path: &Path, version_arg: &str) -> String {
     let output = match Command::new(exe_path).arg(version_arg).output() {
         Ok(out) => out,
         Err(e) => {
-            debug!("获取版本失败 ({}): {e}", exe_path.display());
+            warn!("获取版本失败 ({}): {e}", exe_path.display());
             return "0.0.0".to_string();
         }
     };
@@ -327,7 +327,7 @@ fn download_core_with_retry(
                     }
                 };
                 if actual.eq_ignore_ascii_case(expected) {
-                    debug!("SHA256 校验通过: {actual}");
+                    info!("SHA256 校验通过: {actual}");
                     return Ok(());
                 }
                 warn!("SHA256 校验失败: expected={expected}, actual={actual}");
@@ -355,7 +355,7 @@ fn download_file(url: &str, dest: &Path) -> Result<(), AppError> {
     let mut file = fs::File::create(dest).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
 
     let bytes = io::copy(&mut reader, &mut file).map_err(|e| AppError::Msg(format!("写入文件失败: {e}")))?;
-    debug!("下载完成: {} ({:.1} MB)", dest.display(), bytes as f64 / 1_048_576.0);
+    info!("下载完成: {} ({:.1} MB)", dest.display(), bytes as f64 / 1_048_576.0);
 
     Ok(())
 }
@@ -443,7 +443,7 @@ fn backup_and_extract(zip_path: &Path, core_dir: &Path, strip_prefix: Option<&st
         }
     }
 
-    debug!("解压完成: {} -> {}", zip_path.display(), core_dir.display());
+    info!("解压完成: {} -> {}", zip_path.display(), core_dir.display());
     Ok(())
 }
 
@@ -595,7 +595,7 @@ fn download_ruleset_with_retry(
             }
         };
         if actual.eq_ignore_ascii_case(expected_hash) {
-            debug!("SHA256 校验通过: {actual}");
+            info!("SHA256 校验通过: {actual}");
             return Ok(());
         }
         warn!("SHA256 校验失败: expected={expected_hash}, actual={actual}");

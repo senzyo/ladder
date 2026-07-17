@@ -109,7 +109,7 @@ pub fn set_physical_dns_to_local() {
         return;
     }
 
-    info!("设置物理网卡 DNS 防泄漏...");
+    info!("设置物理网卡 DNS 为本地回环地址防止 DNS 泄漏...");
     for adapter in &adapters {
         let ipv4_path = format!(
             r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{}",
@@ -160,7 +160,7 @@ fn set_registry_name_server(reg_path: &str, value: &str, alias: &str, protocol: 
                 warn!("设置 {alias} 的 {protocol} DNS 失败: {e}");
             } else {
                 let display_value = if value.is_empty() { "DHCP 自动获取" } else { value };
-                info!("已设置 {alias} 的 {protocol} DNS 为 '{display_value}'");
+                debug!("已设置 {alias} 的 {protocol} DNS 为 '{display_value}'");
             }
         }
         Err(e) => {

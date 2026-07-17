@@ -108,7 +108,7 @@ pub fn start_xray_at(exe_dir: &Path) -> Result<(), AppError> {
         .unwrap_or(false);
 
     if has_tun {
-        debug!("xray 配置包含 TUN 模式");
+        info!("xray 配置包含 TUN 模式");
         randomize_xray_tun_name(&config, &text, &json)?;
         dns::set_physical_dns_to_local();
     }
@@ -295,7 +295,7 @@ fn randomize_sing_box_tun_name(config_path: &Path) -> Result<(), AppError> {
         if old_name == new_name {
             return Ok(());
         }
-        debug!("随机化 TUN 接口名: {old_name} -> {new_name}");
+        info!("随机化 sing-tun 接口名: {old_name} -> {new_name}");
         let old_pattern = format!("\"interface_name\": \"{}\"", old_name);
         let new_pattern = format!("\"interface_name\": \"{}\"", new_name);
         let new_text = text.replacen(&old_pattern, &new_pattern, 1);
@@ -303,7 +303,7 @@ fn randomize_sing_box_tun_name(config_path: &Path) -> Result<(), AppError> {
     }
 
     // 无 interface_name → 在 "type": "tun" 行后插入
-    debug!("写入 TUN 接口名: {new_name}");
+    debug!("写入 sing-tun 接口名: {new_name}");
     let type_pattern = "\"type\": \"tun\"";
     let pos = text
         .find(type_pattern)
@@ -347,7 +347,7 @@ fn randomize_xray_tun_name(config_path: &Path, text: &str, json: &Value) -> Resu
         if old_name == new_name {
             return Ok(());
         }
-        debug!("随机化 xray TUN 接口名: {old_name} -> {new_name}");
+        info!("随机化 Xray TUN 接口名: {old_name} -> {new_name}");
         let old_pattern = format!("\"name\": \"{}\"", old_name);
         let new_pattern = format!("\"name\": \"{}\"", new_name);
         let new_text = text.replacen(&old_pattern, &new_pattern, 1);
@@ -355,7 +355,7 @@ fn randomize_xray_tun_name(config_path: &Path, text: &str, json: &Value) -> Resu
     }
 
     // 无 settings.name → 在 "settings": { 行后插入
-    debug!("写入 xray TUN 接口名: {new_name}");
+    debug!("写入 Xray TUN 接口名: {new_name}");
     let settings_pattern = "\"settings\": {";
     let pos = text
         .find(settings_pattern)
@@ -396,7 +396,7 @@ pub fn cleanup_network_registry() {
     const PROFILES: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles";
     const SIGNATURES: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged";
 
-    debug!("清理 TUN 相关网络注册表项...");
+    info!("清理 TUN 相关网络注册表项...");
     clean_tun_entries(PROFILES);
     clean_tun_entries(SIGNATURES);
 }
@@ -454,7 +454,7 @@ fn clean_tun_entries(parent_path: &str) {
 fn cleanup_orphaned_wintun() {
     const CR_NO_SUCH_DEVNODE: u32 = 0x0D;
 
-    debug!("检查孤立 WinTUN 设备...");
+    info!("检查孤立 WinTUN 设备...");
     let mut instance_ids: Vec<String> = Vec::new();
 
     unsafe {
@@ -520,7 +520,7 @@ fn cleanup_orphaned_wintun() {
         }
     }
 
-    debug!("扫描硬件变更 ({} 个设备已移除)", instance_ids.len());
+    info!("扫描硬件变更 ({} 个设备已移除)", instance_ids.len());
     let _ = hidden_command("pnputil").arg("/scan-devices").status();
 }
 
@@ -531,7 +531,7 @@ fn cleanup_orphaned_wintun() {
 fn flush_dns() {
     let result = unsafe { DnsFlushResolverCache() };
     if result != 0 {
-        debug!("DNS 缓存刷新成功");
+        info!("DNS 缓存刷新成功");
     } else {
         warn!("DNS 缓存刷新失败");
     }
