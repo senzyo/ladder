@@ -65,18 +65,8 @@ pub fn update_sing_box(
     let zip_name = format!("sing-box-{}-windows-{}.zip", remote_ver, SINGBOX_ARCH_SUFFIX);
     let zip_path = exe_dir.join(&zip_name);
 
-    let (download_url, expected_hash) = find_asset(&assets, &zip_name);
-    let download_url = match download_url {
-        Some(url) => url,
-        None => {
-            error!("[sing-box] 未找到发布文件: {zip_name}");
-            return Err(AppError::Msg(format!("未找到发布文件: {zip_name}")));
-        }
-    };
-    debug!(
-        "[sing-box] 下载链接: {download_url}, SHA256: {}",
-        expected_hash.as_deref().unwrap_or("无")
-    );
+    let (download_url, expected_hash) = find_asset(&assets, &zip_name)?;
+    debug!("[sing-box] 下载链接: {download_url}, SHA256: {expected_hash}");
 
     crate::toast::show_toast("sing-box", &format!("检测到新版本 v{remote_ver}"));
 
@@ -87,7 +77,7 @@ pub fn update_sing_box(
     if let Err(e) = download_core_with_retry(
         &download_url,
         &zip_path,
-        expected_hash.as_deref(),
+        &expected_hash,
         gh_proxy_url,
         max_retries,
         delay_secs,
@@ -129,18 +119,8 @@ pub fn update_xray(
     let zip_name = XRAY_ZIP_NAME;
     let zip_path = exe_dir.join(zip_name);
 
-    let (download_url, expected_hash) = find_asset(&assets, zip_name);
-    let download_url = match download_url {
-        Some(url) => url,
-        None => {
-            error!("[xray] 未找到发布文件: {zip_name}");
-            return Err(AppError::Msg(format!("未找到发布文件: {zip_name}")));
-        }
-    };
-    debug!(
-        "[xray] 下载链接: {download_url}, SHA256: {}",
-        expected_hash.as_deref().unwrap_or("无")
-    );
+    let (download_url, expected_hash) = find_asset(&assets, zip_name)?;
+    debug!("[xray] 下载链接: {download_url}, SHA256: {expected_hash}");
 
     crate::toast::show_toast("xray", &format!("检测到新版本 v{remote_ver}"));
 
@@ -151,7 +131,7 @@ pub fn update_xray(
     if let Err(e) = download_core_with_retry(
         &download_url,
         &zip_path,
-        expected_hash.as_deref(),
+        &expected_hash,
         gh_proxy_url,
         max_retries,
         delay_secs,
@@ -306,24 +286,37 @@ fn fetch_xray_release(zip_name: &str) -> Result<(String, Vec<Value>), AppError> 
 }
 
 /// 从 release assets 中查找指定文件名的下载 URL 和 digest 哈希值。
-fn find_asset(assets: &[Value], file_name: &str) -> (Option<String>, Option<String>) {
-    let asset = assets.iter().find(|a| a["name"].as_str() == Some(file_name));
-    let url = asset
-        .and_then(|a| a["browser_download_url"].as_str())
-        .map(|s| s.to_string());
-    let hash = asset
-        .and_then(|a| a["digest"].as_str())
-        .and_then(|d| d.split(':').next_back())
-        .map(|s| s.to_string());
-    (url, hash)
+///
+/// 未找到文件或 digest 缺失时返回错误。
+fn find_asset(assets: &[Value], file_name: &str) -> Result<(String, String), AppError> {
+    let asset = assets
+        .iter()
+        .find(|a| a["name"].as_str() == Some(file_name))
+        .ok_or_else(|| AppError::Msg(format!("未找到发布文件: {file_name}")))?;
+
+    let url = asset["browser_download_url"]
+        .as_str()
+        .ok_or_else(|| AppError::Msg(format!("发布文件缺少下载链接: {file_name}")))?
+        .to_string();
+
+    let digest = asset["digest"]
+        .as_str()
+        .ok_or_else(|| AppError::Msg(format!("发布文件缺少 digest: {file_name}")))?;
+    let hash = digest
+        .split(':')
+        .next_back()
+        .ok_or_else(|| AppError::Msg(format!("digest 格式无效: {digest}")))?
+        .to_string();
+
+    Ok((url, hash))
 }
 
 /// 带重试的下载。启用代理时将代理 URL 前缀拼接到下载链接。
-/// 若提供 expected_hash, 下载后校验 SHA256, 不匹配则删除文件并重试。
+/// 下载后校验 SHA256, 不匹配则删除文件并重试。
 fn download_core_with_retry(
     download_url: &str,
     dest: &Path,
-    expected_hash: Option<&str>,
+    expected_hash: &str,
     gh_proxy_url: &str,
     max_retries: u32,
     delay_secs: u64,
@@ -334,9 +327,8 @@ fn download_core_with_retry(
         format!("{gh_proxy_url}{download_url}")
     };
     debug!(
-        "下载准备: url={url}, 代理={}, hash={}",
+        "下载准备: url={url}, 代理={}, hash={expected_hash}",
         if gh_proxy_url.is_empty() { "禁用" } else { "启用" },
-        expected_hash.unwrap_or("无")
     );
 
     for attempt in 1..=max_retries {
@@ -353,25 +345,20 @@ fn download_core_with_retry(
             continue;
         }
 
-        match expected_hash {
-            Some(expected) => {
-                let actual = match sha256_file(dest) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        warn!("SHA256 计算失败 (第 {attempt}/{max_retries} 次): {e}");
-                        let _ = fs::remove_file(dest);
-                        continue;
-                    }
-                };
-                if actual.eq_ignore_ascii_case(expected) {
-                    info!("SHA256 校验通过: {actual}");
-                    return Ok(());
-                }
-                warn!("SHA256 校验失败: expected={expected}, actual={actual}");
+        let actual = match sha256_file(dest) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("SHA256 计算失败 (第 {attempt}/{max_retries} 次): {e}");
                 let _ = fs::remove_file(dest);
+                continue;
             }
-            None => return Ok(()),
+        };
+        if actual.eq_ignore_ascii_case(expected_hash) {
+            info!("SHA256 校验通过: {actual}");
+            return Ok(());
         }
+        warn!("SHA256 校验失败: expected={expected_hash}, actual={actual}");
+        let _ = fs::remove_file(dest);
     }
 
     Err(AppError::Msg("下载文件校验失败, 已达到最大重试次数".into()))
