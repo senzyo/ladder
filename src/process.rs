@@ -23,8 +23,8 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 
 use crate::dns;
 use crate::error::AppError;
-use crate::update;
 use crate::state::{self};
+use crate::update;
 
 // dnsapi.dll 导入, 用于刷新系统 DNS 缓存。
 #[link(name = "dnsapi")]

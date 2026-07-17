@@ -313,15 +313,9 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                 };
                 info!("{label}");
                 let result = match id {
-                    tray::ID_UPDATE_ALL => {
-                        update::update_cores(&exe_dir, &gh_proxy, max_retries, delay_secs)
-                    }
-                    tray::ID_UPDATE_SING => {
-                        update::update_sing_box(&exe_dir, &gh_proxy, max_retries, delay_secs)
-                    }
-                    tray::ID_UPDATE_XRAY => {
-                        update::update_xray(&exe_dir, &gh_proxy, max_retries, delay_secs)
-                    }
+                    tray::ID_UPDATE_ALL => update::update_cores(&exe_dir, &gh_proxy, max_retries, delay_secs),
+                    tray::ID_UPDATE_SING => update::update_sing_box(&exe_dir, &gh_proxy, max_retries, delay_secs),
+                    tray::ID_UPDATE_XRAY => update::update_xray(&exe_dir, &gh_proxy, max_retries, delay_secs),
                     _ => unreachable!(),
                 };
                 if let Err(e) = result {

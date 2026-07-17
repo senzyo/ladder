@@ -32,24 +32,14 @@ const XRAY_ZIP_NAME: &str = if cfg!(target_arch = "aarch64") {
 };
 
 /// 依次更新 sing-box 和 xray。
-pub fn update_cores(
-    exe_dir: &Path,
-    gh_proxy_url: &str,
-    max_retries: u32,
-    delay_secs: u64,
-) -> Result<(), AppError> {
+pub fn update_cores(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_secs: u64) -> Result<(), AppError> {
     let exe_dir = exe_dir.to_path_buf();
     update_sing_box(&exe_dir, gh_proxy_url, max_retries, delay_secs)?;
     update_xray(&exe_dir, gh_proxy_url, max_retries, delay_secs)
 }
 
 /// 检查并更新 sing-box。
-pub fn update_sing_box(
-    exe_dir: &Path,
-    gh_proxy_url: &str,
-    max_retries: u32,
-    delay_secs: u64,
-) -> Result<(), AppError> {
+pub fn update_sing_box(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_secs: u64) -> Result<(), AppError> {
     let exe_path = exe_dir.join("sing-box_core").join("sing-box.exe");
 
     let local = get_local_version(&exe_path, "version");
@@ -98,12 +88,7 @@ pub fn update_sing_box(
 }
 
 /// 检查并更新 xray。
-pub fn update_xray(
-    exe_dir: &Path,
-    gh_proxy_url: &str,
-    max_retries: u32,
-    delay_secs: u64,
-) -> Result<(), AppError> {
+pub fn update_xray(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_secs: u64) -> Result<(), AppError> {
     let exe_path = exe_dir.join("xray_core").join("xray.exe");
 
     let local = get_local_version(&exe_path, "version");
@@ -484,7 +469,12 @@ fn backup_and_extract(zip_path: &Path, core_dir: &Path, strip_prefix: Option<&st
 /// 4. 校验通过后移动到 `xray_core/{name}.dat`
 ///
 /// 返回成功更新的规则集名称列表 (供调用方更新 `last_update`) 。
-pub fn update_ruleset(exe_dir: &Path, ruleset: &crate::settings::Ruleset, max_retries: u32, delay_secs: u64) -> Vec<String> {
+pub fn update_ruleset(
+    exe_dir: &Path,
+    ruleset: &crate::settings::Ruleset,
+    max_retries: u32,
+    delay_secs: u64,
+) -> Vec<String> {
     let interval_secs = ruleset.interval_days * 86400;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
