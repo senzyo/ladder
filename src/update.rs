@@ -85,7 +85,7 @@ pub fn update_sing_box(
     let title = format!("sing-box v{remote_ver}");
     crate::toast::show_progress_toast(&title, tag);
 
-    if let Err(e) = download_with_retry(
+    if let Err(e) = download_core_with_retry(
         &download_url,
         &zip_path,
         expected_hash.as_deref(),
@@ -150,7 +150,7 @@ pub fn update_xray(
     let title = format!("xray v{remote_ver}");
     crate::toast::show_progress_toast(&title, tag);
 
-    if let Err(e) = download_with_retry(
+    if let Err(e) = download_core_with_retry(
         &download_url,
         &zip_path,
         expected_hash.as_deref(),
@@ -283,7 +283,7 @@ fn find_asset(assets: &[Value], file_name: &str) -> (Option<String>, Option<Stri
 
 /// 带重试的下载。启用代理时将代理 URL 前缀拼接到下载链接。
 /// 若提供 expected_hash，下载后校验 SHA256，不匹配则删除文件并重试。
-fn download_with_retry(
+fn download_core_with_retry(
     download_url: &str,
     dest: &Path,
     expected_hash: Option<&str>,
@@ -310,11 +310,22 @@ fn download_with_retry(
             debug!("第 1/{max_retries} 次尝试下载...");
         }
 
-        download_file(&url, dest)?;
+        if let Err(e) = download_file(&url, dest) {
+            warn!("下载失败 (第 {attempt}/{max_retries} 次): {e}");
+            let _ = fs::remove_file(dest);
+            continue;
+        }
 
         match expected_hash {
             Some(expected) => {
-                let actual = sha256_file(dest)?;
+                let actual = match sha256_file(dest) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!("SHA256 计算失败 (第 {attempt}/{max_retries} 次): {e}");
+                        let _ = fs::remove_file(dest);
+                        continue;
+                    }
+                };
                 if actual.eq_ignore_ascii_case(expected) {
                     debug!("SHA256 校验通过: {actual}");
                     return Ok(());
@@ -479,7 +490,7 @@ pub fn update_ruleset(exe_dir: &Path, ruleset: &crate::settings::Ruleset, max_re
         let dat_path = exe_dir.join("xray_core").join(format!("{name}.dat"));
         let tmp_path = exe_dir.join("xray_core").join(format!("{name}.dat.tmp"));
 
-        match download_dat_with_retry(&entry.dat, &tmp_path, &expected_hash, max_retries, delay_secs) {
+        match download_ruleset_with_retry(&entry.dat, &tmp_path, &expected_hash, max_retries, delay_secs) {
             Ok(_) => {
                 if let Err(e) = fs::rename(&tmp_path, &dat_path) {
                     warn!("[ruleset] {name}: 移动文件失败: {e}");
@@ -556,7 +567,7 @@ fn parse_sha256sum(content: &str) -> Option<String> {
 /// 带重试的 dat 文件下载。
 ///
 /// 下载到临时文件后校验 SHA256，下载失败或校验不匹配均删除并重试。
-fn download_dat_with_retry(
+fn download_ruleset_with_retry(
     url: &str,
     dest: &Path,
     expected_hash: &str,
@@ -575,7 +586,14 @@ fn download_dat_with_retry(
             continue;
         }
 
-        let actual = sha256_file(dest)?;
+        let actual = match sha256_file(dest) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("SHA256 计算失败 (第 {attempt}/{max_retries} 次): {e}");
+                let _ = fs::remove_file(dest);
+                continue;
+            }
+        };
         if actual.eq_ignore_ascii_case(expected_hash) {
             debug!("SHA256 校验通过: {actual}");
             return Ok(());
