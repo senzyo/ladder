@@ -29,7 +29,7 @@ use crate::state::{self};
 // dnsapi.dll 导入, 用于刷新系统 DNS 缓存。
 #[link(name = "dnsapi")]
 unsafe extern "system" {
-    fn DnsFlushResolverCache() -> i32;
+    fn DnsFlushResolverCache();
 }
 
 /// 创建不显示控制台窗口的子进程 Command。
@@ -110,7 +110,6 @@ pub fn start_xray_at(exe_dir: &Path) -> Result<(), AppError> {
     if has_tun {
         info!("xray 配置包含 TUN 模式");
         randomize_xray_tun_name(&config, &text, &json)?;
-        dns::set_physical_dns_to_local();
     }
 
     info!("启动 xray");
@@ -122,6 +121,11 @@ pub fn start_xray_at(exe_dir: &Path) -> Result<(), AppError> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| AppError::Msg(format!("启动 xray 失败: {e}")))?;
+
+    if has_tun {
+        dns::set_physical_dns_to_local();
+    }
+
     forward_stderr(&mut child, "xray");
     if let Some(mut app) = state::app_state_mut() {
         app.child_xray = Some(child);
@@ -529,12 +533,8 @@ fn cleanup_orphaned_wintun() {
 // ═══════════════════════════════════════════════
 
 fn flush_dns() {
-    let result = unsafe { DnsFlushResolverCache() };
-    if result != 0 {
-        info!("DNS 缓存刷新成功");
-    } else {
-        warn!("DNS 缓存刷新失败");
-    }
+    unsafe { DnsFlushResolverCache() };
+    info!("已刷新 DNS 缓存");
 }
 
 #[cfg(test)]

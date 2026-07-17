@@ -1,6 +1,6 @@
 //! Windows 任务计划程序: 开机自动恢复物理网卡 DNS 为 DHCP。
 //!
-//! 通过 `schtasks.exe` 注册 BootTrigger 任务, 开机后延迟 10 秒执行 PowerShell 命令,
+//! 通过 `schtasks.exe` 注册 BootTrigger 任务, 开机后执行 PowerShell 命令,
 //! 将所有物理网卡 DNS 重置为自动获取。用于防止意外断电后 DNS 状态残留。
 
 use std::fs;
