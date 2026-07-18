@@ -228,11 +228,10 @@ fn run() -> Result<(), AppError> {
 
 /// 分发托盘菜单命令。
 ///
-/// 重启/终止/更新操作在独立线程中执行 (避免阻塞 UI 线程) , 每个线程
-/// 独立初始化 COM。切换配置操作在当前线程同步执行。退出操作终止所有
-/// 进程并销毁窗口。
+/// 重启/终止/更新/切换配置操作在独立线程中执行 (避免阻塞 UI 线程) ,
+/// 每个线程独立初始化 COM。退出操作终止所有进程并销毁窗口。
 fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, ConfigAction>) {
-    let result = match id {
+    match id {
         tray::ID_RESTART_SING
         | tray::ID_RESTART_XRAY
         | tray::ID_RESTART_ALL
@@ -273,7 +272,6 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                     toast::show_toast("操作失败", &err.to_string());
                 }
             });
-            return;
         }
         tray::ID_UPDATE_ALL | tray::ID_UPDATE_SING | tray::ID_UPDATE_XRAY => {
             let exe_dir = match state::exe_dir() {
@@ -323,7 +321,6 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                     toast::show_toast("更新失败", &e.to_string());
                 }
             });
-            return;
         }
         tray::ID_SWITCH_CORE_XRAY | tray::ID_SWITCH_CORE_SING | tray::ID_SWITCH_CORE_BOTH => {
             let new_mode = match id {
@@ -351,7 +348,6 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                 }
             }
             info!("核心模式已切换为: {new_mode:?}");
-            return;
         }
         tray::ID_OPEN_DIR => {
             let exe_dir = match state::exe_dir() {
@@ -363,7 +359,6 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
             };
             info!("打开程序目录: {}", exe_dir.display());
             let _ = Command::new("explorer").arg(&exe_dir).spawn();
-            return;
         }
         tray::ID_EXIT => {
             info!("退出程序");
@@ -373,37 +368,49 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
             unsafe {
                 let _ = DestroyWindow(HWND(hwnd as *mut std::ffi::c_void));
             }
-            Ok(())
         }
-        _ => run_config_action(id, config_actions),
-    };
-
-    if let Err(err) = result {
-        error!("菜单命令执行失败: {err}");
-        toast::show_toast("操作失败", &err.to_string());
-    }
-}
-
-/// 执行配置切换操作: 将选中的配置文件复制到活跃配置路径并重启对应服务。
-fn run_config_action(id: u16, config_actions: &HashMap<u16, ConfigAction>) -> Result<(), AppError> {
-    let Some(action) = config_actions.get(&id).cloned() else {
-        return Ok(());
-    };
-
-    let exe_dir = state::exe_dir()?;
-    info!("切换配置: {}", action.path.display());
-    match action.kind {
-        state::ConfigKind::SingBox => {
-            let dest = exe_dir.join("configs").join("sing-box.json");
-            debug!("复制配置: {} -> {}", action.path.display(), dest.display());
-            fs::copy(&action.path, dest).map_err(|e| AppError::Msg(format!("切换 sing-box 配置失败: {e}")))?;
-            process::restart_sing_box_at(&exe_dir)
-        }
-        state::ConfigKind::Xray => {
-            let dest = exe_dir.join("configs").join("xray.json");
-            debug!("复制配置: {} -> {}", action.path.display(), dest.display());
-            fs::copy(&action.path, dest).map_err(|e| AppError::Msg(format!("切换 xray 配置失败: {e}")))?;
-            process::restart_xray_at(&exe_dir)
+        _ => {
+            let action = match config_actions.get(&id).cloned() {
+                Some(a) => a,
+                None => return,
+            };
+            std::thread::spawn(move || {
+                let _com = ComGuard::new();
+                let exe_dir = match state::exe_dir() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        error!("获取 exe 目录失败: {e}");
+                        return;
+                    }
+                };
+                info!("切换配置: {}", action.path.display());
+                let result = match action.kind {
+                    state::ConfigKind::SingBox => {
+                        let dest = exe_dir.join("configs").join("sing-box.json");
+                        debug!("复制配置: {} -> {}", action.path.display(), dest.display());
+                        if let Err(e) = fs::copy(&action.path, &dest) {
+                            error!("复制配置失败: {e}");
+                            toast::show_toast("操作失败", &e.to_string());
+                            return;
+                        }
+                        process::restart_sing_box_at(&exe_dir)
+                    }
+                    state::ConfigKind::Xray => {
+                        let dest = exe_dir.join("configs").join("xray.json");
+                        debug!("复制配置: {} -> {}", action.path.display(), dest.display());
+                        if let Err(e) = fs::copy(&action.path, &dest) {
+                            error!("复制配置失败: {e}");
+                            toast::show_toast("操作失败", &e.to_string());
+                            return;
+                        }
+                        process::restart_xray_at(&exe_dir)
+                    }
+                };
+                if let Err(err) = result {
+                    error!("操作失败: {err}");
+                    toast::show_toast("操作失败", &err.to_string());
+                }
+            });
         }
     }
 }
