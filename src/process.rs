@@ -47,7 +47,8 @@ pub fn hidden_command(program: impl AsRef<OsStr>) -> Command {
 fn forward_stderr(child: &mut std::process::Child, label: &str) {
     if let Some(stderr) = child.stderr.take() {
         let label = label.to_owned();
-        std::thread::spawn(move || {
+        let name = format!("stderr-{label}");
+        let _ = std::thread::Builder::new().name(name).spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
                 warn!("[{label}] {line}");
@@ -340,7 +341,7 @@ fn randomize_xray_tun_name(config_path: &Path, text: &str, json: &Value) -> Resu
                 .iter()
                 .find(|inbound| inbound.get("protocol").and_then(Value::as_str) == Some("tun"))
         })
-        .expect("xray 配置中应存在 TUN inbound");
+        .ok_or_else(|| AppError::Msg("xray 配置中应存在 TUN inbound".into()))?;
 
     // 有 settings.name → 替换
     if let Some(old_name) = tun_inbound

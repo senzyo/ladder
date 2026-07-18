@@ -22,6 +22,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use tracing::{Event, debug, error, info, warn};
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
@@ -58,6 +59,20 @@ impl Drop for ComGuard {
         unsafe {
             CoUninitialize();
         }
+    }
+}
+
+/// 在后台线程中安全执行闭包, 捕获 panic 并通过 Toast 通知用户。
+fn spawn_safe<F: FnOnce() + Send + 'static>(name: &str, f: F) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    if let Err(e) = result {
+        let msg = e
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| e.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "未知内部错误".to_string());
+        error!("后台线程 [{name}] panic: {msg}");
+        toast::show_toast("内部错误", &msg);
     }
 }
 
@@ -231,6 +246,10 @@ fn run() -> Result<(), AppError> {
 /// 重启/终止/更新/切换配置操作在独立线程中执行 (避免阻塞 UI 线程) ,
 /// 每个线程独立初始化 COM。退出操作终止所有进程并销毁窗口。
 fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, ConfigAction>) {
+    if !matches!(id, tray::ID_OPEN_DIR | tray::ID_EXIT) && state::BUSY.swap(true, Ordering::SeqCst) {
+        toast::show_toast("操作进行中", "请等待当前操作完成");
+        return;
+    }
     match id {
         tray::ID_RESTART_SING
         | tray::ID_RESTART_XRAY
@@ -246,32 +265,43 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                     return;
                 }
             };
-            std::thread::spawn(move || {
-                let _com = ComGuard::new();
-                let label = match id {
-                    tray::ID_RESTART_SING => "重启 sing-box",
-                    tray::ID_RESTART_XRAY => "重启 xray",
-                    tray::ID_RESTART_ALL => "重启所有服务",
-                    tray::ID_STOP_SING => "终止 sing-box",
-                    tray::ID_STOP_XRAY => "终止 xray",
-                    tray::ID_STOP_ALL => "终止所有服务",
-                    _ => "",
-                };
-                info!("{label}");
-                let result = match id {
-                    tray::ID_RESTART_SING => process::restart_sing_box_at(&exe_dir),
-                    tray::ID_RESTART_XRAY => process::restart_xray_at(&exe_dir),
-                    tray::ID_RESTART_ALL => process::restart_all_at(&exe_dir),
-                    tray::ID_STOP_SING => process::stop_processes(&["sing-box.exe"]),
-                    tray::ID_STOP_XRAY => process::stop_processes(&["xray.exe"]),
-                    tray::ID_STOP_ALL => process::stop_all(),
-                    _ => unreachable!(),
-                };
-                if let Err(err) = result {
-                    error!("操作失败: {err}");
-                    toast::show_toast("操作失败", &err.to_string());
-                }
-            });
+            let _ = std::thread::Builder::new()
+                .name("bg-restart-stop".into())
+                .spawn(move || {
+                    let _com = match ComGuard::new() {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            warn!("COM 初始化失败: {e}");
+                            None
+                        }
+                    };
+                    spawn_safe("restart-stop", move || {
+                        let label = match id {
+                            tray::ID_RESTART_SING => "重启 sing-box",
+                            tray::ID_RESTART_XRAY => "重启 xray",
+                            tray::ID_RESTART_ALL => "重启所有服务",
+                            tray::ID_STOP_SING => "终止 sing-box",
+                            tray::ID_STOP_XRAY => "终止 xray",
+                            tray::ID_STOP_ALL => "终止所有服务",
+                            _ => "",
+                        };
+                        info!("{label}");
+                        let result = match id {
+                            tray::ID_RESTART_SING => process::restart_sing_box_at(&exe_dir),
+                            tray::ID_RESTART_XRAY => process::restart_xray_at(&exe_dir),
+                            tray::ID_RESTART_ALL => process::restart_all_at(&exe_dir),
+                            tray::ID_STOP_SING => process::stop_processes(&["sing-box.exe"]),
+                            tray::ID_STOP_XRAY => process::stop_processes(&["xray.exe"]),
+                            tray::ID_STOP_ALL => process::stop_all(),
+                            _ => unreachable!(),
+                        };
+                        if let Err(err) = result {
+                            error!("操作失败: {err}");
+                            toast::show_toast("操作失败", &err.to_string());
+                        }
+                    });
+                    state::BUSY.store(false, Ordering::SeqCst);
+                });
         }
         tray::ID_UPDATE_ALL | tray::ID_UPDATE_SING | tray::ID_UPDATE_XRAY => {
             let exe_dir = match state::exe_dir() {
@@ -301,25 +331,34 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
             if let Err(e) = process::stop_all() {
                 warn!("更新前终止进程失败: {e}");
             }
-            std::thread::spawn(move || {
-                let _com = ComGuard::new();
-                let label = match id {
-                    tray::ID_UPDATE_ALL => "更新所有核心",
-                    tray::ID_UPDATE_SING => "更新 sing-box",
-                    tray::ID_UPDATE_XRAY => "更新 xray",
-                    _ => "",
+            let _ = std::thread::Builder::new().name("bg-update".into()).spawn(move || {
+                let _com = match ComGuard::new() {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        warn!("COM 初始化失败: {e}");
+                        None
+                    }
                 };
-                info!("{label}");
-                let result = match id {
-                    tray::ID_UPDATE_ALL => update::update_cores(&exe_dir, &gh_proxy, max_retries, delay_secs),
-                    tray::ID_UPDATE_SING => update::update_sing_box(&exe_dir, &gh_proxy, max_retries, delay_secs),
-                    tray::ID_UPDATE_XRAY => update::update_xray(&exe_dir, &gh_proxy, max_retries, delay_secs),
-                    _ => unreachable!(),
-                };
-                if let Err(e) = result {
-                    error!("更新失败: {e}");
-                    toast::show_toast("更新失败", &e.to_string());
-                }
+                spawn_safe("update", move || {
+                    let label = match id {
+                        tray::ID_UPDATE_ALL => "更新所有核心",
+                        tray::ID_UPDATE_SING => "更新 sing-box",
+                        tray::ID_UPDATE_XRAY => "更新 xray",
+                        _ => "",
+                    };
+                    info!("{label}");
+                    let result = match id {
+                        tray::ID_UPDATE_ALL => update::update_cores(&exe_dir, &gh_proxy, max_retries, delay_secs),
+                        tray::ID_UPDATE_SING => update::update_sing_box(&exe_dir, &gh_proxy, max_retries, delay_secs),
+                        tray::ID_UPDATE_XRAY => update::update_xray(&exe_dir, &gh_proxy, max_retries, delay_secs),
+                        _ => unreachable!(),
+                    };
+                    if let Err(e) = result {
+                        error!("更新失败: {e}");
+                        toast::show_toast("更新失败", &e.to_string());
+                    }
+                });
+                state::BUSY.store(false, Ordering::SeqCst);
             });
         }
         tray::ID_SWITCH_CORE_XRAY | tray::ID_SWITCH_CORE_SING | tray::ID_SWITCH_CORE_BOTH => {
@@ -348,6 +387,7 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                 }
             }
             info!("核心模式已切换为: {new_mode:?}");
+            state::BUSY.store(false, Ordering::SeqCst);
         }
         tray::ID_OPEN_DIR => {
             let exe_dir = match state::exe_dir() {
@@ -374,43 +414,54 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
                 Some(a) => a,
                 None => return,
             };
-            std::thread::spawn(move || {
-                let _com = ComGuard::new();
-                let exe_dir = match state::exe_dir() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        error!("获取 exe 目录失败: {e}");
-                        return;
-                    }
-                };
-                info!("切换配置: {}", action.path.display());
-                let result = match action.kind {
-                    state::ConfigKind::SingBox => {
-                        let dest = exe_dir.join("configs").join("sing-box.json");
-                        debug!("复制配置: {} -> {}", action.path.display(), dest.display());
-                        if let Err(e) = fs::copy(&action.path, &dest) {
-                            error!("复制配置失败: {e}");
-                            toast::show_toast("操作失败", &e.to_string());
-                            return;
+            let _ = std::thread::Builder::new()
+                .name("bg-config-switch".into())
+                .spawn(move || {
+                    let _com = match ComGuard::new() {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            warn!("COM 初始化失败: {e}");
+                            None
                         }
-                        process::restart_sing_box_at(&exe_dir)
-                    }
-                    state::ConfigKind::Xray => {
-                        let dest = exe_dir.join("configs").join("xray.json");
-                        debug!("复制配置: {} -> {}", action.path.display(), dest.display());
-                        if let Err(e) = fs::copy(&action.path, &dest) {
-                            error!("复制配置失败: {e}");
-                            toast::show_toast("操作失败", &e.to_string());
-                            return;
+                    };
+                    spawn_safe("config-switch", move || {
+                        let exe_dir = match state::exe_dir() {
+                            Ok(d) => d,
+                            Err(e) => {
+                                error!("获取 exe 目录失败: {e}");
+                                return;
+                            }
+                        };
+                        info!("切换配置: {}", action.path.display());
+                        let result = match action.kind {
+                            state::ConfigKind::SingBox => {
+                                let dest = exe_dir.join("configs").join("sing-box.json");
+                                debug!("复制配置: {} -> {}", action.path.display(), dest.display());
+                                if let Err(e) = fs::copy(&action.path, &dest) {
+                                    error!("复制配置失败: {e}");
+                                    toast::show_toast("操作失败", &e.to_string());
+                                    return;
+                                }
+                                process::restart_sing_box_at(&exe_dir)
+                            }
+                            state::ConfigKind::Xray => {
+                                let dest = exe_dir.join("configs").join("xray.json");
+                                debug!("复制配置: {} -> {}", action.path.display(), dest.display());
+                                if let Err(e) = fs::copy(&action.path, &dest) {
+                                    error!("复制配置失败: {e}");
+                                    toast::show_toast("操作失败", &e.to_string());
+                                    return;
+                                }
+                                process::restart_xray_at(&exe_dir)
+                            }
+                        };
+                        if let Err(err) = result {
+                            error!("操作失败: {err}");
+                            toast::show_toast("操作失败", &err.to_string());
                         }
-                        process::restart_xray_at(&exe_dir)
-                    }
-                };
-                if let Err(err) = result {
-                    error!("操作失败: {err}");
-                    toast::show_toast("操作失败", &err.to_string());
-                }
-            });
+                    });
+                    state::BUSY.store(false, Ordering::SeqCst);
+                });
         }
     }
 }

@@ -8,6 +8,7 @@ use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 use tracing::warn;
 use windows::Win32::Foundation::CloseHandle;
@@ -53,6 +54,9 @@ pub struct AppState {
 
 /// 全局应用状态, 通过 OnceLock + Mutex 实现线程安全的单例。
 pub static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
+
+/// 操作忙标志, 防止并发执行冲突操作。true 表示有操作正在执行。
+pub static BUSY: AtomicBool = AtomicBool::new(false);
 
 /// 获取只读应用状态。Mutex 中毒时恢复并继续使用。
 pub fn app_state() -> Option<std::sync::MutexGuard<'static, AppState>> {
