@@ -1,6 +1,6 @@
 [package]
 name = "ladder"
-version = "2.32.0"
+version = "2.33.0"
 edition = "2024"
 build = "build.rs"
 
