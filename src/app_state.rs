@@ -152,6 +152,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    #[must_use]
     fn local_state(exe_dir: PathBuf) -> OnceLock<Mutex<AppState>> {
         OnceLock::from(Mutex::new(AppState {
             exe_dir,

@@ -69,7 +69,6 @@ pub(crate) mod test_support {
     use super::{CleanupStep, cleanup_with, terminate_with};
     use crate::core::Core;
     use std::fs::{self, File, OpenOptions};
-    use std::io::Write;
     use std::process::{Child, Command, ExitStatus, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -96,10 +95,12 @@ pub(crate) mod test_support {
         }
     }
 
+    #[must_use]
     pub(crate) fn is_child(test_name: &str) -> bool {
         std::env::var(CHILD_TEST).as_deref() == Ok(test_name)
     }
 
+    #[must_use = "必须检查测试子进程的退出状态和清理记录"]
     pub(crate) fn run_child(test_name: &str) -> ChildResult {
         let directory = tempfile::tempdir().expect("应能创建隔离进程测试目录");
         let records = directory.path().join("steps.txt");
@@ -142,6 +143,8 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn record(step: &str) {
+        use std::io::Write;
+
         let path = std::env::var_os(RECORD_PATH).expect("记录替身仅能在隔离测试子进程运行");
         let mut file = OpenOptions::new()
             .append(true)

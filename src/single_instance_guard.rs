@@ -32,25 +32,26 @@ impl SingleInstanceGuard {
     /// 应降级为允许启动, 避免误伤正常使用。
     pub(crate) fn acquire() -> Result<Option<Self>, AppError> {
         let name = windows_strings::wide(SINGLE_INSTANCE_MUTEX);
-        unsafe {
-            let handle = CreateMutexW(None, false, PCWSTR(name.as_ptr()))
-                .map_err(|e| AppError::Msg(format!("创建单实例互斥体失败: {e}")))?;
-            // 必须紧跟 CreateMutexW 读取, 中间任何一次 Win32 调用都会覆盖它
-            let already_exists = GetLastError() == ERROR_ALREADY_EXISTS;
-            if already_exists {
-                let _ = CloseHandle(handle);
-                Ok(None)
-            } else {
-                Ok(Some(Self { handle }))
-            }
+        // SAFETY: name 是调用期存活的 null 结尾 UTF-16 缓冲区, 使用默认安全属性;
+        // 返回的句柄由本函数失败分支或唯一守卫关闭。
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+            .map_err(|e| AppError::Msg(format!("创建单实例互斥体失败: {e}")))?;
+        // 必须紧跟 CreateMutexW 读取, 中间任何一次 Win32 调用都会覆盖它。
+        // SAFETY: GetLastError 只读取当前线程的错误码, 没有指针或资源前提。
+        let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        if already_exists {
+            // SAFETY: handle 来自本次成功的 CreateMutexW, 尚未关闭且不再使用。
+            let _ = unsafe { CloseHandle(handle) };
+            Ok(None)
+        } else {
+            Ok(Some(Self { handle }))
         }
     }
 }
 
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.handle);
-        }
+        // SAFETY: 私有句柄来自成功的 CreateMutexW, 守卫不可复制, 在此唯一关闭。
+        let _ = unsafe { CloseHandle(self.handle) };
     }
 }

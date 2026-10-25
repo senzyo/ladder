@@ -33,10 +33,9 @@ static ICON_URI: OnceLock<String> = OnceLock::new();
 /// 设置当前进程的 AUMID, 并在开始菜单 Programs 目录创建快捷方式。
 /// Windows 要求应用必须有带 AUMID 的快捷方式才能显示 Toast 通知。
 pub fn setup(exe_path: &Path) -> Result<(), AppError> {
-    unsafe {
-        SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(AUMID))
-            .map_err(|e| AppError::Msg(format!("设置 AUMID 失败: {e}")))?;
-    }
+    // SAFETY: HSTRING 提供以空字符结尾的 UTF-16, 并存活到同步调用结束。
+    unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(AUMID)) }
+        .map_err(|e| AppError::Msg(format!("设置 AUMID 失败: {e}")))?;
     let icon_path = exe_path
         .parent()
         .unwrap_or(exe_path)
@@ -87,6 +86,7 @@ pub fn show_progress_toast(title: &str, tag: &str) {
 // Internal helpers
 // ═══════════════════════════════════════════════
 
+#[must_use]
 fn icon_element() -> String {
     let uri = ICON_URI.get().map(|s| s.as_str()).unwrap_or("");
     if uri.is_empty() {
@@ -95,6 +95,7 @@ fn icon_element() -> String {
     format!("<image placement=\"appLogoOverride\" src=\"{}\"/>", uri)
 }
 
+#[must_use]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -125,9 +126,11 @@ fn show_toast_xml(xml_str: &str, tag: Option<&str>) -> Result<(), AppError> {
 
 fn fallback_msgbox(title: &str, err: &str) {
     let msg = format!("Toast 通知失败: {err}");
+    let title_wide = windows_strings::wide(title);
+    let msg_wide = windows_strings::wide(&msg);
+    // SAFETY: 无所有者窗口是允许的; 两个 UTF-16 缓冲区以空字符结尾,
+    // 在同步 MessageBoxW 返回前保持有效, Win32 不取得缓冲区所有权。
     unsafe {
-        let title_wide = windows_strings::wide(title);
-        let msg_wide = windows_strings::wide(&msg);
         windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
             std::ptr::null_mut(),
             msg_wide.as_ptr(),
@@ -160,25 +163,32 @@ fn ensure_shortcut(exe_path: &Path, icon_path: &Path) -> Result<(), AppError> {
 fn create_shortcut(exe_path: &Path, icon_path: &Path, lnk_path: &Path) -> Result<(), AppError> {
     use windows::core::Interface;
 
-    unsafe {
-        let shell_link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
-            .map_err(|e| AppError::Msg(format!("创建 ShellLink 失败: {e}")))?;
-        shell_link
-            .SetPath(&HSTRING::from(exe_path.to_string_lossy().as_ref()))
+    {
+        // SAFETY: 创建 Windows ShellLink 并请求其 IShellLinkW 接口, 不聚合外部对象。
+        // 接口仅在当前线程使用; COM 未初始化等失败沿原 Result 路径返回。
+        let shell_link: IShellLinkW =
+            unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|e| AppError::Msg(format!("创建 ShellLink 失败: {e}")))?;
+        // SAFETY: shell_link 持有有效接口; HSTRING 的空字符结尾缓冲区覆盖同步调用。
+        unsafe { shell_link.SetPath(&HSTRING::from(exe_path.to_string_lossy().as_ref())) }
             .map_err(|e| AppError::Msg(format!("设置链接路径失败: {e}")))?;
         if let Some(parent) = exe_path.parent() {
-            shell_link
-                .SetWorkingDirectory(&HSTRING::from(parent.to_string_lossy().as_ref()))
-                .map_err(|e| AppError::Msg(format!("设置工作目录失败: {e}")))?;
+            // SAFETY: 同一线程的有效接口, 临时 HSTRING 保持到调用结束。
+            unsafe {
+                shell_link.SetWorkingDirectory(&HSTRING::from(parent.to_string_lossy().as_ref()))
+            }
+            .map_err(|e| AppError::Msg(format!("设置工作目录失败: {e}")))?;
         }
-        shell_link
-            .SetIconLocation(&HSTRING::from(icon_path.to_string_lossy().as_ref()), 0)
-            .map_err(|e| AppError::Msg(format!("设置图标路径失败: {e}")))?;
+        // SAFETY: 同一线程的有效接口; 路径缓冲区覆盖调用, 图标索引为既有的 0。
+        unsafe {
+            shell_link.SetIconLocation(&HSTRING::from(icon_path.to_string_lossy().as_ref()), 0)
+        }
+        .map_err(|e| AppError::Msg(format!("设置图标路径失败: {e}")))?;
         let persist: IPersistFile = shell_link
             .cast()
             .map_err(|e| AppError::Msg(format!("获取 IPersistFile 失败: {e}")))?;
-        persist
-            .Save(&HSTRING::from(lnk_path.to_string_lossy().as_ref()), true)
+        // SAFETY: persist 来自同一对象的 QueryInterface; 路径缓冲区覆盖同步保存调用。
+        unsafe { persist.Save(&HSTRING::from(lnk_path.to_string_lossy().as_ref()), true) }
             .map_err(|e| AppError::Msg(format!("保存快捷方式失败: {e}")))?;
     }
 
@@ -193,59 +203,71 @@ fn create_shortcut(exe_path: &Path, icon_path: &Path, lnk_path: &Path) -> Result
 fn set_shortcut_aumid(lnk_path: &Path) -> Result<(), AppError> {
     use std::os::windows::ffi::OsStrExt;
 
-    unsafe {
-        let lnk_wide: Vec<u16> = OsStr::new(&lnk_path.to_string_lossy().as_ref())
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
+    let lnk_wide: Vec<u16> = OsStr::new(&lnk_path.to_string_lossy().as_ref())
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
 
-        let mut pps: *mut c_void = std::ptr::null_mut();
-        let hr = windows_sys::Win32::UI::Shell::PropertiesSystem::SHGetPropertyStoreFromParsingName(
+    let mut pps: *mut c_void = std::ptr::null_mut();
+    // SAFETY: 路径以空字符结尾且覆盖调用; IID 为 IPropertyStore, 输出槽可写。
+    // 不传入绑定上下文, 成功后的接口在本线程使用并按既有路径 Release。
+    let hr = unsafe {
+        windows_sys::Win32::UI::Shell::PropertiesSystem::SHGetPropertyStoreFromParsingName(
             lnk_wide.as_ptr(),
             std::ptr::null_mut(),
             2, // GPS_READWRITE
             &IID_IPROPERTY_STORE,
             &mut pps,
-        );
-        if hr != 0 {
-            return Err(AppError::Msg(format!(
-                "SHGetPropertyStoreFromParsingName 失败: 0x{hr:08X}"
-            )));
-        }
-        if pps.is_null() {
-            return Err(AppError::Msg("未获取到 IPropertyStore".into()));
-        }
+        )
+    };
+    if hr != 0 {
+        return Err(AppError::Msg(format!(
+            "SHGetPropertyStoreFromParsingName 失败: 0x{hr:08X}"
+        )));
+    }
+    if pps.is_null() {
+        return Err(AppError::Msg("未获取到 IPropertyStore".into()));
+    }
 
-        let prop_store = &*(pps as *const IPropertyStoreW);
+    // SAFETY: S_OK 且非空的输出是所请求的 IPropertyStore; repr(C) 接口首字段
+    // 为下方按 COM ABI 定义的 vtable 指针, 此引用最后一次使用不晚于 Release。
+    let prop_store = unsafe { &*(pps as *const IPropertyStoreW) };
 
-        let aumid_wide: Vec<u16> = OsStr::new(AUMID).encode_wide().chain(Some(0)).collect();
+    let aumid_wide: Vec<u16> = OsStr::new(AUMID).encode_wide().chain(Some(0)).collect();
 
-        // 手动构建 PROPVARIANT 结构体:
-        // 偏移 0: VT_LPWSTR 类型标签 (u16)
-        // 偏移 8: 指向 null 结尾 Unicode 字符串的指针
-        let mut pv: PROPVARIANT = std::mem::zeroed();
-        let pv_ptr = &mut pv as *mut PROPVARIANT as *mut u8;
+    // windows-sys 的 Default 与原先 zeroed 相同, 且此绑定无析构清理。
+    let mut pv = PROPVARIANT::default();
+    let pv_ptr = &mut pv as *mut PROPVARIANT as *mut u8;
+    // SAFETY: 当前绑定与 Windows ABI 在 amd64/ARM64 上均为偏移 0 的 u16 标签,
+    // 以及偏移 8 的指针联合体; 两次写入均在 pv 内且满足对齐。
+    // VT_LPWSTR 借用仍存活的 Vec, 不调用 PropVariantClear, 不转交 Vec 的所有权。
+    unsafe {
         std::ptr::write(pv_ptr as *mut u16, VT_LPWSTR as u16);
         std::ptr::write(pv_ptr.add(8) as *mut *const u16, aumid_wide.as_ptr());
+    }
 
-        let pkey = PROPERTYKEY_S {
-            fmtid: GUID_PKEY_AUMID,
-            pid: 5,
-        };
-        let hr = ((*prop_store.0).set_value)(pps, &pkey, &pv);
-        if hr != 0 {
-            ((*prop_store.0).release)(pps);
-            return Err(AppError::Msg(format!(
-                "IPropertyStore::SetValue 失败: 0x{hr:08X}"
-            )));
-        }
-        let hr = ((*prop_store.0).commit)(pps);
-        ((*prop_store.0).release)(pps);
-        if hr != 0 {
-            return Err(AppError::Msg(format!(
-                "IPropertyStore::Commit 失败: 0x{hr:08X}"
-            )));
-        }
+    let pkey = PROPERTYKEY_S {
+        fmtid: GUID_PKEY_AUMID,
+        pid: 5,
+    };
+    // SAFETY: 接口引用尚未释放, vtable 与 IID 对应; pkey/pv 及 UTF-16 Vec 均
+    // 保持到 Release 完成, REFPROPVARIANT 仅借用输入, 不转交 Vec 的所有权。
+    let hr = unsafe { ((*prop_store.0).set_value)(pps, &pkey, &pv) };
+    if hr != 0 {
+        // SAFETY: 归还 SHGetPropertyStoreFromParsingName 返回的这次引用, 之后立即返回。
+        unsafe { ((*prop_store.0).release)(pps) };
+        return Err(AppError::Msg(format!(
+            "IPropertyStore::SetValue 失败: 0x{hr:08X}"
+        )));
+    }
+    // SAFETY: 同一线程上的接口引用仍有效, Commit 不接收额外裸指针。
+    let hr = unsafe { ((*prop_store.0).commit)(pps) };
+    // SAFETY: 无论 Commit 成败均归还所取得的引用, 后续不再访问接口或 vtable。
+    unsafe { ((*prop_store.0).release)(pps) };
+    if hr != 0 {
+        return Err(AppError::Msg(format!(
+            "IPropertyStore::Commit 失败: 0x{hr:08X}"
+        )));
     }
     Ok(())
 }
@@ -269,18 +291,18 @@ const VT_LPWSTR: i32 = 31;
 
 /// PKEY_AppUserModel_ID 属性的 GUID (来自 propkey.h) 。
 const GUID_PKEY_AUMID: GUID = GUID {
-    data1: 0x9F4C2855,
-    data2: 0x9F79,
-    data3: 0x4B39,
-    data4: [0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3],
+    data1: 0x9f4c2855,
+    data2: 0x9f79,
+    data3: 0x4b39,
+    data4: [0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0xf3],
 };
 
 /// IPropertyStore 接口的 IID。
 const IID_IPROPERTY_STORE: GUID = GUID {
-    data1: 0x886D8EEB,
-    data2: 0x8CF2,
+    data1: 0x886d8eeb,
+    data2: 0x8cf2,
     data3: 0x4446,
-    data4: [0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99],
+    data4: [0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99],
 };
 
 #[repr(C)]
@@ -289,9 +311,10 @@ struct PROPERTYKEY_S {
     pid: u32,
 }
 
-// 手动定义 IPropertyStore COM vtable。
-// windows crate 的 IPropertyStore 与 windows-sys 的 PROPVARIANT 存在跨 crate 兼容性问题,
-// 因此直接用 windows-sys 构建最小可用的 vtable 来调用 SetValue / Commit。
+// 手动定义 IPropertyStore COM vtable, 顺序对应 IUnknown 的三项方法,
+// 再依次为 GetCount/GetAt/GetValue/SetValue/Commit; 占位槽保持指针宽度。
+// typed COM 迁移已延期: windows 0.62.2 将非负 HRESULT 统一视为成功,
+// 而此处须保留原 hr != 0 判定。属性布局、借用缓冲区和手动 Release 保持不变。
 #[repr(C)]
 struct IPropertyStoreVtbl {
     query_interface: unsafe extern "system" fn(

@@ -85,8 +85,8 @@ impl Core {
 /// 更新核心时从 release zip 中提取的文件清单。
 ///
 /// 刻意只取这几个文件, 而不是解压整个包:
-/// - xray 包里带的 `geoip.dat` / `geosite.dat` 是官方版, 全量解压会盖掉用户
-///   自己配置的那套规则集 (settings.json 的 `download.ruleset`)
+/// - Xray 的 `geoip.dat` / `geosite.dat` 属于可选更新文件, 包中存在时会覆盖本地副本;
+///   自定义规则集仍按 settings.json 的 `download.ruleset` 独立更新
 /// - `LICENSE`、`README.md`、`xray_no_window.*` 对本程序没用, 白占几十 MB
 /// - 核心目录里还有 sing-box 运行时生成的 `cache.db`, 整体替换目录会连它
 ///   一起丢掉

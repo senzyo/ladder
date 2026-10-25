@@ -64,7 +64,7 @@ fn run_application() -> Result<(), AppError> {
     scheduler::ensure_boot_dns_reset_task(&exe_dir);
     toast::setup(&exe_path).map_err(|e| AppError::Msg(format!("初始化 Toast 通知失败: {e}")))?;
 
-    let icons = unsafe { tray::load_status_icons(&exe_dir) };
+    let icons = tray::load_status_icons(&exe_dir);
 
     app_state::initialize(AppState {
         exe_dir: exe_dir.clone(),
@@ -74,18 +74,22 @@ fn run_application() -> Result<(), AppError> {
         child_xray: None,
     })?;
 
-    unsafe {
-        let h_instance = GetModuleHandleW(None)
-            .map_err(|e| AppError::Msg(format!("获取模块句柄失败: {e}")))?
-            .0 as isize;
-        let hwnd = tray::create_window(h_instance)?;
-        tray::add_icon(hwnd, h_instance, &exe_dir)?;
-        tray::set_tooltip("ladder");
-        tray::run_message_loop();
-    }
+    // SAFETY: None 请求当前可执行模块, 它在整个进程运行期保持加载; 不手动释放。
+    let h_instance = unsafe { GetModuleHandleW(None) }
+        .map_err(|e| AppError::Msg(format!("获取模块句柄失败: {e}")))?
+        .0 as isize;
+    // SAFETY: 模块句柄有效, 创建和后续消息分发均在当前主线程, 回调存活至进程结束。
+    let hwnd = unsafe { tray::create_window(h_instance) }?;
+    // SAFETY: hwnd 刚由本线程创建且未销毁; 模块和路径在同步注册期间有效。
+    unsafe { tray::add_icon(hwnd, h_instance, &exe_dir) }?;
+    tray::set_tooltip("ladder");
+    // SAFETY: 当前主线程拥有托盘窗口, 循环中保持 COM 守卫和应用资源存活。
+    unsafe { tray::run_message_loop() };
 
     let _ = app_state::with_app_state(|app| {
-        app.icons.delete();
+        // SAFETY: 主线程消息循环已结束, 弹出菜单已关闭; 位图由本次启动创建,
+        // 仅在此释放一次, 后续不再使用这些句柄。
+        unsafe { app.icons.delete() };
     });
 
     Ok(())

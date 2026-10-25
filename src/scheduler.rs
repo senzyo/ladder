@@ -65,6 +65,7 @@ pub fn ensure_boot_dns_reset_task(exe_dir: &Path) {
     }
 }
 
+#[must_use]
 fn task_exists() -> bool {
     process::hidden_command("schtasks")
         .args(["/Query", "/TN", TASK_NAME])

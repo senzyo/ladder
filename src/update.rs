@@ -709,6 +709,7 @@ fn stage_and_replace(
 /// 核心文件了, 界面上会显示成未安装。所以必须把已挪走的旧文件放回去; 万一连
 /// 恢复都失败, 错误信息要指名道姓地给出需要手工处理的路径, 而不是只说一句
 /// "更新失败"。
+#[must_use = "必须向调用方报告替换失败及回滚结果"]
 fn replace_failed(
     core_dir: &Path,
     renamed: &[(&str, PathBuf)],
@@ -1424,7 +1425,7 @@ mod tests {
     fn test_sha256_file_large_multichunk() {
         let dir = tempfile::tempdir().expect("创建独立测试目录");
         let path = dir.path().join("large.bin");
-        let data = vec![0xABu8; 200_000];
+        let data = vec![0xabu8; 200_000];
         assert!(data.len() > HASH_BUFFER_SIZE, "样本必须跨多个缓冲区");
         fs::write(&path, &data).expect("写入跨缓冲区哈希样本");
         assert_eq!(
@@ -1654,7 +1655,7 @@ mod tests {
     fn test_extract_artifacts_accepts_deflated_contents() {
         let dir = tempfile::tempdir().expect("创建独立测试目录");
         let zip_path = dir.path().join("core.zip");
-        let data = vec![0xAB; 32 * 1024];
+        let data = vec![0xab; 32 * 1024];
         write_test_zip_with_compression(
             &zip_path,
             &[("extra.dll", b"new-dll"), ("core.exe", &data)],
@@ -1680,7 +1681,7 @@ mod tests {
         for compression in [CompressionMethod::Stored, CompressionMethod::Deflated] {
             let dir = tempfile::tempdir().expect("创建独立测试目录");
             let zip_path = dir.path().join("core.zip");
-            let data = vec![0xAB; 32 * 1024];
+            let data = vec![0xab; 32 * 1024];
             // 先成功暂存可选文件, 再由必需文件触发错误, 覆盖两份 .new 的清理。
             write_test_zip_with_compression(
                 &zip_path,

@@ -132,7 +132,12 @@ fn switch_core_mode(id: u16) -> Option<CoreMode> {
 /// 耗时操作 (重启 / 终止 / 更新 / 切换配置) 都交给后台线程, 避免阻塞消息
 /// 循环。忙标志由 `FlagGuard` 管理: 交给后台线程的分支在线程结束时释放,
 /// 其余分支在本函数返回时释放, 提前返回不会漏。
-pub(crate) fn execute_menu_command(
+///
+/// # Safety
+///
+/// `hwnd` 必须是当前线程拥有的有效托盘窗口; 调用方须允许退出命令销毁它,
+/// 销毁后不得继续将其用于要求有效窗口的操作。
+pub(crate) unsafe fn execute_menu_command(
     hwnd: isize,
     id: u16,
     config_selections: &HashMap<u16, ConfigSelection>,
@@ -140,7 +145,8 @@ pub(crate) fn execute_menu_command(
     // 打开目录和退出不占用忙标志: 前者只是拉起 explorer, 后者必须随时可用。
     match id {
         tray::ID_OPEN_DIR => return open_exe_dir(),
-        tray::ID_EXIT => return exit_app(hwnd),
+        // SAFETY: 沿用本函数的窗口所有权和当前线程契约, 退出后立即返回。
+        tray::ID_EXIT => return unsafe { exit_app(hwnd) },
         _ => {}
     }
 
@@ -174,16 +180,20 @@ fn open_exe_dir() {
     let _ = Command::new("explorer").arg(&exe_dir).spawn();
 }
 
-fn exit_app(hwnd: isize) {
+/// 停止核心并恢复 DNS 后销毁托盘窗口。
+///
+/// # Safety
+///
+/// `hwnd` 必须是当前线程拥有且尚未销毁的托盘窗口, 调用后不再使用它。
+unsafe fn exit_app(hwnd: isize) {
     info!("退出程序");
     // 这里刻意同步执行: 一旦 DestroyWindow 触发消息循环退出, 进程很快就会
     // 结束, 放到后台线程会来不及恢复物理网卡 DNS。
     if let Err(e) = process::stop_all() {
         warn!("退出时终止进程失败: {e}");
     }
-    unsafe {
-        let _ = DestroyWindow(HWND(hwnd as *mut c_void));
-    }
+    // SAFETY: 调用方保证窗口归当前线程所有且存活, 同步清理已结束; 不再使用 hwnd。
+    let _ = unsafe { DestroyWindow(HWND(hwnd as *mut c_void)) };
 }
 
 fn run_service_command(hwnd: isize, guard: FlagGuard, cmd: ServiceCommand) {

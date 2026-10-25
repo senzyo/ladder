@@ -10,7 +10,9 @@
 use std::ffi::c_void;
 use tracing::{debug, info, warn};
 use windows::Win32::Foundation::{NO_ERROR, WIN32_ERROR};
-use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+use windows::Win32::NetworkManagement::IpHelper::{
+    FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
+};
 use windows::core::Error;
 use windows_registry::LOCAL_MACHINE;
 
@@ -31,6 +33,7 @@ struct PhysicalAdapter {
 }
 
 /// 获取物理网卡列表, 保留普通操作的发现与失败诊断。
+#[must_use]
 fn get_physical_adapters() -> Vec<PhysicalAdapter> {
     match get_physical_adapters_without_logging() {
         Ok(adapters) => {
@@ -58,14 +61,20 @@ fn get_physical_adapters_without_logging() -> Result<Vec<PhysicalAdapter>, WIN32
     let mut adapters = Vec::new();
     let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
 
+    // SAFETY: 输出指针指向本地可写变量; 成功后系统分配的表在遍历结束前保持存活。
     let result = unsafe { GetIfTable2(&mut table_ptr) };
     if result != NO_ERROR || table_ptr.is_null() {
         return Err(result);
     }
 
-    let table = unsafe { &*table_ptr };
-    let rows = std::ptr::slice_from_raw_parts(table.Table.as_ptr(), table.NumEntries as usize);
-    let rows = unsafe { &*rows };
+    // SAFETY: 已检查成功和非空, GetIfTable2 返回正确对齐且已初始化的表头。
+    let count = unsafe { (*table_ptr).NumEntries } as usize;
+    // SAFETY: 通过原始分配指针定位柔性数组, 不先借用绑定中长度为 1 的占位数组;
+    // repr(C) 字段偏移及 MIB_IF_ROW2 大小保留 Windows 要求的对齐填充。
+    let rows_ptr = unsafe { std::ptr::addr_of!((*table_ptr).Table).cast::<MIB_IF_ROW2>() };
+    // SAFETY: 系统为 count 项分配并初始化同一块内存, 长度在分配范围内;
+    // 本函数只读这些项, 所有借用在 FreeMibTable 之前结束, 没有并发释放者。
+    let rows = unsafe { std::slice::from_raw_parts(rows_ptr, count) };
 
     for row in rows {
         let flags = row.InterfaceAndOperStatusFlags._bitfield;
@@ -111,6 +120,7 @@ fn get_physical_adapters_without_logging() -> Result<Vec<PhysicalAdapter>, WIN32
         adapters.push(PhysicalAdapter { alias, guid });
     }
 
+    // SAFETY: 这是 GetIfTable2 的原始分配地址, 所有行借用已结束, 且只释放一次。
     unsafe { FreeMibTable(table_ptr as *const c_void) };
 
     Ok(adapters)
@@ -280,7 +290,8 @@ mod tests {
                 ),
             ];
             assert_eq!(writes.len(), expected.len(), "每张网卡应尝试两个协议");
-            for (actual, expected) in writes.iter().zip(expected) {
+            let paired_writes = writes.iter().zip(expected);
+            for (actual, expected) in paired_writes {
                 assert_eq!(
                     (
                         actual.0.as_str(),

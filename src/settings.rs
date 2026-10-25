@@ -131,22 +131,27 @@ impl Default for Retry {
     }
 }
 
+#[must_use]
 fn default_log_level() -> String {
     "debug".to_string()
 }
 
+#[must_use]
 fn default_log_max_size_mb() -> u64 {
     5
 }
 
+#[must_use]
 fn default_max_retries() -> u32 {
     3
 }
 
+#[must_use]
 fn default_retry_delay() -> u64 {
     2
 }
 
+#[must_use]
 fn default_interval_days() -> u64 {
     3
 }

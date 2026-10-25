@@ -4,12 +4,12 @@
 
 ## 当前状态与执行范围
 
-- 用户选择 B：先按建议顺序分批升级依赖，验证通过后按已定稿方案重构。
-- 用户已于 2026-10-23 指示按照暂存区文档开始执行，并自行补装构建工具。S0、D1–D4、R1–R5 已通过；2026-10-25 最新续做完成 R5 故障策略，Clippy、84 项测试及双架构 release 构建通过。本轮在 R5 验证边界收尾，下一步 R6；R6–R7 尚未实施。
-- 用户于 2026-10-24 明确提醒旧版 `ladder.exe` 正在运行，并允许分会话执行；最新指令为“先提交git，然后按工作区最新版交接文档继续”。本轮先提交 R4，再按 R5 边界推进。未启动新编译的应用；后续也不得为验证而启动它、终止现有实例或核心、修改真实 DNS/注册表/计划任务。实际托盘与 DNS 验证留到可恢复的隔离环境。
-- **始终读取工作区最新版本。** 依赖与首批整理已提交为 `531f3a2`，R2/R3 已提交为 `d8ea64b`；本轮按用户指令把 R4 提交为 `e63f584`（`refactor: 对齐内部 API 并封装状态闭包访问`）。后续 R5 源码和进度文档均留在未暂存区，未扩大“先提交”为自动逐批提交。typed COM 迁移已由用户明确暂缓，保留原 `hr != 0` 判定和手写接口，不新增迁移所需 features。
-- 工作目录：`C:\Users\admin\Documents\GitRepos\ladder`；分支 `main`，本轮 HEAD 为 `e63f584`，父提交为 `d8ea64b`。接手时用 `git log -1` 和 `git status` 确认实际状态，不假设分支或文件始终不变。
-- R4 源码与文档已在 `e63f584` 中。R5 的未提交修改是最新进度，换 checkout/worktree 时必须一并传递。
+- 用户选择 B：先按建议顺序分批升级依赖，验证通过后按已定稿方案重构。2026-10-25 本轮最新指令为“按最新版交接文档继续”。
+- 用户已于 2026-10-23 指示按照暂存区文档开始执行，并自行补装构建工具。S0、D1–D4、R1–R6 已完成授权范围；本轮完成 R6 Windows 边界整理及 R7 逐条静态复核，格式、Clippy、84 项测试和双架构 release 构建通过。R7 的 Windows 隔离实测和 ARM64 原生运行仍未完成，typed COM 明确延期，不能标为全部验收通过。
+- 用户于 2026-10-24 明确提醒旧版 `ladder.exe` 正在运行，并允许分会话执行。未启动新编译的应用；后续也不得为验证而启动它、终止现有实例或核心、修改真实 DNS/注册表/计划任务。实际托盘与 DNS 验证留到可恢复的隔离环境。
+- **始终读取工作区最新版本。** 依赖与首批整理已提交为 `531f3a2`，R2/R3 为 `d8ea64b`，R4 为 `e63f584`；本轮接手核实 R5 已提交为 `3fe528c`（`refactor: 按资源处理中毒锁并统一无日志紧急清理`），工作区干净。历史记录的“未提交”仅表示当时状态。typed COM 迁移继续延期，保留原 `hr != 0` 判定和手写接口，不新增迁移所需 features。
+- 工作目录：`C:\Users\admin\Documents\GitRepos\ladder`；分支 `main`，本轮 HEAD 为 `3fe528c`，父提交为 `e63f584`。接手时用 `git log -1` 和 `git status` 确认实际状态，不假设分支或文件始终不变。
+- R5 源码与文档已在 `3fe528c` 中；本轮 R6/R7 修改留在未暂存区，未自动提交或推送，换 checkout/worktree 时须一并传递。
 - 不自动 commit、push、发布，不更改全局工具链或系统配置。分批是独立审查和验证的单位，不表示自动创建提交。
 - Windows 10 22H2、PowerShell 7；已观察到 rustc 1.99.0。执行前读取适用的 AGENTS.md；PowerShell 输出中文前设置 UTF-8。
 
@@ -20,7 +20,7 @@
 3. 从下面第一个未完成批次继续。先验证、记录结果，再进入下一批；失败时先定位并处理本批回归，不能写成已通过。
 4. 每批结束更新本文的进度表及证据记录。换会话或上下文压缩后先重读这些文件，不依赖上一轮的口头总结。
 
-当前直接入口是下文“新会话续做入口”。不要重复升级依赖或重做已完成的 R2–R5；故障策略已完成自动验证，但不能等同于 Windows 安全契约和真实系统运行验证已完成。
+当前直接入口是下文“新会话续做入口”。不要重复升级依赖或重做 R2–R6；R7 静态复核和自动验证已有证据，但不能等同于真实系统验证完成或所有既有 unsafe 错误路径已证明安全。
 
 ## 执行批次
 
@@ -36,8 +36,8 @@
 | R3 | 职责迁移 | 按模块映射迁移代码和测试，先保留原锁与错误语义 | 已完成，66 项测试及双架构构建通过 |
 | R4 | 内部 API 对齐 | 具名结果、闭包访问、must_use、derive、隔离线程测试等 | 已完成，77 项测试及双架构构建通过 |
 | R5 | 故障策略 | 中毒处理、无 tracing 紧急路径及隔离测试 | 已完成，84 项测试及双架构构建通过 |
-| R6 | Windows 边界 | 收缩 unsafe 与补安全契约；typed COM 已明确延期 | 未开始，COM 部分延期 |
-| R7 | 最终验收 | 逐项复核规范、不变量、自动检查、双架构构建及环境允许的实际验证 | 未开始 |
+| R6 | Windows 边界 | 收缩 unsafe 与补安全契约；typed COM 已明确延期 | 授权的边界整理完成，84 项测试及双架构构建通过；COM 延期，已知独立缺陷保留 |
+| R7 | 最终验收 | 逐项复核规范、不变量、自动检查、双架构构建及环境允许的实际验证 | 静态复核与自动检查通过；Windows 隔离实测、ARM64 原生运行未完成 |
 
 测试应针对本批风险，复用已通过的检查；只在后续修改、失败或未解决风险需要时重复。构建使用独立 `CARGO_TARGET_DIR`，防止 build.rs 覆盖现有运行目录中的配置。不能把缺少 ARM64 原生运行环境写成原生验证已通过。
 
@@ -184,14 +184,14 @@ TLS 三项实际依赖链为 `ladder → ureq → rustls / webpki-roots`，`rust
 
 ## 新会话续做入口
 
-### 从 R6 Windows 边界开始
+### 从剩余运行验证开始
 
-1. 读取工作区的方案/进度文件、术语和 ADR，检查相对 `e63f584` 的未提交差异；最新验证见下文 R5 记录。环境和代码未变时无需重新建立 S0 或重做 R2–R5。
+1. 读取工作区的方案/进度文件、术语和 ADR，检查相对 `3fe528c` 的未提交差异；最新验证见下文 R6/R7 记录。环境和源码未变时无需重新建立 S0 或重复已通过的检查。
 2. 主要入口已是 `app.rs`、`commands.rs`、`logging.rs` 和 `app_state.rs` 等平铺叶模块；`main.rs` 只做装配，`state.rs` 已删除、`error.rs` 已更名为 `app_error.rs`。不得按旧文件布局重新运行提取脚本。
-3. R6 只推进已确认的 unsafe 边界收缩和 SAFETY/调用方契约，typed COM 保持延期。优先检查 app/tray/toast/com_guard/single_instance_guard/process/dns/logging 中的 FFI；不混入图标泄漏、消息循环、XML、TUN 等独立缺陷修复。新增的 process/DNS 无日志底层也需纳入安全边界复核。
-4. 每个批次验证后更新本文；可以再次在完整批次边界交接，无须在单一会话耗尽上下文。
+3. R6 的 unsafe 收缩、SAFETY、调用方契约及 R7 格式/文档细项已落实，逐条清单已更新。当前剩余托盘菜单、模式切换、配置选择、退出/DNS 实测，须有可恢复的隔离 Windows 环境；ARM64 原生验证另需相应主机。现有日常环境不满足这些条件，不擅自运行。
+4. typed COM 继续延期；图标、GetMessageW 的 -1 路径、XML、TUN 等独立缺陷未获本轮修复授权。只有用户另行选择处理或恢复迁移时才推进；不把缺口重写为通过。
 
-R5 所有模块已完成汇合，最新源码在当前未暂存区，无需从子代理或临时脚本恢复内容。没有必须等待的后台构建/测试。切换 checkout 时应使用 `e63f584` 加本轮 R5 未提交修改。
+所有源码已汇合，无需从子代理或临时脚本恢复，没有必须等待的后台构建/测试。切换 checkout 时应使用 `3fe528c` 加本轮 R6/R7 未提交修改。本轮未提交或推送。
 
 ### 后续实现注意点
 
@@ -201,8 +201,8 @@ R5 所有模块已完成汇合，最新源码在当前未暂存区，无需从�
 - R5 已完成：`try_with_state` 先释放中毒错误，再返回不携带数据/守卫的 `PoisonedState` 标记；`with_state` 立即转入 `emergency::terminate_after_state_poison`，不存在读取中毒值或继续执行闭包的分支。未初始化仍为 None。四处 `into_inner()` 已全部删除，也没有 clear_poison/catch_unwind 调用。
 - R5 清理链：emergency 共用四步编排，依次调用 process 的 `kill_processes_by_name_without_logging`（sing-box、xray）、dns 的 `restore_dns_to_dhcp_without_logging`、process 的 `flush_dns_without_logging`。普通包装继续保留原日志；原 `kill_cores_without_state` 已删除。R6 不得把日志、AppState、Child 或通知引入底层。
 - R5 测试：局部 Mutex 用工作线程 panic 制造中毒；日志 write/flush 固定错误且无递归 tracing，另一输出层仍收到事件；启动警告队列返回固定降级消息。状态退出和 panic 钩子测试分别在有 10 秒父进程超时的独立测试子进程中执行，只注入文件记录替身。`emergency::test_support` 属于 cfg(test)，切勿将测试注入替换为真实清理入口。这些测试验证故障编排，不证明真实系统清理必然成功。
-- R6：typed COM 明确延期，其余 FFI 安全边界仍需处理；方案末尾的图标、消息循环、XML、TUN 等独立缺陷不得夹带修复。
-- R7：逐条更新规范清单，保留未验证项；以 D4 的 2,153,984 / 1,900,032 字节为重构体积基准。ARM64 原生运行与真实托盘/DNS 验证当前均未做。
+- R6：COM 守卫使用私有线程标记；加载位图是安全封装，显式释放为 unsafe；菜单命令分发贯通窗口线程/销毁契约。typed COM 和独立缺陷仍保留，GetMessageW 的 -1 路径没有宣称已证明安全。
+- R7：逐条清单已更新；以 D4 的 2,153,984 / 1,900,032 字节为重构体积基准。最终产物为 2,154,496 / 1,900,544 字节，与 R5 相同。ARM64 原生运行与真实托盘/DNS 验证当前均未做。
 
 ### 已验证可用的本机构建方式
 
@@ -281,6 +281,27 @@ cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxilia
 - 两个既定独立目标目录内的 amd64/ARM64 release 构建均退出 0，未执行产物。amd64 **2,154,496 字节**，相对 D4 **+512 字节 / +0.0238%**；ARM64 **1,900,544 字节**，相对 D4 **+512 字节 / +0.0269%**；相对 R4 两者各增加 1,024 字节。
 - 独立只读复核逐层核查紧急调用链、普通错误诊断、状态中毒守卫释放、未初始化契约以及测试注入边界，未发现阻断问题。Cargo.lock SHA256 保持 `ADA9DA1D7911EFE76D72B1B420C31A6587B55F9499FB1BE7AFF4B53390FD117B`；R5 源文件快照在 `target/codex-batches-20261025/r5-complete/`，不随 Git 自动传递。
 - 本轮在 R5 验证边界收尾，下一步 R6 的 unsafe/SAFETY/调用方契约，typed COM 继续延期。R7 最终规范复核、Windows 实际托盘/模式切换/配置选择/退出/DNS、ARM64 原生运行仍未完成；未触碰旧运行实例或日常网络配置。
+
+### R6 Windows 边界整理完成
+
+- 本轮接手 `main` 的 HEAD 为 `3fe528c`，工作区干净；R5 已提交的实际状态取代上节当时的未提交记录。本轮仅修改源码及三份既有方案/进度文档，未暂存、提交或推送。Cargo.toml、Cargo.lock、build.rs、CI、实际 settings.json 和配置目录均未变。
+- app、commands、tray、toast、com_guard、single_instance_guard、process、dns、logging 的大块 unsafe 收缩到原生调用、裸指针投影或紧密的资源操作；各块补 SAFETY，保留 unsafe 函数的调用方义务写入 `# Safety`。main 模块文档说明标准库与当前 Win32 绑定无法提供所需安全等价实现的技术理由。纯菜单分支、配置扫描、错误转换、字符串构造及设备 ID 解析在安全 Rust 中完成。
+- `ComGuard` 改为包含私有 `PhantomData<*mut ()>` 的零大小守卫，不能绕过构造或安全地跨线程移动/共享；成功的 CoInitializeEx（包括 S_FALSE）与同线程 Drop 配对，失败不构造，主线程及后台线程原生命周期不变。单实例仍紧接 CreateMutexW 读取 LastError，创建失败允许启动，已有实例只关闭本次句柄。
+- tray 的路径加载函数改为安全封装；`StatusIcons::delete` 保留显式退出释放并改为 unsafe，要求有效位图、菜单结束且唯一释放。窗口创建、托盘注册、消息循环、菜单内部句柄借用及 commands 退出分发都有明确调用方契约。保留所有菜单 ID、文本、flags、模式分支、锁范围及释放/失败顺序；退出仍同步停止核心/恢复 DNS 后 DestroyWindow。
+- DNS 从 GetIfTable2 返回的原始分配指针读取计数，用 `addr_of!` 定位 Table 柔性数组后建立只读 slice，避免先借用绑定中长度为 1 的占位数组；行借用结束后仍释放原始地址一次。进程枚举使用与原 zeroed 等价的 `PROCESSENTRY32W` Default，并一次性设置 dwSize；首项/后续失败、按名终止及普通诊断契约不变。WinTUN 枚举保留普通作用域，临时缓冲仍在执行 pnputil 前释放。
+- toast 保留手写接口、属性键和布局、VT_LPWSTR 对 Vec 的借用、严格 `hr != 0` 判断及各分支 Release；ShellLink/IPersistFile 仍在属性写入前的原作用域释放。PROPVARIANT Default 与原 zeroed 等价且 windows-sys 绑定无 Drop；未引入 typed COM、hidden API 或新 features。本机 windows 0.62.2/windows-sys 0.61.2 源码与 SDK 10.0.26100.0 布局经静态核查。
+- 独立交叉审查未发现新增运行行为回归；无日志紧急清理链未引入 tracing、状态或 UI。图标/DC 泄漏、GetMessageW 的 -1 路径及其余独立缺陷未修复；消息循环注释明确正常路径保证不覆盖该错误分支，不能把本轮整理说成完整内存安全证明。
+- 官方依据于 2026-10-25 核对：[GetIfTable2 分配/释放和对齐](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getiftable2)、[CoUninitialize 同线程配对](https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-couninitialize)、[IPropertyStore::SetValue 借用参数与提交](https://learn.microsoft.com/en-us/windows/win32/api/propsys/nf-propsys-ipropertystore-setvalue)。SetValue 页面未明确描述复制细节，注释仅按 REFPROPVARIANT 借用输入、不转交 Vec 所有权表述，缓冲保持到 Release。
+- 初次 Clippy 指出 Default 后再赋 dwSize 的 `field_reassign_with_default`；改为结构体初始化后重新完成全部检查，未加 lint 豁免。最终 `cargo fmt --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked`、`git diff --check` 均退出 0；**84 项测试通过，0 失败、0 忽略，2.92 秒**，原覆盖未丢失。没有为注释与机械改写新增重复测试，也未运行真实应用入口。
+- 最终源码在既定独立目标目录内完成 amd64/ARM64 release 构建，均退出 0，未执行产物。amd64 **2,154,496 字节**（相对 D4 **+512 / +0.0238%**），ARM64 **1,900,544 字节**（**+512 / +0.0269%**），两者均与 R5 相同。Cargo.lock SHA256 保持 `ADA9DA1D7911EFE76D72B1B420C31A6587B55F9499FB1BE7AFF4B53390FD117B`。
+
+### R7 静态与自动验收通过，运行验证仍有缺口
+
+- 逐行复核规范清单，分别记录落实证据、条件适用、不适用和明确延期；再次读取 [Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html)。本轮补齐纯函数/查询及重要错误或资源结果的 `must_use`，包括私有函数和测试辅助；不对 Result/Option、已标注类型或 trait 实现重复标注。
+- 十六进制字面量改小写，数值和 `{hr:08X}` 错误输出不变；无自定义宏 matcher。没有发现裸 unwrap/unwrap_err、中毒恢复/clear_poison/catch_unwind 调用、feature gate、rustfmt skip 或未转义不可见控制字符。保留 stable，未开启不支持的 rustfmt 选项。修正 CoreArtifacts 关于 Xray geo 文件的陈旧说明；仅移动测试 Write 导入、提取 DNS 测试配对迭代变量，不改覆盖目的。
+- 复核正常行为不变量：COM 线程范围、单实例失败策略、退出顺序、忙守卫、状态闭包及串行保存、失败不回滚内存、当前规则集条目回写、日志上限、候选去重、下载失败通知后的返回成功、资产首匹配/版本容错、白名单和更新回滚、设置默认值及序列化顺序均保持。R5 的退出/panic 隔离测试继续通过。
+- 上节最终验证已包含这些机械收口，不改源码后重复运行同一测试；R7 复用该快照的 84 项测试、Clippy、格式与双架构结果。最终源文件快照位于 `target/codex-batches-20261025/r6-r7-complete/`，属于忽略目录，不随 Git 自动传递。
+- **未完成门槛**：Windows 托盘/模式切换/配置选择/正常退出/DNS 恢复需要可恢复的隔离环境；ARM64 原生运行需要相应设备；typed COM 的快捷方式属性/通知验证随迁移延期。普通测试子进程不等于 release abort 实跑，交叉构建不等于 ARM64 原生验证，既有独立缺陷不因本轮通过而消失。旧运行实例和用户日常网络配置未触碰。
 
 后续每批追加：批次状态、修改文件、实际版本差异、执行命令与退出结果、测试数量及关键用例、两架构产物字节数（适用时）、未验证项、遇到的回归及修正、下一步。
 

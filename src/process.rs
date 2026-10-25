@@ -37,6 +37,7 @@ use crate::update;
 use crate::windows_strings;
 
 // dnsapi.dll 导入, 用于刷新系统 DNS 缓存。
+// SAFETY: 导出使用 Windows system ABI, 没有参数; 本地声明保留不读取返回值的契约。
 #[link(name = "dnsapi")]
 unsafe extern "system" {
     fn DnsFlushResolverCache();
@@ -76,31 +77,35 @@ fn for_each_process(visit: impl FnMut(&str, u32) -> bool) {
 fn for_each_process_without_logging(
     mut visit: impl FnMut(&str, u32) -> bool,
 ) -> Result<(), WindowsError> {
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;
+    // SAFETY: 使用进程快照标志, 不传指针; 成功句柄由本函数持有直到枚举结束。
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }?;
 
-        let mut entry: PROCESSENTRY32W = mem::zeroed();
-        entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
 
-        if Process32FirstW(snapshot, &mut entry).is_ok() {
-            loop {
-                let end = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-                if !visit(&name, entry.th32ProcessID) {
-                    break;
-                }
-                if Process32NextW(snapshot, &mut entry).is_err() {
-                    break;
-                }
+    // SAFETY: snapshot 有效, entry 是独占且大小正确的输出缓冲区。
+    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
+        loop {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            if !visit(&name, entry.th32ProcessID) {
+                break;
+            }
+            // SAFETY: 继续使用同一未关闭的快照及独占输出, 回调未取得它们的句柄/引用。
+            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+                break;
             }
         }
-
-        let _ = CloseHandle(snapshot);
     }
+
+    // SAFETY: snapshot 来自本次成功创建, 枚举已结束且不再使用, 在此关闭一次。
+    let _ = unsafe { CloseHandle(snapshot) };
     Ok(())
 }
 
@@ -172,6 +177,7 @@ pub fn core_states(exe_dir: &Path) -> CoreStates {
     }
 }
 
+#[must_use]
 fn core_status(installed: bool, running: bool) -> CoreStatus {
     match (installed, running) {
         (false, _) => CoreStatus::NotInstalled,
@@ -337,12 +343,13 @@ pub(crate) fn kill_processes_by_name_without_logging(exe_name: &str) {
 /// 紧急路径必须传入不访问日志或应用状态的回调。
 fn terminate_pids(pids: Vec<u32>, mut before_terminate: impl FnMut(u32)) {
     for pid in pids {
-        unsafe {
-            if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-                before_terminate(pid);
-                let _ = TerminateProcess(handle, 1);
-                let _ = CloseHandle(handle);
-            }
+        // SAFETY: PID 是数值标识, 存在性和访问权限由系统检查; 不传借用指针。
+        if let Ok(handle) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
+            before_terminate(pid);
+            // SAFETY: handle 为本次打开、尚未关闭且带终止权限的进程句柄。
+            let _ = unsafe { TerminateProcess(handle, 1) };
+            // SAFETY: 回调未取得 handle; 终止调用不关闭它, 因此仍由这里唯一关闭。
+            let _ = unsafe { CloseHandle(handle) };
         }
     }
 }
@@ -602,6 +609,7 @@ const TUN_PREFIX: &str = "tun-";
 
 /// 生成带 `tun-` 前缀的随机 TUN 接口名 (如 `tun-0ad1f0`) 。
 /// 使用 RandomState 对时间戳做哈希, 每次运行种子不同。
+#[must_use]
 fn random_tun_name() -> String {
     use std::hash::{BuildHasher, Hasher, RandomState};
 
@@ -612,7 +620,7 @@ fn random_tun_name() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     hasher.write_u128(nanos);
-    format!("{TUN_PREFIX}{:06x}", hasher.finish() & 0xFF_FFFF)
+    format!("{TUN_PREFIX}{:06x}", hasher.finish() & 0xff_ffff)
 }
 
 /// 清理 Windows 网络配置注册表中 TUN 相关的子项。
@@ -682,14 +690,15 @@ fn clean_tun_entries(parent_path: &str) {
 /// 5. 通过 `pnputil /remove-device` 移除问题设备
 /// 6. 最后执行 `pnputil /scan-devices` 重新扫描硬件
 fn cleanup_orphaned_wintun() {
-    const CR_NO_SUCH_DEVNODE: u32 = 0x0D;
+    const CR_NO_SUCH_DEVNODE: u32 = 0x0d;
 
     info!("检查孤立 WinTUN 设备...");
     let mut instance_ids: Vec<String> = Vec::new();
 
-    unsafe {
+    {
         let mut size = 0u32;
-        if CM_Get_Device_ID_List_SizeW(&mut size, ptr::null(), 0) != CR_SUCCESS {
+        // SAFETY: size 是可写输出, 空过滤器和零 flags 请求所有设备 ID 的缓冲区大小。
+        if unsafe { CM_Get_Device_ID_List_SizeW(&mut size, ptr::null(), 0) } != CR_SUCCESS {
             return;
         }
         if size == 0 {
@@ -697,7 +706,11 @@ fn cleanup_orphaned_wintun() {
         }
 
         let mut buffer: Vec<u16> = vec![0u16; size as usize];
-        if CM_Get_Device_ID_ListW(ptr::null(), buffer.as_mut_ptr(), size, 0) != CR_SUCCESS {
+        // SAFETY: buffer 有 size 个已分配的 u16 元素, 调用期间独占可写且不会移动;
+        // 枚举规模变化导致的缓冲区不足仍由返回码处理。
+        if unsafe { CM_Get_Device_ID_ListW(ptr::null(), buffer.as_mut_ptr(), size, 0) }
+            != CR_SUCCESS
+        {
             return;
         }
 
@@ -716,14 +729,18 @@ fn cleanup_orphaned_wintun() {
             if id.to_uppercase().contains("WINTUN") {
                 let mut dev_inst = 0u32;
                 let wide_id = windows_strings::wide(&id);
-                let locate_ret = CM_Locate_DevNodeW(&mut dev_inst, wide_id.as_ptr(), 0);
+                // SAFETY: dev_inst 是独占输出, wide_id 是调用期存活的 null 结尾 UTF-16。
+                let locate_ret = unsafe { CM_Locate_DevNodeW(&mut dev_inst, wide_id.as_ptr(), 0) };
 
                 if locate_ret == CR_NO_SUCH_DEVNODE {
                     instance_ids.push(id);
                 } else if locate_ret == CR_SUCCESS {
                     let mut status = 0u32;
                     let mut problem = 0u32;
-                    if CM_Get_DevNode_Status(&mut status, &mut problem, dev_inst, 0) == CR_SUCCESS
+                    // SAFETY: dev_inst 来自成功定位, 两个输出变量独立且可写;
+                    // 设备消失等系统变化通过返回码处理。
+                    if unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, dev_inst, 0) }
+                        == CR_SUCCESS
                         && ((status & DN_STARTED) == 0 || (status & DN_HAS_PROBLEM) != 0)
                     {
                         instance_ids.push(id);
@@ -767,6 +784,7 @@ fn flush_dns() {
 
 /// 尽力刷新 DNS 缓存, 不访问应用状态或 tracing。
 pub(crate) fn flush_dns_without_logging() {
+    // SAFETY: dnsapi 导出没有参数或借用资源, 可以在清理线程直接调用。
     unsafe { DnsFlushResolverCache() };
 }
 
@@ -777,6 +795,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// 用测试进程自己做样本, 不依赖环境里存在某个特定进程。
+    #[must_use]
     fn current_exe_name() -> String {
         std::env::current_exe()
             .expect("测试进程应能查询自身可执行文件路径")
@@ -850,17 +869,20 @@ mod tests {
     }
 
     /// 读回配置并解析, 解析失败即说明改写产生了非法 JSON。
+    #[must_use]
     fn read_json(path: &Path) -> Value {
         let text = fs::read_to_string(path).expect("应能读取改写后的测试配置");
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("改写后的 JSON 非法: {e}\n{text}"))
     }
 
+    #[must_use]
     fn sing_box_interface_name(json: &Value) -> &str {
         json["inbounds"][0]["interface_name"]
             .as_str()
             .expect("sing-box 配置应含字符串 interface_name")
     }
 
+    #[must_use]
     fn xray_tun_name(json: &Value) -> &str {
         json["inbounds"][0]["settings"]["name"]
             .as_str()

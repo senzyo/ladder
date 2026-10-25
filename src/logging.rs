@@ -28,6 +28,7 @@ const ANSI_YELLOW: &str = "\x1b[33m";
 const ANSI_RED: &str = "\x1b[31m";
 const ANSI_BLUE: &str = "\x1b[34m";
 
+#[must_use]
 fn level_color(level: &Level) -> &'static str {
     match *level {
         Level::INFO => ANSI_GREEN,
@@ -66,6 +67,7 @@ where
 
 /// 把当前 UTC 时间戳直接写进输出, 避免每条日志都分配一个 String。
 fn write_utc_timestamp(writer: &mut Writer<'_>) -> fmt::Result {
+    // SAFETY: 绑定内部提供 SYSTEMTIME 输出空间, 调用不借用外部指针或持有资源。
     let t = unsafe { GetSystemTime() };
     write!(
         writer,
@@ -162,12 +164,13 @@ pub(crate) fn init_logging(exe_dir: &Path, log: &Log) -> Result<(), AppError> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    unsafe {
-        if let Ok(handle) = GetStdHandle(STD_ERROR_HANDLE) {
-            let mut mode = CONSOLE_MODE::default();
-            if GetConsoleMode(handle, &mut mode).is_ok() {
-                let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-            }
+    // SAFETY: 使用系统定义的 stderr 选择符, 返回的句柄仅借用, 不在此关闭。
+    if let Ok(handle) = unsafe { GetStdHandle(STD_ERROR_HANDLE) } {
+        let mut mode = CONSOLE_MODE::default();
+        // SAFETY: mode 是独占可写输出; 标准句柄是否支持控制台模式由 Win32 检查。
+        if unsafe { GetConsoleMode(handle, &mut mode) }.is_ok() {
+            // SAFETY: 复用刚刚查询成功的借用句柄和模式值, 本模块不关闭或替换它。
+            let _ = unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) };
         }
     }
 
