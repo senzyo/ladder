@@ -117,8 +117,11 @@ impl Write for CappedFile {
 }
 
 /// `CappedFile` 的共享句柄, 供 tracing 的 `MakeWriter` 使用。
+/// 锁中毒后仅返回固定 IO 错误, 不再访问文件或递归记录日志。
 #[derive(Clone)]
 struct CappedLogWriter(Arc<Mutex<CappedFile>>);
+
+const LOG_POISONED_ERROR: &str = "日志文件锁已中毒";
 
 impl<'a> MakeWriter<'a> for CappedLogWriter {
     type Writer = Self;
@@ -130,11 +133,23 @@ impl<'a> MakeWriter<'a> for CappedLogWriter {
 
 impl Write for CappedLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).write(buf)
+        match self.0.lock() {
+            Ok(mut file) => file.write(buf),
+            Err(error) => {
+                drop(error);
+                Err(io::Error::other(LOG_POISONED_ERROR))
+            }
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).flush()
+        match self.0.lock() {
+            Ok(mut file) => file.flush(),
+            Err(error) => {
+                drop(error);
+                Err(io::Error::other(LOG_POISONED_ERROR))
+            }
+        }
     }
 }
 
@@ -194,6 +209,8 @@ pub(crate) fn init_logging(exe_dir: &Path, log: &Log) -> Result<(), AppError> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::TryLockError;
+    use std::thread;
 
     fn capped(path: &Path, limit: u64) -> CappedFile {
         CappedFile {
@@ -202,6 +219,121 @@ mod tests {
             limit,
             notified: false,
         }
+    }
+
+    fn poisoned_writer(path: &Path) -> CappedLogWriter {
+        let mut writer = CappedLogWriter(Arc::new(Mutex::new(capped(path, 0))));
+        writer
+            .write_all(b"before poison")
+            .expect("中毒前应能写入测试日志");
+        writer.flush().expect("中毒前应能刷新测试日志");
+        let shared = Arc::clone(&writer.0);
+        let result = thread::spawn(move || {
+            let _file = shared.lock().expect("局部日志锁初始应未中毒");
+            panic!("仅用于中毒局部日志锁");
+        })
+        .join();
+        assert!(result.is_err(), "工作线程应持有局部日志锁后 panic");
+        writer
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedOutput(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for CapturedOutput {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Write for CapturedOutput {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("测试输出缓存不应中毒")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_poisoned_log_writer_returns_fixed_errors_without_writing() {
+        let directory = tempfile::tempdir().expect("应能创建日志中毒测试目录");
+        let path = directory.path().join("app.log");
+        let mut writer = poisoned_writer(&path);
+
+        for _ in 0..2 {
+            let write_error = writer
+                .write(b"must not be written")
+                .expect_err("中毒后 write 必须返回错误");
+            let flush_error = writer.flush().expect_err("中毒后 flush 必须返回错误");
+            for error in [write_error, flush_error] {
+                assert_eq!(error.kind(), io::ErrorKind::Other);
+                assert_eq!(error.to_string(), "日志文件锁已中毒");
+            }
+            assert!(
+                matches!(writer.0.try_lock(), Err(TryLockError::Poisoned(_))),
+                "write/flush 应释放错误中的守卫并保留中毒标记"
+            );
+        }
+        drop(writer);
+        assert_eq!(fs::read(&path).expect("应能读回日志文件"), b"before poison");
+    }
+
+    #[test]
+    fn test_poisoned_file_layer_keeps_other_output_without_recursive_events() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let directory = tempfile::tempdir().expect("应能创建日志层中毒测试目录");
+        let path = directory.path().join("app.log");
+        let mut writer = poisoned_writer(&path);
+        let output = CapturedOutput::default();
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_target(false)
+            .compact()
+            .event_format(BracketedLevel)
+            .with_writer(writer.clone());
+        // 使用与生产相同的层顺序, 仅将 stderr 替换为测试捕获缓存。
+        let console_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_target(false)
+            .compact()
+            .event_format(BracketedLevel)
+            .with_writer(output.clone());
+        let subscriber = tracing_subscriber::registry()
+            .with(file_layer)
+            .with(console_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            writer.write(b"discard").expect_err("中毒后 write 必须失败");
+            writer.flush().expect_err("中毒后 flush 必须失败");
+            assert!(
+                output.0.lock().expect("测试输出缓存不应中毒").is_empty(),
+                "直接 write/flush 错误不得通过 tracing 再记录事件"
+            );
+            tracing::info!("other-output-remains-available");
+        });
+
+        let captured = output.0.lock().expect("测试输出缓存不应中毒");
+        let text = std::str::from_utf8(&captured).expect("格式化日志应为 UTF-8");
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "只应收到原事件, 不应递归记录文件错误: {text}"
+        );
+        assert!(
+            text.contains("other-output-remains-available"),
+            "独立输出层应收到原事件: {text}"
+        );
+        drop(writer);
+        assert_eq!(fs::read(&path).expect("应能读回日志文件"), b"before poison");
     }
 
     #[test]

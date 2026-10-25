@@ -5,11 +5,11 @@
 ## 当前状态与执行范围
 
 - 用户选择 B：先按建议顺序分批升级依赖，验证通过后按已定稿方案重构。
-- 用户已于 2026-10-23 指示按照暂存区文档开始执行，并自行补装构建工具。S0、D1–D4、R1–R4 已通过；2026-10-25 最新续做完成 R4 内部 API 对齐，Clippy、77 项测试及双架构 release 构建通过。本轮在 R4 验证边界收尾，下一步 R5；R5–R7 尚未实施。
-- 用户于 2026-10-24 明确提醒旧版 `ladder.exe` 正在运行，并允许分会话执行；2026-10-25 授权先提交 Git，再按最新版交接继续，最新指令为“按最新版交接文档继续”。本轮按 R4 边界推进。未启动新编译的应用；后续也不得为验证而启动它、终止现有实例或核心、修改真实 DNS/注册表/计划任务。实际托盘与 DNS 验证留到可恢复的隔离环境。
-- **始终读取工作区最新版本。** 依赖与首批整理已按用户指令提交为 `531f3a2`（`chore: 升级依赖并完成首批 Rust 风格整理`）；R2/R3 已提交为 `d8ea64b`（`refactor: 整理 Rust 导入并拆分应用职责模块`）。本轮 R4 以该干净提交为起点，源码和进度文档均留在未暂存区，未自动提交。typed COM 迁移已由用户明确暂缓，保留原 `hr != 0` 判定和手写接口，不新增迁移所需 features。
-- 工作目录：`C:\Users\admin\Documents\GitRepos\ladder`；分支 `main`，本轮 HEAD 为 `d8ea64b`，父提交为 `531f3a2`。接手时用 `git log -1` 和 `git status` 确认实际状态，不假设分支或文件始终不变。
-- 最初五份规划/术语文档及前轮实现已包含在 `531f3a2` 中，R2/R3 源码与文档在 `d8ea64b` 中。R4 的未提交修改是最新进度，换 checkout/worktree 时必须一并传递。
+- 用户已于 2026-10-23 指示按照暂存区文档开始执行，并自行补装构建工具。S0、D1–D4、R1–R5 已通过；2026-10-25 最新续做完成 R5 故障策略，Clippy、84 项测试及双架构 release 构建通过。本轮在 R5 验证边界收尾，下一步 R6；R6–R7 尚未实施。
+- 用户于 2026-10-24 明确提醒旧版 `ladder.exe` 正在运行，并允许分会话执行；最新指令为“先提交git，然后按工作区最新版交接文档继续”。本轮先提交 R4，再按 R5 边界推进。未启动新编译的应用；后续也不得为验证而启动它、终止现有实例或核心、修改真实 DNS/注册表/计划任务。实际托盘与 DNS 验证留到可恢复的隔离环境。
+- **始终读取工作区最新版本。** 依赖与首批整理已提交为 `531f3a2`，R2/R3 已提交为 `d8ea64b`；本轮按用户指令把 R4 提交为 `e63f584`（`refactor: 对齐内部 API 并封装状态闭包访问`）。后续 R5 源码和进度文档均留在未暂存区，未扩大“先提交”为自动逐批提交。typed COM 迁移已由用户明确暂缓，保留原 `hr != 0` 判定和手写接口，不新增迁移所需 features。
+- 工作目录：`C:\Users\admin\Documents\GitRepos\ladder`；分支 `main`，本轮 HEAD 为 `e63f584`，父提交为 `d8ea64b`。接手时用 `git log -1` 和 `git status` 确认实际状态，不假设分支或文件始终不变。
+- R4 源码与文档已在 `e63f584` 中。R5 的未提交修改是最新进度，换 checkout/worktree 时必须一并传递。
 - 不自动 commit、push、发布，不更改全局工具链或系统配置。分批是独立审查和验证的单位，不表示自动创建提交。
 - Windows 10 22H2、PowerShell 7；已观察到 rustc 1.99.0。执行前读取适用的 AGENTS.md；PowerShell 输出中文前设置 UTF-8。
 
@@ -20,7 +20,7 @@
 3. 从下面第一个未完成批次继续。先验证、记录结果，再进入下一批；失败时先定位并处理本批回归，不能写成已通过。
 4. 每批结束更新本文的进度表及证据记录。换会话或上下文压缩后先重读这些文件，不依赖上一轮的口头总结。
 
-当前直接入口是下文“新会话续做入口”。不要重复升级依赖或重做已完成的 R2–R4，也不要将职责迁移和闭包访问等同于故障策略和 Windows 边界已完成。
+当前直接入口是下文“新会话续做入口”。不要重复升级依赖或重做已完成的 R2–R5；故障策略已完成自动验证，但不能等同于 Windows 安全契约和真实系统运行验证已完成。
 
 ## 执行批次
 
@@ -35,7 +35,7 @@
 | R2 | 格式与机械命名 | 100 列格式、名称、导入及 expect 上下文分批审查 | 已完成，Clippy、66 项测试通过 |
 | R3 | 职责迁移 | 按模块映射迁移代码和测试，先保留原锁与错误语义 | 已完成，66 项测试及双架构构建通过 |
 | R4 | 内部 API 对齐 | 具名结果、闭包访问、must_use、derive、隔离线程测试等 | 已完成，77 项测试及双架构构建通过 |
-| R5 | 故障策略 | 中毒处理、无 tracing 紧急路径及隔离测试 | 未开始 |
+| R5 | 故障策略 | 中毒处理、无 tracing 紧急路径及隔离测试 | 已完成，84 项测试及双架构构建通过 |
 | R6 | Windows 边界 | 收缩 unsafe 与补安全契约；typed COM 已明确延期 | 未开始，COM 部分延期 |
 | R7 | 最终验收 | 逐项复核规范、不变量、自动检查、双架构构建及环境允许的实际验证 | 未开始 |
 
@@ -184,23 +184,23 @@ TLS 三项实际依赖链为 `ladder → ureq → rustls / webpki-roots`，`rust
 
 ## 新会话续做入口
 
-### 从 R5 故障策略开始
+### 从 R6 Windows 边界开始
 
-1. 读取工作区的方案/进度文件、术语和 ADR，检查相对 `d8ea64b` 的未提交差异；最新验证见下文 R4 记录。环境和代码未变时无需重新建立 S0 或重做 R2–R4。
+1. 读取工作区的方案/进度文件、术语和 ADR，检查相对 `e63f584` 的未提交差异；最新验证见下文 R5 记录。环境和代码未变时无需重新建立 S0 或重做 R2–R5。
 2. 主要入口已是 `app.rs`、`commands.rs`、`logging.rs` 和 `app_state.rs` 等平铺叶模块；`main.rs` 只做装配，`state.rs` 已删除、`error.rs` 已更名为 `app_error.rs`。不得按旧文件布局重新运行提取脚本。
-3. R4 已引入具名结果和 `FnOnce` 闭包访问，`APP` 已私有，状态初始化经 `app_state::initialize`。从 `app_state::with_state`、logging 的 write/flush、settings 的警告缓存及 emergency/process/dns 清理链进入 R5；按资源替换中毒恢复，并接入无 tracing 的紧急清理。
+3. R6 只推进已确认的 unsafe 边界收缩和 SAFETY/调用方契约，typed COM 保持延期。优先检查 app/tray/toast/com_guard/single_instance_guard/process/dns/logging 中的 FFI；不混入图标泄漏、消息循环、XML、TUN 等独立缺陷修复。新增的 process/DNS 无日志底层也需纳入安全边界复核。
 4. 每个批次验证后更新本文；可以再次在完整批次边界交接，无须在单一会话耗尽上下文。
 
-R4 所有模块已完成汇合，最新源码在当前未暂存区，无需从子代理或临时脚本恢复内容。没有必须等待的后台构建/测试。切换 checkout 时应使用 `d8ea64b` 加本轮 R4 未提交修改。
+R5 所有模块已完成汇合，最新源码在当前未暂存区，无需从子代理或临时脚本恢复内容。没有必须等待的后台构建/测试。切换 checkout 时应使用 `e63f584` 加本轮 R5 未提交修改。
 
 ### 后续实现注意点
 
 - R3 已迁移：`StatusIcons` 在 tray，继续显式退出释放；不能改成依赖静态变量 Drop。`ensure_exists` 已成为 process 私有辅助；进程查询与核心状态查询也在 process，`state.rs` 不再保留。
-- R4 已保留的约束：设置更新和 `save()` 在同一次可变闭包内，保留既有错误日志/通知与保存失败后的内存变化。核心模式切换仅在 `Some(Ok(()))` 时记成功。规则集下载后只修改当前仍存在的条目；忙守卫一直覆盖后台任务结束。R5 不得改变这些锁范围和错误契约。
+- R4 已保留的约束：设置更新和 `save()` 在同一次可变闭包内，保留既有错误日志/通知与保存失败后的内存变化。核心模式切换仅在 `Some(Ok(()))` 时记成功。规则集下载后只修改当前仍存在的条目；忙守卫一直覆盖后台任务结束。后续不得改变这些锁范围和错误契约。
 - R4 具名结果已完成：`ReleaseInfo`、`DownloadAsset`、`ParsedSettings`、`MenuSelection` 等。Xray 搜索保持“首次匹配发行版缺少 tag 即报错”的顺序，借用资产直到确定结果再复制；保留 digest 和版本号的容错，不改为严格解析。
-- R5：全链路核查 process 与 DNS 的无日志底层函数，普通包装仍保留原日志。枚举失败、注册表打开/写入失败等返回信息需足以保留普通路径原有诊断。紧急路径仍按 sing-box、xray、恢复 DHCP、刷新 DNS 顺序，不访问 AppState 或 Child。
-- R5 测试：局部 Mutex 用工作线程 panic 制造中毒；日志 write/flush 固定错误且无递归 tracing，另一输出层仍收到事件；启动警告队列返回固定降级消息。退出和 panic 钩子使用有父进程超时的独立测试子进程，并注入只记录步骤的清理替身。不得调用真实清理。
-- R5 待替换的旧实现：app_state、logging 的 write/flush、settings 警告队列仍有四处 `into_inner()`；emergency 钩子与下游清理仍有 tracing。R4 已删除公开 APP、返回锁守卫的接口以及测试的 catch_unwind/临时全局 hook，不能据此把中毒/紧急清理策略写成已完成。
+- R5 已完成：`try_with_state` 先释放中毒错误，再返回不携带数据/守卫的 `PoisonedState` 标记；`with_state` 立即转入 `emergency::terminate_after_state_poison`，不存在读取中毒值或继续执行闭包的分支。未初始化仍为 None。四处 `into_inner()` 已全部删除，也没有 clear_poison/catch_unwind 调用。
+- R5 清理链：emergency 共用四步编排，依次调用 process 的 `kill_processes_by_name_without_logging`（sing-box、xray）、dns 的 `restore_dns_to_dhcp_without_logging`、process 的 `flush_dns_without_logging`。普通包装继续保留原日志；原 `kill_cores_without_state` 已删除。R6 不得把日志、AppState、Child 或通知引入底层。
+- R5 测试：局部 Mutex 用工作线程 panic 制造中毒；日志 write/flush 固定错误且无递归 tracing，另一输出层仍收到事件；启动警告队列返回固定降级消息。状态退出和 panic 钩子测试分别在有 10 秒父进程超时的独立测试子进程中执行，只注入文件记录替身。`emergency::test_support` 属于 cfg(test)，切勿将测试注入替换为真实清理入口。这些测试验证故障编排，不证明真实系统清理必然成功。
 - R6：typed COM 明确延期，其余 FFI 安全边界仍需处理；方案末尾的图标、消息循环、XML、TUN 等独立缺陷不得夹带修复。
 - R7：逐条更新规范清单，保留未验证项；以 D4 的 2,153,984 / 1,900,032 字节为重构体积基准。ARM64 原生运行与真实托盘/DNS 验证当前均未做。
 
@@ -232,6 +232,7 @@ cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxilia
 - 接手时上轮 18 个改动文件全部已暂存，未暂存区无差异；检查 `git diff --cached --check`、文件范围与锁文件哈希后，执行 `git commit -m 'chore: 升级依赖并完成首批 Rust 风格整理'`，退出 0，提交 `531f3a2`。
 - 该提交包含依赖升级、100 列格式、主要名称及五份文档；没有 push。随后的 R2 余项和 R3 均留在未暂存区，未扩大“先提交”授权为自动逐批提交。
 - R2/R3 验证并交接后，用户再次明确要求“先提交git”；因此把后续源码和文档一并提交。此前各批记录中的“未暂存/未提交”描述的是当时状态，当前以本节和实际 Git 状态为准。
+- R4 验证后，用户要求“先提交git，然后按工作区最新版交接文档继续”。检查 15 个改动文件及差异后，提交 `e63f584`（`refactor: 对齐内部 API 并封装状态闭包访问`），退出 0。首次写 Git 索引受沙箱限制，按工具审批后完成同一提交；未 push。之后的 R5 不自动提交。
 
 ### R2 导入与 expect 上下文完成
 
@@ -264,7 +265,22 @@ cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxilia
 - 两个既定独立目标目录内的 amd64/ARM64 release 构建均退出 0。产物大小：amd64 **2,153,472 字节**，相对 D4 **-512 字节 / -0.0238%**；ARM64 **1,899,520 字节**，相对 D4 **-512 字节 / -0.0269%**。构建后只修正一条注释中对零长度缓冲区 panic 的过强描述，未改变可执行代码，复用本轮构建与测试结果。
 - 独立只读审查确认状态所有权、保存与通知锁范围、失败传播、忙守卫和规则集回写不变量；另行复核 release/资产映射、Xray 首匹配、digest 容错与菜单行为，未发现运行行为回归。零长度缓冲区的文档问题已修正为调用前提，未新增断言或修复独立缺陷。
 - Cargo.lock SHA256 仍为 `ADA9DA1D7911EFE76D72B1B420C31A6587B55F9499FB1BE7AFF4B53390FD117B`。R4 源文件快照为 `target/codex-batches-20261025/r4-complete/`，位于忽略目录，不随 Git 自动传递。
-- 本轮在 R4 验证边界收尾。R5 中毒/无日志紧急清理、R6 unsafe 边界、R7 逐项验收尚未开始；typed COM 保持延期。Windows 实际托盘/模式切换/配置选择/退出/DNS 和 ARM64 原生运行仍未验证；未启动新应用、终止旧实例或核心、修改真实 DNS/注册表/计划任务。
+- 当时在 R4 验证边界收尾，R5 已由下节续做完成。R6 unsafe 边界、R7 逐项验收尚未开始；typed COM 保持延期。Windows 实际托盘/模式切换/配置选择/退出/DNS 和 ARM64 原生运行仍未验证；未启动新应用、终止旧实例或核心、修改真实 DNS/注册表/计划任务。
+
+### R5 故障策略完成
+
+- 本轮先按用户要求把上轮 15 个文件提交为 `e63f584`，确认工作区干净后继续。R5 修改 app_state、emergency、process、dns、logging、settings 六个源码文件及三份进度/方案文档，留在未暂存区，未自动提交或推送；依赖、release panic 配置及实际 settings.json 均未改动。
+- app_state 使用私有 `try_with_state -> Result<Option<R>, PoisonedState>`：未初始化仍为 `Ok(None)`，中毒时不调用访问闭包，显式丢弃 PoisonError 释放锁后，只返回无字段标记。`with_state` 收到标记即调用集中紧急终止入口，清理后 `process::exit(1)`；不读取中毒值，也不依赖普通 panic 触发清理。R4 的正常状态锁范围、保存失败和忙守卫契约保持。
+- emergency 共用 `cleanup_with` 四步编排：sing-box、xray、恢复 DHCP DNS、刷新 DNS。状态中毒和 panic 钩子都使用同一实际 cleanup；panic 清理后调用安装前的默认诊断钩子。去掉钩子中的 tracing；整个生产清理链均不访问 AppState、Child、日志锁或 UI。release 仍为 `panic = "abort"`，清理仍是尽力尝试，不承诺系统调用或并发故障时必然成功。
+- process 拆出无日志的快照枚举/PID 查询、按名终止与 DNS 刷新底层。普通包装保留快照失败 warn、打开进程成功后的 debug、刷新后的 info，原先忽略的错误仍不扩大；删除旧 `kill_cores_without_state`，由 emergency 编排。dns 的无日志枚举返回 Win32 错误，注册表写入结果区分 Open/Write，普通路径继续输出原诊断；恢复路径逐网卡、先 IPv4 后 IPv6，单项失败继续。发现网卡日志移到枚举释放系统表之后，文本、数量和相对次序保持。
+- logging 的 write/flush 中毒后仅返回 `io::ErrorKind::Other` 和固定“日志文件锁已中毒”，不再读写文件或调用 tracing；独立输出层保持可用。settings 警告缓存中毒后不重放旧队列，仅返回“启动警告缓存不可用”，不阻止启动。源码已无 `into_inner()`、`clear_poison()` 或 `catch_unwind()` 调用。
+- 新增 7 项测试：日志 2 项检查固定错误、文件不再增长、第二输出层收到唯一原事件且错误处理不递归日志；设置 2 项检查正常 drain 和中毒降级；DNS 1 项用纯写入记录替身核对两张网卡的协议/路径/值/顺序；状态和 panic 各 1 项用独立测试子进程验证终止与钩子。
+- 子进程通过 current_exe 的 `--exact` 只重启目标测试，参数仅以 Command.env 传入，输出写临时文件；父进程设 10 秒期限，超时 kill/wait，异常路径也回收自己的子进程。状态测试以工作线程毒化局部 Mutex，检查访问闭包未执行、PoisonError 锁已释放且中毒标记保留，然后用四步记录替身退出，父进程确认状态码 1。panic 测试持有局部状态与日志锁，注入记录清理并包装原诊断 hook，确认四步记录先于 default-hook、stderr 含原 panic 信息且子进程状态码 101；若钩子误写 tracing，日志锁哨兵会阻塞并被父进程超时捕获。
+- 测试未安装生产清理钩子，未调用真实终止核心、DNS/注册表修改或计划任务入口，也未毒化静态 APP、修改父进程 panic hook。子进程测试使用 dev/unwind 测试程序，验证共享编排与退出契约；它不等于 release abort 进程实跑或真实系统清理验证。
+- 初次编译发现当前 Rust 对 `match terminate() {}` 的 Infallible 回调写法发出 unreachable_code 警告；改为上述无数据错误标记后消除，不增加 lint 豁免、不使用不稳定特性。最终 `cargo fmt --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked`、`git diff --check` 全部退出 0；**84 项测试通过，0 失败、0 忽略**（首次完整运行 2.89 秒）。原 77 项覆盖保留，现分布为 app_state 7、config_selection 3、core 2、dns 1、emergency 1、logging 4、process 15、settings 13、update 38。
+- 两个既定独立目标目录内的 amd64/ARM64 release 构建均退出 0，未执行产物。amd64 **2,154,496 字节**，相对 D4 **+512 字节 / +0.0238%**；ARM64 **1,900,544 字节**，相对 D4 **+512 字节 / +0.0269%**；相对 R4 两者各增加 1,024 字节。
+- 独立只读复核逐层核查紧急调用链、普通错误诊断、状态中毒守卫释放、未初始化契约以及测试注入边界，未发现阻断问题。Cargo.lock SHA256 保持 `ADA9DA1D7911EFE76D72B1B420C31A6587B55F9499FB1BE7AFF4B53390FD117B`；R5 源文件快照在 `target/codex-batches-20261025/r5-complete/`，不随 Git 自动传递。
+- 本轮在 R5 验证边界收尾，下一步 R6 的 unsafe/SAFETY/调用方契约，typed COM 继续延期。R7 最终规范复核、Windows 实际托盘/模式切换/配置选择/退出/DNS、ARM64 原生运行仍未完成；未触碰旧运行实例或日常网络配置。
 
 后续每批追加：批次状态、修改文件、实际版本差异、执行命令与退出结果、测试数量及关键用例、两架构产物字节数（适用时）、未验证项、遇到的回归及修正、下一步。
 

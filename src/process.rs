@@ -23,6 +23,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, OpenProcess, PROCESS_TERMINATE, TerminateProcess,
 };
+use windows::core::Error as WindowsError;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Status, CM_Get_Device_ID_List_SizeW, CM_Get_Device_ID_ListW, CM_Locate_DevNodeW,
     CR_SUCCESS, DN_HAS_PROBLEM, DN_STARTED,
@@ -63,12 +64,20 @@ fn ensure_exists(path: &Path) -> Result<(), AppError> {
 /// 遍历系统进程快照, 对每个进程调用 `visit(进程名, PID)`。
 ///
 /// `visit` 返回 `false` 时提前结束遍历。
-fn for_each_process(mut visit: impl FnMut(&str, u32) -> bool) {
+fn for_each_process(visit: impl FnMut(&str, u32) -> bool) {
+    if for_each_process_without_logging(visit).is_err() {
+        warn!("CreateToolhelp32Snapshot 失败, 无法枚举进程");
+    }
+}
+
+/// 仅枚举进程, 不访问应用状态或 tracing; 快照创建失败交给普通包装记录。
+///
+/// 首项或后续项读取失败仍按原契约结束遍历, 不新增错误或诊断。
+fn for_each_process_without_logging(
+    mut visit: impl FnMut(&str, u32) -> bool,
+) -> Result<(), WindowsError> {
     unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            warn!("CreateToolhelp32Snapshot 失败, 无法枚举进程");
-            return;
-        };
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;
 
         let mut entry: PROCESSENTRY32W = mem::zeroed();
         entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
@@ -92,19 +101,27 @@ fn for_each_process(mut visit: impl FnMut(&str, u32) -> bool) {
 
         let _ = CloseHandle(snapshot);
     }
+    Ok(())
 }
 
 /// 通过 Win32 ToolHelp API 枚举所有与 `exe_name` 匹配的进程, 返回 PID 列表。
 #[must_use]
 pub fn find_pids_by_name(exe_name: &str) -> Vec<u32> {
+    find_pids_by_name_without_logging(exe_name).unwrap_or_else(|_| {
+        warn!("CreateToolhelp32Snapshot 失败, 无法枚举进程");
+        Vec::new()
+    })
+}
+
+fn find_pids_by_name_without_logging(exe_name: &str) -> Result<Vec<u32>, WindowsError> {
     let mut pids = Vec::new();
-    for_each_process(|name, pid| {
+    for_each_process_without_logging(|name, pid| {
         if name.eq_ignore_ascii_case(exe_name) {
             pids.push(pid);
         }
         true
-    });
-    pids
+    })?;
+    Ok(pids)
 }
 
 /// 一次进程快照判断 `names` 中每个名字是否有进程在运行, 返回值与入参同序。
@@ -271,19 +288,6 @@ pub fn stop_all() -> Result<(), AppError> {
     stop_processes(&Core::ALL)
 }
 
-/// 按进程名终止两个核心并恢复网络状态, 全程不触碰 `AppState`。
-///
-/// 供 panic 钩子使用。`stop_all` 会取 `AppState` 的 Mutex 来拿 Child 句柄, 而
-/// panic 完全可能发生在持锁期间, 此时再取同一把锁就是自死锁。这里跳过 Child
-/// 句柄, 只按名字终止, 因此不存在这个风险。
-pub fn kill_cores_without_state() {
-    for core in Core::ALL {
-        kill_processes_by_name(core.exe_name());
-    }
-    dns::restore_dns_to_dhcp();
-    flush_dns();
-}
-
 /// 终止指定核心。先通过保存的 Child 句柄直接 kill,
 /// 再通过进程名枚举兜底 (覆盖其他来源启动的同名进程) 。
 pub fn stop_processes(cores: &[Core]) -> Result<(), AppError> {
@@ -317,10 +321,25 @@ pub fn stop_processes(cores: &[Core]) -> Result<(), AppError> {
 
 /// 终止与 `exe_name` 匹配的所有进程。
 fn kill_processes_by_name(exe_name: &str) {
-    for pid in find_pids_by_name(exe_name) {
+    terminate_pids(find_pids_by_name(exe_name), |pid| {
+        debug!("终止进程: {} (PID {})", exe_name, pid);
+    });
+}
+
+/// 尽力按名称终止进程, 不获取应用状态、不记录日志; 供紧急清理使用。
+pub(crate) fn kill_processes_by_name_without_logging(exe_name: &str) {
+    if let Ok(pids) = find_pids_by_name_without_logging(exe_name) {
+        terminate_pids(pids, |_| {});
+    }
+}
+
+/// 共用终止流程。普通路径可在打开句柄后、终止前记录诊断;
+/// 紧急路径必须传入不访问日志或应用状态的回调。
+fn terminate_pids(pids: Vec<u32>, mut before_terminate: impl FnMut(u32)) {
+    for pid in pids {
         unsafe {
             if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-                debug!("终止进程: {} (PID {})", exe_name, pid);
+                before_terminate(pid);
                 let _ = TerminateProcess(handle, 1);
                 let _ = CloseHandle(handle);
             }
@@ -742,8 +761,13 @@ fn cleanup_orphaned_wintun() {
 // ═══════════════════════════════════════════════
 
 fn flush_dns() {
-    unsafe { DnsFlushResolverCache() };
+    flush_dns_without_logging();
     info!("已刷新 DNS 缓存");
+}
+
+/// 尽力刷新 DNS 缓存, 不访问应用状态或 tracing。
+pub(crate) fn flush_dns_without_logging() {
+    unsafe { DnsFlushResolverCache() };
 }
 
 #[cfg(test)]

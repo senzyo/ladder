@@ -7,6 +7,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::app_error::AppError;
 use crate::core::Core;
+use crate::emergency;
 use crate::settings::Settings;
 use crate::tray::StatusIcons;
 
@@ -90,6 +91,7 @@ pub fn acquire_busy() -> Option<FlagGuard> {
 /// 在锁内只读访问状态, 未初始化时不执行闭包并返回 `None`。
 ///
 /// 状态借用不能逃出闭包。闭包内不得再次访问全局状态; 耗时操作应在取得快照后执行。
+/// 状态锁中毒时不调用闭包, 释放锁后紧急清理并以失败状态退出。
 pub fn with_app_state<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&AppState) -> R,
@@ -101,6 +103,7 @@ where
 ///
 /// 闭包可以移入或取出拥有的值, 但不得再次获取状态锁。设置修改及保存必须在同一次
 /// 访问中完成, 保存失败不回滚内存修改; 调用方负责处理闭包返回的错误。
+/// 状态锁中毒时不调用闭包, 释放锁后紧急清理并以失败状态退出。
 pub fn with_mut_app_state<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut AppState) -> R,
@@ -112,9 +115,28 @@ fn with_state<F, R>(state: &OnceLock<Mutex<AppState>>, f: F) -> Option<R>
 where
     F: FnOnce(&mut AppState) -> R,
 {
-    // R4 仅收口访问接口, 中毒处理由下一批故障策略统一替换。
-    let mut app = state.get()?.lock().unwrap_or_else(|e| e.into_inner());
-    Some(f(&mut app))
+    try_with_state(state, f).unwrap_or_else(|_| emergency::terminate_after_state_poison())
+}
+
+/// 不携带状态或锁守卫的中毒标记, 由访问入口统一转入紧急终止。
+struct PoisonedState;
+
+fn try_with_state<F, R>(state: &OnceLock<Mutex<AppState>>, f: F) -> Result<Option<R>, PoisonedState>
+where
+    F: FnOnce(&mut AppState) -> R,
+{
+    let Some(state) = state.get() else {
+        return Ok(None);
+    };
+    let mut app = match state.lock() {
+        Ok(app) => app,
+        Err(error) => {
+            // PoisonError 自身持有锁守卫; 丢弃错误后再清理, 不读取其中的状态。
+            drop(error);
+            return Err(PoisonedState);
+        }
+    };
+    Ok(Some(f(&mut app)))
 }
 
 /// 获取 exe 所在目录。
@@ -138,6 +160,63 @@ mod tests {
             child_sing_box: None,
             child_xray: None,
         }))
+    }
+
+    #[test]
+    fn test_poisoned_state_releases_lock_and_exits_without_access() {
+        use crate::emergency::test_support;
+
+        const TEST_NAME: &str =
+            "app_state::tests::test_poisoned_state_releases_lock_and_exits_without_access";
+        if !test_support::is_child(TEST_NAME) {
+            let child = test_support::run_child(TEST_NAME);
+            assert_eq!(
+                child.status.code(),
+                Some(1),
+                "{}\n{}",
+                child.stdout,
+                child.stderr
+            );
+            assert_eq!(
+                child.records,
+                [
+                    "state-lock-released",
+                    "stop-sing-box",
+                    "stop-xray",
+                    "restore-dhcp-dns",
+                    "flush-dns"
+                ],
+                "中毒时不得访问状态, 必须释放锁后清理并退出"
+            );
+            return;
+        }
+
+        let state = local_state(PathBuf::new());
+        thread::scope(|scope| {
+            let result = scope
+                .spawn(|| {
+                    let _state = state
+                        .get()
+                        .expect("局部状态已初始化")
+                        .lock()
+                        .expect("局部状态初始应未中毒");
+                    panic!("仅用于中毒隔离子进程中的局部状态锁");
+                })
+                .join();
+            assert!(result.is_err(), "工作线程应持有局部状态锁后 panic");
+        });
+
+        let _ = try_with_state(&state, |_| test_support::record("state-closure-called"))
+            .unwrap_or_else(|_| {
+                match state.get().expect("局部状态已初始化").try_lock() {
+                    Err(TryLockError::Poisoned(error)) => drop(error),
+                    Err(TryLockError::WouldBlock) => panic!("终止入口前必须释放中毒错误中的锁守卫"),
+                    Ok(_) => panic!("终止入口不得清除中毒标记"),
+                }
+                test_support::record("state-lock-released");
+                test_support::terminate_with_recorded_cleanup()
+            });
+        panic!("中毒状态访问必须终止测试子进程");
     }
 
     #[test]

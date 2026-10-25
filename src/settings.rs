@@ -213,14 +213,10 @@ impl Settings {
         fs::write(&path, json).map_err(|e| AppError::Msg(format!("写入配置文件失败: {e}")))
     }
 
-    /// 取出加载期间收集的警告。调用后清空, 仅首次调用返回内容。
+    /// 取出加载期间收集的警告。健康缓存调用后清空, 中毒时仅返回固定降级提示。
     #[must_use]
     pub fn take_warnings() -> Vec<String> {
-        LOAD_WARNINGS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .collect()
+        take_load_warnings(&LOAD_WARNINGS)
     }
 
     /// 校验配置值合法性, 非法值回退到默认值。
@@ -297,9 +293,57 @@ fn push_warning(msg: String) {
     }
 }
 
+/// 不读取中毒缓存中的旧警告, 也不恢复或清除中毒标记。
+#[must_use]
+fn take_load_warnings(cache: &Mutex<Vec<String>>) -> Vec<String> {
+    match cache.lock() {
+        Ok(mut warnings) => warnings.drain(..).collect(),
+        Err(error) => {
+            drop(error);
+            vec!["启动警告缓存不可用".to_string()]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_take_load_warnings_drains_healthy_queue() {
+        let warnings = Mutex::new(vec!["first".to_string(), "second".to_string()]);
+
+        assert_eq!(take_load_warnings(&warnings), ["first", "second"]);
+        assert!(
+            take_load_warnings(&warnings).is_empty(),
+            "正常缓存只重放一次警告"
+        );
+    }
+
+    #[test]
+    fn test_take_load_warnings_discards_poisoned_queue() {
+        use std::sync::TryLockError;
+        use std::thread;
+
+        let warnings = Mutex::new(vec!["不得重放的旧警告".to_string()]);
+        thread::scope(|scope| {
+            let result = scope
+                .spawn(|| {
+                    let _warnings = warnings.lock().expect("局部警告缓存初始应未中毒");
+                    panic!("仅用于中毒局部警告缓存");
+                })
+                .join();
+            assert!(result.is_err(), "工作线程应持有局部警告锁后 panic");
+        });
+
+        for _ in 0..2 {
+            assert_eq!(take_load_warnings(&warnings), ["启动警告缓存不可用"]);
+            assert!(
+                matches!(warnings.try_lock(), Err(TryLockError::Poisoned(_))),
+                "返回降级提示后应释放错误中的守卫并保留中毒标记"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_settings_defaults() {
