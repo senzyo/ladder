@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::Stdio;
 use tracing::{debug, info, warn};
 
 use crate::process;
@@ -67,8 +68,8 @@ pub fn ensure_boot_dns_reset_task(exe_dir: &Path) {
 fn task_exists() -> bool {
     process::hidden_command("schtasks")
         .args(["/Query", "/TN", TASK_NAME])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)

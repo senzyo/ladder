@@ -55,6 +55,6 @@ strip = true
 #
 # abort 下 panic 不展开, Drop 和 catch_unwind 都不会执行, 但 panic 钩子仍会在
 # abort 之前被调用。必须做的清理 (恢复物理网卡 DNS、终止核心进程) 因此放在
-# main::install_panic_hook 里, 见那里的说明。
+# emergency::install_panic_hook 里, 见那里的说明。
 panic = "abort"
 

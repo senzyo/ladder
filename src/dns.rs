@@ -7,9 +7,10 @@
 //! 使用 `GetIfTable2` API 检测物理网卡, 通过 `InterfaceAndOperStatusFlags.ConnectorPresent`
 //! 标志判断, 这与 `Get-NetAdapter -Physical` 使用相同的检测机制。
 
+use std::ffi::c_void;
 use tracing::{debug, info, warn};
 use windows::Win32::Foundation::NO_ERROR;
-use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2};
+use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
 use windows_registry::LOCAL_MACHINE;
 
 /// MIB_IF_ROW2_0 bitfield 中 ConnectorPresent 标志的位偏移。
@@ -38,8 +39,7 @@ struct PhysicalAdapter {
 /// 这与 `Get-NetAdapter -Physical` 使用相同的检测机制。
 fn get_physical_adapters() -> Vec<PhysicalAdapter> {
     let mut adapters = Vec::new();
-    let mut table_ptr: *mut windows::Win32::NetworkManagement::IpHelper::MIB_IF_TABLE2 =
-        std::ptr::null_mut();
+    let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
 
     let result = unsafe { GetIfTable2(&mut table_ptr) };
     if result != NO_ERROR || table_ptr.is_null() {
@@ -96,7 +96,7 @@ fn get_physical_adapters() -> Vec<PhysicalAdapter> {
         adapters.push(PhysicalAdapter { alias, guid });
     }
 
-    unsafe { FreeMibTable(table_ptr as *const std::ffi::c_void) };
+    unsafe { FreeMibTable(table_ptr as *const c_void) };
 
     adapters
 }

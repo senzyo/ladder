@@ -5,16 +5,19 @@
 //! 自动重试, 下载完成后从 zip 中提取 exe 并替换。
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
-use std::fs;
-use std::io::{self, BufReader, Read};
+use std::fs::{self, File};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
+use ureq::RequestBuilder;
+use ureq::typestate::WithoutBody;
+use zip::ZipArchive;
 
-use crate::error::AppError;
-use crate::state::{Core, CoreArtifacts};
+use crate::app_error::AppError;
+use crate::core::{Core, CoreArtifacts};
+use crate::settings::Ruleset;
 
 /// GitHub API 要求的 User-Agent 头, 缺少会返回 403。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0";
@@ -381,7 +384,7 @@ fn download_core_with_retry(
     for attempt in 1..=max_retries {
         if attempt > 1 {
             debug!("第 {attempt}/{max_retries} 次重试, 等待 {delay_secs}s...");
-            std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+            thread::sleep(Duration::from_secs(delay_secs));
         } else {
             debug!("第 1/{max_retries} 次尝试下载...");
         }
@@ -424,7 +427,7 @@ fn download_file(url: &str, dest: &Path) -> Result<(), AppError> {
 
 /// 使用给定时限下载, 让本地服务测试能覆盖相同配置和落盘路径。
 fn download_file_with_timeouts(
-    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+    request: RequestBuilder<WithoutBody>,
     dest: &Path,
     connect_timeout: Duration,
     header_timeout: Duration,
@@ -447,8 +450,7 @@ fn download_file_with_timeouts(
         .map_err(|e| AppError::Msg(format!("下载失败: {e}")))?;
 
     let mut reader = resp.into_body().into_reader();
-    let mut file =
-        fs::File::create(dest).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
+    let mut file = File::create(dest).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
 
     // io::copy 分不清是读取还是写入出错, 用中性描述: 这里最常见的是接收超时,
     // 写成"写入文件失败"会把人往磁盘问题上引
@@ -465,8 +467,11 @@ fn download_file_with_timeouts(
 
 /// 计算文件的 SHA256 哈希值, 返回小写十六进制字符串。
 fn sha256_file(path: &Path) -> Result<String, AppError> {
-    let mut file = fs::File::open(path)
-        .map_err(|e| AppError::Msg(format!("打开文件计算 SHA256 失败: {e}")))?;
+    use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+
+    let mut file =
+        File::open(path).map_err(|e| AppError::Msg(format!("打开文件计算 SHA256 失败: {e}")))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; HASH_BUFFER_SIZE];
     loop {
@@ -485,6 +490,8 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
 ///
 /// 逐字节 `format!` 会为每个字节分配一个 String, 这里一次分配到位。
 fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         let _ = write!(out, "{b:02x}");
@@ -524,7 +531,7 @@ fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
                 to.display()
             ),
         }
-        std::thread::sleep(RENAME_RETRY_DELAY);
+        thread::sleep(RENAME_RETRY_DELAY);
     }
     fs::rename(from, to)
 }
@@ -575,10 +582,10 @@ fn stage_and_replace(
     artifacts: &CoreArtifacts,
 ) -> Result<(), AppError> {
     let file =
-        fs::File::open(zip_path).map_err(|e| AppError::Msg(format!("打开 zip 文件失败: {e}")))?;
+        File::open(zip_path).map_err(|e| AppError::Msg(format!("打开 zip 文件失败: {e}")))?;
     let reader = BufReader::new(file);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|e| AppError::Msg(format!("解析 zip 文件失败: {e}")))?;
+    let mut archive =
+        ZipArchive::new(reader).map_err(|e| AppError::Msg(format!("解析 zip 文件失败: {e}")))?;
 
     let mut staged: Vec<String> = Vec::new();
 
@@ -615,7 +622,7 @@ fn stage_and_replace(
 
         let tmp_path = core_dir.join(format!("{name}.{NEW_SUFFIX}"));
         let mut out =
-            fs::File::create(&tmp_path).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
+            File::create(&tmp_path).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
         io::copy(&mut entry, &mut out).map_err(|e| AppError::Msg(format!("解压文件失败: {e}")))?;
         debug!("已解压 {name} -> {}", tmp_path.display());
         staged.push(name.to_string());
@@ -740,15 +747,15 @@ fn remove_suffixed(core_dir: &Path, artifacts: &CoreArtifacts, suffix: &str) {
 /// 返回成功更新的规则集名称列表 (供调用方更新 `last_update`) 。
 pub fn update_ruleset(
     exe_dir: &Path,
-    ruleset: &crate::settings::Ruleset,
+    ruleset: &Ruleset,
     max_retries: u32,
     delay_secs: u64,
 ) -> Vec<String> {
     // interval_days 由 Settings::validate 限制在上限内; saturating_mul 是
     // 针对绕过校验直接调用本函数的兜底, 避免溢出 (debug 构建下会 panic) 。
     let interval_secs = ruleset.interval_days.saturating_mul(86400);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
@@ -813,7 +820,7 @@ fn download_and_parse_sha256sum(
     for attempt in 1..=max_retries {
         if attempt > 1 {
             debug!("SHA256 校验和下载第 {attempt}/{max_retries} 次重试, 等待 {delay_secs}s...");
-            std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+            thread::sleep(Duration::from_secs(delay_secs));
         }
 
         debug!("下载 SHA256 校验和: {url}");
@@ -867,7 +874,7 @@ fn download_ruleset_with_retry(
     for attempt in 1..=max_retries {
         if attempt > 1 {
             debug!("dat 文件下载第 {attempt}/{max_retries} 次重试, 等待 {delay_secs}s...");
-            std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+            thread::sleep(Duration::from_secs(delay_secs));
         }
 
         if let Err(e) = download_file(url, dest) {
@@ -900,8 +907,10 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
-    use std::thread;
+    use std::thread::JoinHandle;
     use std::time::Instant;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     const TEST_HEADER_TIMEOUT: Duration = Duration::from_millis(300);
     const TEST_STALL_TIMEOUT: Duration = Duration::from_millis(600);
@@ -910,10 +919,17 @@ mod tests {
     fn spawn_download_server(
         request_count: usize,
         mut respond: impl FnMut(usize, &mut TcpStream) -> io::Result<()> + Send + 'static,
-    ) -> (String, thread::JoinHandle<io::Result<Vec<String>>>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
+    ) -> (String, JoinHandle<io::Result<Vec<String>>>) {
+        use std::io::Read as _;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("绑定本地下载测试端口");
+        listener
+            .set_nonblocking(true)
+            .expect("将本地下载测试监听器设置为非阻塞模式");
+        let url = format!(
+            "http://{}/",
+            listener.local_addr().expect("获取本地下载测试监听地址")
+        );
         let server = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut paths = Vec::new();
@@ -983,7 +999,7 @@ mod tests {
     }
 
     fn assert_download_requests(
-        server: thread::JoinHandle<io::Result<Vec<String>>>,
+        server: JoinHandle<io::Result<Vec<String>>>,
         client_result: &Result<(), AppError>,
         expected_paths: &[&str],
     ) {
@@ -1007,7 +1023,9 @@ mod tests {
     }
 
     fn assert_download_timeout(result: Result<(), AppError>, prefix: &str) {
-        let error = result.unwrap_err().to_string();
+        let error = result
+            .expect_err("下载应因阶段或读取超时而失败")
+            .to_string();
         assert!(error.starts_with(prefix), "意外的失败阶段: {error}");
         assert!(error.contains("timeout"), "失败原因不是超时: {error}");
     }
@@ -1029,7 +1047,7 @@ mod tests {
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone")
         });
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let dest = dir.path().join("download.bin");
 
         let result = download_test_file(&url, &dest, Duration::from_secs(2));
@@ -1049,7 +1067,7 @@ mod tests {
             }
             stream.write_all(b"\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone")
         });
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let dest = dir.path().join("download.bin");
 
         let result = download_test_file(&url, &dest, Duration::from_secs(2));
@@ -1068,27 +1086,33 @@ mod tests {
             thread::sleep(Duration::from_millis(1800));
             stream.write_all(b"rest")
         });
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let dest = dir.path().join("download.bin");
 
         let result = download_test_file(&url, &dest, TEST_STALL_TIMEOUT);
         assert_download_requests(server, &result, &["/"]);
 
         assert_download_timeout(result, "下载数据失败:");
-        assert_eq!(fs::read(&dest).unwrap(), b"part");
+        assert_eq!(
+            fs::read(&dest).expect("读取本地下载测试的输出文件"),
+            b"part"
+        );
     }
 
     #[test]
     fn test_download_allows_continuous_slow_body() {
         let (url, server) = spawn_download_server(1, |_, stream| send_slow_download(stream));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let dest = dir.path().join("download.bin");
 
         let result = download_test_file(&url, &dest, TEST_STALL_TIMEOUT);
         assert_download_requests(server, &result, &["/"]);
 
-        result.unwrap();
-        assert_eq!(fs::read(&dest).unwrap(), b"0123456789abcdef");
+        result.expect("持续传输的本地测试下载应成功");
+        assert_eq!(
+            fs::read(&dest).expect("读取本地下载测试的输出文件"),
+            b"0123456789abcdef"
+        );
     }
 
     #[test]
@@ -1102,14 +1126,17 @@ mod tests {
                 send_slow_download(stream)
             }
         });
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let dest = dir.path().join("download.bin");
 
         let result = download_test_file(&url, &dest, TEST_STALL_TIMEOUT);
         assert_download_requests(server, &result, &["/", "/body"]);
 
-        result.unwrap();
-        assert_eq!(fs::read(&dest).unwrap(), b"0123456789abcdef");
+        result.expect("持续传输的本地测试下载应成功");
+        assert_eq!(
+            fs::read(&dest).expect("读取本地下载测试的输出文件"),
+            b"0123456789abcdef"
+        );
     }
 
     #[test]
@@ -1126,7 +1153,7 @@ mod tests {
                 )
             }
         });
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let dest = dir.path().join("download.bin");
 
         let result = download_test_file(&url, &dest, Duration::from_secs(2));
@@ -1197,22 +1224,22 @@ mod tests {
 
     #[test]
     fn test_sha256_file_empty() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let path = dir.path().join("empty.bin");
-        fs::write(&path, b"").unwrap();
+        fs::write(&path, b"").expect("创建空文件哈希样本");
         assert_eq!(
-            sha256_file(&path).unwrap(),
+            sha256_file(&path).expect("计算已写入测试文件的 SHA256"),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 
     #[test]
     fn test_sha256_file_abc() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let path = dir.path().join("abc.txt");
-        fs::write(&path, b"abc").unwrap();
+        fs::write(&path, b"abc").expect("写入 abc 哈希样本");
         assert_eq!(
-            sha256_file(&path).unwrap(),
+            sha256_file(&path).expect("计算已写入测试文件的 SHA256"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
@@ -1220,13 +1247,13 @@ mod tests {
     /// 数据量刻意超过 HASH_BUFFER_SIZE, 覆盖多次 read 的累积路径。
     #[test]
     fn test_sha256_file_large_multichunk() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let path = dir.path().join("large.bin");
         let data = vec![0xABu8; 200_000];
         assert!(data.len() > HASH_BUFFER_SIZE, "样本必须跨多个缓冲区");
-        fs::write(&path, &data).unwrap();
+        fs::write(&path, &data).expect("写入跨缓冲区哈希样本");
         assert_eq!(
-            sha256_file(&path).unwrap(),
+            sha256_file(&path).expect("计算已写入测试文件的 SHA256"),
             "1bd168fa4e29a8a1af90173db63749b296c7f417c23487dd03ebf21d6ed663a6"
         );
     }
@@ -1239,29 +1266,28 @@ mod tests {
 
     #[test]
     fn test_sha256_file_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let path = dir.path().join("missing.bin");
         assert!(sha256_file(&path).is_err());
     }
 
     fn write_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
-        write_test_zip_with_compression(path, entries, zip::CompressionMethod::Stored);
+        write_test_zip_with_compression(path, entries, CompressionMethod::Stored);
     }
 
     fn write_test_zip_with_compression(
         path: &Path,
         entries: &[(&str, &[u8])],
-        compression: zip::CompressionMethod,
+        compression: CompressionMethod,
     ) {
-        use std::io::Write as _;
-        let file = fs::File::create(path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default().compression_method(compression);
+        let file = File::create(path).expect("创建测试 ZIP 文件");
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(compression);
         for &(name, data) in entries {
-            zip.start_file(name, options).unwrap();
-            zip.write_all(data).unwrap();
+            zip.start_file(name, options).expect("创建测试 ZIP 条目");
+            zip.write_all(data).expect("写入测试 ZIP 条目内容");
         }
-        zip.finish().unwrap();
+        zip.finish().expect("完成测试 ZIP 并写入中央目录");
     }
 
     /// 测试用的提取清单, 结构与真实核心一致: 一个必需 exe 加一个可选 dll。
@@ -1276,7 +1302,7 @@ mod tests {
 
     #[test]
     fn test_extract_artifacts_only_takes_wanted_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let zip_path = dir.path().join("core.zip");
         write_test_zip(
             &zip_path,
@@ -1290,14 +1316,14 @@ mod tests {
         );
         let core_dir = dir.path().join("core");
 
-        extract(&zip_path, &core_dir).unwrap();
+        extract(&zip_path, &core_dir).expect("包含必需核心文件的测试 ZIP 应提取成功");
 
         assert_eq!(
-            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            fs::read_to_string(core_dir.join("core.exe")).expect("读取提取或回滚后的核心程序"),
             "exe"
         );
         assert_eq!(
-            fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
+            fs::read_to_string(core_dir.join("extra.dll")).expect("读取提取或回滚后的可选文件"),
             "dll"
         );
         for unwanted in ["geoip.dat", "LICENSE", "README.md"] {
@@ -1308,7 +1334,7 @@ mod tests {
     /// 整件事的目的: 用户自己配置的规则集 dat 和运行时生成的文件必须留下。
     #[test]
     fn test_extract_artifacts_keeps_existing_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let zip_path = dir.path().join("core.zip");
         write_test_zip(
             &zip_path,
@@ -1318,40 +1344,41 @@ mod tests {
             ],
         );
         let core_dir = dir.path().join("core");
-        fs::create_dir_all(&core_dir).unwrap();
-        fs::write(core_dir.join("geoip.dat"), b"user-custom").unwrap();
-        fs::write(core_dir.join("cache.db"), b"runtime").unwrap();
+        fs::create_dir_all(&core_dir).expect("创建测试核心目录");
+        fs::write(core_dir.join("geoip.dat"), b"user-custom")
+            .expect("写入用户自定义规则集测试文件");
+        fs::write(core_dir.join("cache.db"), b"runtime").expect("写入运行时缓存测试文件");
 
-        extract(&zip_path, &core_dir).unwrap();
+        extract(&zip_path, &core_dir).expect("包含必需核心文件的测试 ZIP 应提取成功");
 
         assert_eq!(
-            fs::read_to_string(core_dir.join("geoip.dat")).unwrap(),
+            fs::read_to_string(core_dir.join("geoip.dat")).expect("读取应保留的用户规则集"),
             "user-custom",
             "用户配置的规则集被官方版覆盖了"
         );
         assert_eq!(
-            fs::read_to_string(core_dir.join("cache.db")).unwrap(),
+            fs::read_to_string(core_dir.join("cache.db")).expect("读取应保留的运行时缓存"),
             "runtime"
         );
     }
 
     #[test]
     fn test_extract_artifacts_keeps_replaced_file_as_old() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let zip_path = dir.path().join("core.zip");
         write_test_zip(&zip_path, &[("core.exe", &b"new-exe"[..])]);
         let core_dir = dir.path().join("core");
-        fs::create_dir_all(&core_dir).unwrap();
-        fs::write(core_dir.join("core.exe"), b"old-exe").unwrap();
+        fs::create_dir_all(&core_dir).expect("创建测试核心目录");
+        fs::write(core_dir.join("core.exe"), b"old-exe").expect("写入旧版核心程序测试文件");
 
-        extract(&zip_path, &core_dir).unwrap();
+        extract(&zip_path, &core_dir).expect("包含必需核心文件的测试 ZIP 应提取成功");
 
         assert_eq!(
-            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            fs::read_to_string(core_dir.join("core.exe")).expect("读取提取或回滚后的核心程序"),
             "new-exe"
         );
         assert_eq!(
-            fs::read_to_string(core_dir.join("core.exe.old")).unwrap(),
+            fs::read_to_string(core_dir.join("core.exe.old")).expect("读取应保留的核心备份"),
             "old-exe",
             "旧文件应保留为 .old 供回退"
         );
@@ -1364,20 +1391,23 @@ mod tests {
     /// `.old` 留到下一次更新开始时才清理, `.new` 残留也一并清掉。
     #[test]
     fn test_extract_artifacts_clears_leftovers_on_start() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let zip_path = dir.path().join("core.zip");
         write_test_zip(&zip_path, &[("core.exe", &b"v3"[..])]);
         let core_dir = dir.path().join("core");
-        fs::create_dir_all(&core_dir).unwrap();
-        fs::write(core_dir.join("core.exe"), b"v2").unwrap();
-        fs::write(core_dir.join("core.exe.old"), b"v1").unwrap();
-        fs::write(core_dir.join("extra.dll.new"), b"stale").unwrap();
+        fs::create_dir_all(&core_dir).expect("创建测试核心目录");
+        fs::write(core_dir.join("core.exe"), b"v2").expect("写入当前版本核心程序测试文件");
+        fs::write(core_dir.join("core.exe.old"), b"v1").expect("写入上一轮核心备份测试文件");
+        fs::write(core_dir.join("extra.dll.new"), b"stale").expect("写入残留的可选文件暂存副本");
 
-        extract(&zip_path, &core_dir).unwrap();
+        extract(&zip_path, &core_dir).expect("包含必需核心文件的测试 ZIP 应提取成功");
 
-        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "v3");
         assert_eq!(
-            fs::read_to_string(core_dir.join("core.exe.old")).unwrap(),
+            fs::read_to_string(core_dir.join("core.exe")).expect("读取提取或回滚后的核心程序"),
+            "v3"
+        );
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe.old")).expect("读取应保留的核心备份"),
             "v2",
             ".old 应是本次被替换的版本, 不是上一轮的"
         );
@@ -1389,29 +1419,29 @@ mod tests {
 
     #[test]
     fn test_extract_artifacts_missing_required_keeps_core_dir_intact() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let zip_path = dir.path().join("core.zip");
         write_test_zip(
             &zip_path,
             &[("extra.dll", &b"dll"[..]), ("README.md", &b"readme"[..])],
         );
         let core_dir = dir.path().join("core");
-        fs::create_dir_all(&core_dir).unwrap();
-        fs::write(core_dir.join("core.exe"), b"current").unwrap();
-        fs::write(core_dir.join("extra.dll"), b"current-dll").unwrap();
+        fs::create_dir_all(&core_dir).expect("创建测试核心目录");
+        fs::write(core_dir.join("core.exe"), b"current").expect("写入当前核心程序测试文件");
+        fs::write(core_dir.join("extra.dll"), b"current-dll").expect("写入当前可选文件测试样本");
 
-        let err = extract(&zip_path, &core_dir).unwrap_err();
+        let err = extract(&zip_path, &core_dir).expect_err("缺少必需核心文件时提取应失败");
         assert!(
             err.to_string().contains("core.exe"),
             "错误应指出缺哪个文件: {err}"
         );
 
         assert_eq!(
-            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            fs::read_to_string(core_dir.join("core.exe")).expect("读取提取或回滚后的核心程序"),
             "current"
         );
         assert_eq!(
-            fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
+            fs::read_to_string(core_dir.join("extra.dll")).expect("读取提取或回滚后的可选文件"),
             "current-dll",
             "必需文件缺失时不应替换任何文件"
         );
@@ -1424,22 +1454,22 @@ mod tests {
     /// 本次更新失败时, 上一轮的 `.old` 是用户唯一的回退副本, 不能被清掉。
     #[test]
     fn test_extract_artifacts_missing_required_keeps_old_backup() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let zip_path = dir.path().join("core.zip");
         write_test_zip(&zip_path, &[("extra.dll", &b"dll"[..])]);
         let core_dir = dir.path().join("core");
-        fs::create_dir_all(&core_dir).unwrap();
-        fs::write(core_dir.join("core.exe"), b"current").unwrap();
-        fs::write(core_dir.join("core.exe.old"), b"prev").unwrap();
+        fs::create_dir_all(&core_dir).expect("创建测试核心目录");
+        fs::write(core_dir.join("core.exe"), b"current").expect("写入当前核心程序测试文件");
+        fs::write(core_dir.join("core.exe.old"), b"prev").expect("写入待保留的核心备份测试文件");
 
-        extract(&zip_path, &core_dir).unwrap_err();
+        extract(&zip_path, &core_dir).expect_err("缺少必需核心文件时提取应失败");
 
         assert_eq!(
-            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            fs::read_to_string(core_dir.join("core.exe")).expect("读取提取或回滚后的核心程序"),
             "current"
         );
         assert_eq!(
-            fs::read_to_string(core_dir.join("core.exe.old")).unwrap(),
+            fs::read_to_string(core_dir.join("core.exe.old")).expect("读取应保留的核心备份"),
             "prev",
             "更新没成功就不该清掉上一轮的回退副本"
         );
@@ -1447,30 +1477,33 @@ mod tests {
 
     #[test]
     fn test_extract_artifacts_accepts_deflated_contents() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let zip_path = dir.path().join("core.zip");
         let data = vec![0xAB; 32 * 1024];
         write_test_zip_with_compression(
             &zip_path,
             &[("extra.dll", b"new-dll"), ("core.exe", &data)],
-            zip::CompressionMethod::Deflated,
+            CompressionMethod::Deflated,
         );
         let core_dir = dir.path().join("core");
 
-        extract(&zip_path, &core_dir).unwrap();
+        extract(&zip_path, &core_dir).expect("包含必需核心文件的测试 ZIP 应提取成功");
 
-        assert_eq!(fs::read(core_dir.join("core.exe")).unwrap(), data);
-        assert_eq!(fs::read(core_dir.join("extra.dll")).unwrap(), b"new-dll");
+        assert_eq!(
+            fs::read(core_dir.join("core.exe")).expect("读取解压后的核心程序字节"),
+            data
+        );
+        assert_eq!(
+            fs::read(core_dir.join("extra.dll")).expect("读取解压后的可选文件字节"),
+            b"new-dll"
+        );
     }
 
     /// 只缩小头部声明的解压大小, 保持实际数据与 CRC 完整, 验证依赖的大小约束。
     #[test]
     fn test_extract_artifacts_rejects_understated_size_without_replacing_files() {
-        for compression in [
-            zip::CompressionMethod::Stored,
-            zip::CompressionMethod::Deflated,
-        ] {
-            let dir = tempfile::tempdir().unwrap();
+        for compression in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+            let dir = tempfile::tempdir().expect("创建独立测试目录");
             let zip_path = dir.path().join("core.zip");
             let data = vec![0xAB; 32 * 1024];
             // 先成功暂存可选文件, 再由必需文件触发错误, 覆盖两份 .new 的清理。
@@ -1480,23 +1513,27 @@ mod tests {
                 compression,
             );
             let (local_header, central_header) = {
-                let mut archive = zip::ZipArchive::new(fs::File::open(&zip_path).unwrap()).unwrap();
-                let entry = archive.by_name("core.exe").unwrap();
+                let mut archive =
+                    ZipArchive::new(File::open(&zip_path).expect("打开待篡改大小字段的测试 ZIP"))
+                        .expect("读取测试 ZIP 的中央目录");
+                let entry = archive
+                    .by_name("core.exe")
+                    .expect("测试 ZIP 应包含 core.exe 条目");
                 assert_eq!(entry.size(), data.len() as u64);
                 (
                     entry.header_start() as usize,
                     entry.central_header_start() as usize,
                 )
             };
-            let mut bytes = fs::read(&zip_path).unwrap();
+            let mut bytes = fs::read(&zip_path).expect("读取待篡改大小字段的 ZIP 字节");
             // ZIP32 解压大小分别位于 local header +22、central header +24。
             for offset in [local_header + 22, central_header + 24] {
                 bytes[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
             }
-            fs::write(&zip_path, bytes).unwrap();
+            fs::write(&zip_path, bytes).expect("写入虚报解压大小的测试 ZIP");
 
             let core_dir = dir.path().join("core");
-            fs::create_dir_all(&core_dir).unwrap();
+            fs::create_dir_all(&core_dir).expect("创建测试核心目录");
             let original_files = [
                 ("core.exe", "current-exe"),
                 ("extra.dll", "current-dll"),
@@ -1504,10 +1541,12 @@ mod tests {
                 ("extra.dll.old", "previous-dll"),
             ];
             for (name, content) in original_files {
-                fs::write(core_dir.join(name), content).unwrap();
+                fs::write(core_dir.join(name), content).expect("写入大小校验失败后应保留的原文件");
             }
 
-            let err = extract(&zip_path, &core_dir).unwrap_err().to_string();
+            let err = extract(&zip_path, &core_dir)
+                .expect_err("虚报解压大小的 ZIP 应被拒绝")
+                .to_string();
             assert!(err.starts_with("解压文件失败:"), "{compression:?}: {err}");
             assert!(
                 err.contains("declared uncompressed size"),
@@ -1516,7 +1555,8 @@ mod tests {
 
             for (name, content) in original_files {
                 assert_eq!(
-                    fs::read_to_string(core_dir.join(name)).unwrap(),
+                    fs::read_to_string(core_dir.join(name))
+                        .expect("读取大小校验失败后应保留的原文件"),
                     content,
                     "{compression:?}: 读取失败不能替换 {name}"
                 );
@@ -1534,12 +1574,12 @@ mod tests {
     /// 界面上表现为"未安装"。
     #[test]
     fn test_rollback_restores_renamed_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let core_dir = dir.path();
-        fs::write(core_dir.join("core.exe.old"), b"old-exe").unwrap();
-        fs::write(core_dir.join("extra.dll.old"), b"old-dll").unwrap();
+        fs::write(core_dir.join("core.exe.old"), b"old-exe").expect("写入回滚所需的核心备份");
+        fs::write(core_dir.join("extra.dll.old"), b"old-dll").expect("写入回滚所需的可选文件备份");
         // extra.dll 已经换成新版, 回滚要把它一起还原, 不留版本错配的组合
-        fs::write(core_dir.join("extra.dll"), b"new-dll").unwrap();
+        fs::write(core_dir.join("extra.dll"), b"new-dll").expect("写入替换后的新版可选文件");
 
         let renamed = [
             ("extra.dll", core_dir.join("extra.dll.old")),
@@ -1548,11 +1588,11 @@ mod tests {
         assert!(rollback(core_dir, &renamed).is_empty(), "应全部恢复成功");
 
         assert_eq!(
-            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            fs::read_to_string(core_dir.join("core.exe")).expect("读取提取或回滚后的核心程序"),
             "old-exe"
         );
         assert_eq!(
-            fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
+            fs::read_to_string(core_dir.join("extra.dll")).expect("读取提取或回滚后的可选文件"),
             "old-dll"
         );
         assert!(!core_dir.join("core.exe.old").exists());
@@ -1562,7 +1602,7 @@ mod tests {
     /// 恢复失败的文件名必须报告出去, 错误信息靠它提示用户手动处理。
     #[test]
     fn test_rollback_reports_unrecovered() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let core_dir = dir.path();
         let renamed = [("missing.exe", core_dir.join("missing.exe.old"))];
 
@@ -1579,7 +1619,7 @@ mod tests {
     /// 这个用例会走满改名重试, 因此比其他用例慢几秒。
     #[test]
     fn test_extract_artifacts_rolls_back_when_replace_fails() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let zip_path = dir.path().join("core.zip");
         write_test_zip(
             &zip_path,
@@ -1589,12 +1629,13 @@ mod tests {
             ],
         );
         let core_dir = dir.path().join("core");
-        fs::create_dir_all(&core_dir).unwrap();
-        fs::write(core_dir.join("core.exe"), b"old-exe").unwrap();
-        fs::write(core_dir.join("extra.dll"), b"old-dll").unwrap();
-        fs::create_dir_all(core_dir.join(format!("extra.dll.{OLD_SUFFIX}"))).unwrap();
+        fs::create_dir_all(&core_dir).expect("创建测试核心目录");
+        fs::write(core_dir.join("core.exe"), b"old-exe").expect("写入旧版核心程序测试文件");
+        fs::write(core_dir.join("extra.dll"), b"old-dll").expect("写入待回滚的旧版可选文件");
+        fs::create_dir_all(core_dir.join(format!("extra.dll.{OLD_SUFFIX}")))
+            .expect("创建阻止可选文件备份改名的目录");
 
-        let err = extract(&zip_path, &core_dir).unwrap_err();
+        let err = extract(&zip_path, &core_dir).expect_err("备份目标被目录占用时替换应失败");
         assert!(
             err.to_string().contains("extra.dll"),
             "错误应指出哪个文件失败: {err}"
@@ -1605,12 +1646,12 @@ mod tests {
         );
 
         assert_eq!(
-            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            fs::read_to_string(core_dir.join("core.exe")).expect("读取提取或回滚后的核心程序"),
             "old-exe",
             "已经换成新版的文件必须还原"
         );
         assert_eq!(
-            fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
+            fs::read_to_string(core_dir.join("extra.dll")).expect("读取提取或回滚后的可选文件"),
             "old-dll"
         );
         assert!(!core_dir.join(format!("core.exe.{NEW_SUFFIX}")).exists());
@@ -1619,21 +1660,21 @@ mod tests {
 
     #[test]
     fn test_extract_artifacts_missing_optional_still_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let zip_path = dir.path().join("core.zip");
         write_test_zip(&zip_path, &[("core.exe", &b"exe"[..])]);
         let core_dir = dir.path().join("core");
-        fs::create_dir_all(&core_dir).unwrap();
-        fs::write(core_dir.join("extra.dll"), b"kept").unwrap();
+        fs::create_dir_all(&core_dir).expect("创建测试核心目录");
+        fs::write(core_dir.join("extra.dll"), b"kept").expect("写入待保留的可选文件");
 
-        extract(&zip_path, &core_dir).unwrap();
+        extract(&zip_path, &core_dir).expect("包含必需核心文件的测试 ZIP 应提取成功");
 
         assert_eq!(
-            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            fs::read_to_string(core_dir.join("core.exe")).expect("读取提取或回滚后的核心程序"),
             "exe"
         );
         assert_eq!(
-            fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
+            fs::read_to_string(core_dir.join("extra.dll")).expect("读取提取或回滚后的可选文件"),
             "kept",
             "zip 里没有可选文件时应保留原有的"
         );
@@ -1642,7 +1683,7 @@ mod tests {
     /// 按文件名匹配, 因此 sing-box 那种带版本号的顶层目录不需要额外剥离。
     #[test]
     fn test_extract_artifacts_matches_by_file_name_in_nested_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("创建独立测试目录");
         let zip_path = dir.path().join("core.zip");
         write_test_zip(
             &zip_path,
@@ -1653,10 +1694,10 @@ mod tests {
         );
         let core_dir = dir.path().join("core");
 
-        extract(&zip_path, &core_dir).unwrap();
+        extract(&zip_path, &core_dir).expect("包含必需核心文件的测试 ZIP 应提取成功");
 
         assert_eq!(
-            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            fs::read_to_string(core_dir.join("core.exe")).expect("读取提取或回滚后的核心程序"),
             "exe"
         );
         assert!(!core_dir.join("sing-box-1.2.3-windows-amd64").exists());
@@ -1674,7 +1715,7 @@ mod tests {
             r"\\?\C:\a/../../core.exe",
             r"\\?\UNC\server\share\../core.exe",
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir().expect("创建独立测试目录");
             let zip_path = dir.path().join("core.zip");
             write_test_zip(
                 &zip_path,
@@ -1682,10 +1723,10 @@ mod tests {
             );
             let core_dir = dir.path().join("core");
 
-            extract(&zip_path, &core_dir).unwrap();
+            extract(&zip_path, &core_dir).expect("包含必需核心文件的测试 ZIP 应提取成功");
 
             assert_eq!(
-                fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+                fs::read_to_string(core_dir.join("core.exe")).expect("读取提取或回滚后的核心程序"),
                 "good",
                 "{unsafe_name}"
             );

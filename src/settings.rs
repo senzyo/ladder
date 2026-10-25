@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::error::AppError;
+use crate::app_error::AppError;
 
 /// 核心运行模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -184,7 +185,7 @@ impl Settings {
     pub fn load(exe_dir: &Path) -> Self {
         let path = exe_dir.join("settings.json");
 
-        let text = match std::fs::read_to_string(&path) {
+        let text = match fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
                 push_warning(format!(
@@ -217,7 +218,7 @@ impl Settings {
         let path = exe_dir.join("settings.json");
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| AppError::Msg(format!("序列化配置失败: {e}")))?;
-        std::fs::write(&path, json).map_err(|e| AppError::Msg(format!("写入配置文件失败: {e}")))
+        fs::write(&path, json).map_err(|e| AppError::Msg(format!("写入配置文件失败: {e}")))
     }
 
     /// 取出加载期间收集的警告。调用后清空, 仅首次调用返回内容。
@@ -302,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_parse_settings_defaults() {
-        let (s, warnings) = parse_settings("{}").unwrap();
+        let (s, warnings) = parse_settings("{}").expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.log.level, "debug");
         assert_eq!(s.log.max_size_mb, 5);
         assert_eq!(s.download.retry.max_retries, 3);
@@ -319,7 +320,8 @@ mod tests {
 
     #[test]
     fn test_parse_settings_invalid_log_level() {
-        let (s, warnings) = parse_settings(r#"{"log":{"level":"trace"}}"#).unwrap();
+        let (s, warnings) = parse_settings(r#"{"log":{"level":"trace"}}"#)
+            .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.log.level, "debug");
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("无效的日志级别"));
@@ -327,44 +329,49 @@ mod tests {
 
     #[test]
     fn test_parse_settings_log_level_normalized() {
-        let (s, warnings) = parse_settings(r#"{"log":{"level":"DEBUG"}}"#).unwrap();
+        let (s, warnings) = parse_settings(r#"{"log":{"level":"DEBUG"}}"#)
+            .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.log.level, "debug");
         assert!(warnings.is_empty());
     }
 
     #[test]
     fn test_parse_settings_max_retries_bounds() {
-        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"max_retries":0}}}"#).unwrap();
+        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"max_retries":0}}}"#)
+            .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.retry.max_retries, 3);
         assert_eq!(warnings.len(), 1);
 
-        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"max_retries":11}}}"#).unwrap();
+        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"max_retries":11}}}"#)
+            .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.retry.max_retries, 10);
         assert_eq!(warnings.len(), 1);
     }
 
     #[test]
     fn test_parse_settings_delay_secs_bounds() {
-        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"delay_secs":0}}}"#).unwrap();
+        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"delay_secs":0}}}"#)
+            .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.retry.delay_secs, 2);
         assert_eq!(warnings.len(), 1);
 
-        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"delay_secs":31}}}"#).unwrap();
+        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"delay_secs":31}}}"#)
+            .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.retry.delay_secs, 30);
         assert_eq!(warnings.len(), 1);
     }
 
     #[test]
     fn test_parse_settings_interval_days_bounds() {
-        let (s, warnings) =
-            parse_settings(r#"{"download":{"ruleset":{"interval_days":100000}}}"#).unwrap();
+        let (s, warnings) = parse_settings(r#"{"download":{"ruleset":{"interval_days":100000}}}"#)
+            .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.ruleset.interval_days, MAX_INTERVAL_DAYS);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("interval_days"));
 
         // 0 是合法值, 语义为每次启动都更新规则集
-        let (s, warnings) =
-            parse_settings(r#"{"download":{"ruleset":{"interval_days":0}}}"#).unwrap();
+        let (s, warnings) = parse_settings(r#"{"download":{"ruleset":{"interval_days":0}}}"#)
+            .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.ruleset.interval_days, 0);
         assert!(warnings.is_empty());
     }
@@ -385,7 +392,7 @@ mod tests {
                 }
             }
         }"#;
-        let (s, warnings) = parse_settings(json).unwrap();
+        let (s, warnings) = parse_settings(json).expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.ruleset.interval_days, 7);
         assert_eq!(s.download.ruleset.entries.len(), 1);
         let entry = &s.download.ruleset.entries["geoip"];
@@ -406,8 +413,8 @@ mod tests {
                 }
             }
         }"#;
-        let (s, _) = parse_settings(json).unwrap();
-        let out = serde_json::to_string(&s).unwrap();
+        let (s, _) = parse_settings(json).expect("测试 JSON 应能完成设置解析和校验");
+        let out = serde_json::to_string(&s).expect("已解析的设置应能序列化");
         let alpha = out.find("alpha").expect("应含 alpha");
         let zeta = out.find("zeta").expect("应含 zeta");
         assert!(alpha < zeta, "键应按字典序输出: {out}");
@@ -423,7 +430,7 @@ mod tests {
             },
             "core": {"mode": "both"}
         }"#;
-        let (s, warnings) = parse_settings(json).unwrap();
+        let (s, warnings) = parse_settings(json).expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.log.level, "info");
         assert_eq!(s.download.core.gh_proxy, "https://proxy.example.com/");
         assert_eq!(s.download.retry.max_retries, 5);

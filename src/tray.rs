@@ -1,16 +1,18 @@
 //! Windows 系统托盘 UI。
 //!
 //! 负责创建隐藏窗口、注册托盘图标、构建右键弹出菜单 (重启/终止/更新/切换配置/退出) ,
-//! 处理鼠标消息并将菜单事件分发给 `main::execute_menu_command`。
+//! 处理鼠标消息并将菜单事件分发给 `commands::execute_menu_command`。
 
 use std::collections::HashMap;
-use std::mem::size_of;
+use std::ffi::c_void;
+use std::mem;
 use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
-    DeleteDC, GetDC, HBITMAP, HGDIOBJ, ReleaseDC, SelectObject,
+    DeleteDC, DeleteObject, GetDC, HBITMAP, HGDIOBJ, ReleaseDC, SelectObject,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -28,10 +30,48 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR};
 
-use crate::error::AppError;
+use crate::app_error::AppError;
+use crate::app_state;
+use crate::commands;
+use crate::config_selection::{self, ConfigSelection};
+use crate::core::{Core, CoreStatus};
+use crate::process;
 use crate::settings::CoreMode;
-use crate::state::{self, ConfigSelection, Core, CoreStatus};
+use crate::windows_strings;
 use tracing::warn;
+
+/// 三个状态图标的 GDI 位图句柄, 0 表示加载失败。
+#[derive(Clone, Copy, Default)]
+pub struct StatusIcons {
+    pub running: isize,
+    pub not_running: isize,
+    pub not_installed: isize,
+}
+
+impl StatusIcons {
+    /// 取进程状态对应的位图句柄。
+    pub fn handle_for(self, state: CoreStatus) -> isize {
+        match state {
+            CoreStatus::Running => self.running,
+            CoreStatus::NotRunning => self.not_running,
+            CoreStatus::NotInstalled => self.not_installed,
+        }
+    }
+
+    /// 释放三个位图句柄。
+    ///
+    /// 刻意做成显式方法而不是 `Drop`: `AppState` 放在 `OnceLock` 里, 静态变量
+    /// 的 Drop 永远不会执行, 写成 Drop 就成了不会运行的死代码。
+    pub fn delete(self) {
+        for handle in [self.running, self.not_running, self.not_installed] {
+            if handle != 0 {
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(handle as *mut c_void));
+                }
+            }
+        }
+    }
+}
 
 /// 托盘图标的自定义消息 ID, 当托盘收到鼠标事件时通过此消息通知窗口。
 pub const WM_TRAY_ICON: u32 = WM_APP + 1;
@@ -62,7 +102,7 @@ pub const ID_XRAY_CONFIG_BASE: u16 = 2000;
 pub unsafe fn create_window(h_instance: isize) -> Result<isize, AppError> {
     unsafe {
         let h_instance = HINSTANCE(h_instance as _);
-        let class_name = state::wide("LadderTrayWindow");
+        let class_name = windows_strings::wide("LadderTrayWindow");
 
         let wnd_class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -76,7 +116,7 @@ pub unsafe fn create_window(h_instance: isize) -> Result<isize, AppError> {
             return Err(AppError::Msg("注册托盘窗口类失败".into()));
         }
 
-        let title = state::wide("ladder");
+        let title = windows_strings::wide("ladder");
         let hwnd = CreateWindowExW(
             Default::default(),
             PCWSTR(class_name.as_ptr()),
@@ -107,7 +147,7 @@ pub unsafe fn add_icon(hwnd: isize, h_instance: isize, exe_dir: &Path) -> Result
         let h_instance = HINSTANCE(h_instance as _);
         let icon = load_app_icon(Some(h_instance), exe_dir);
         let nid = NOTIFYICONDATAW {
-            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            cbSize: mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
             uID: TRAY_UID,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
@@ -177,7 +217,7 @@ pub fn set_tooltip(text: &str) {
         let hwnd = HWND(hwnd_val as _);
         unsafe {
             let nid = NOTIFYICONDATAW {
-                cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+                cbSize: mem::size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: hwnd,
                 uID: TRAY_UID,
                 uFlags: NIF_TIP,
@@ -190,9 +230,9 @@ pub fn set_tooltip(text: &str) {
 }
 
 /// 加载托盘菜单使用的三个状态图标。
-pub unsafe fn load_status_icons(exe_dir: &Path) -> state::StatusIcons {
+pub unsafe fn load_status_icons(exe_dir: &Path) -> StatusIcons {
     unsafe {
-        state::StatusIcons {
+        StatusIcons {
             running: load_icon_bitmap(exe_dir, "green_circle.ico"),
             not_running: load_icon_bitmap(exe_dir, "yellow_circle.ico"),
             not_installed: load_icon_bitmap(exe_dir, "red_circle.ico"),
@@ -245,7 +285,7 @@ pub(crate) unsafe fn load_icon_bitmap(exe_dir: &Path, icon_name: &str) -> isize 
 
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: 16,
                 biHeight: 16,
                 biPlanes: 1,
@@ -256,7 +296,7 @@ pub(crate) unsafe fn load_icon_bitmap(exe_dir: &Path, icon_name: &str) -> isize 
             ..Default::default()
         };
 
-        let mut pv_bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut pv_bits: *mut c_void = ptr::null_mut();
         let Ok(bmp) =
             CreateDIBSection(Some(screen_dc), &bmi, DIB_RGB_COLORS, &mut pv_bits, None, 0)
         else {
@@ -290,7 +330,11 @@ unsafe extern "system" fn wnd_proc(
                 if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
                     let (selected, config_selections) = show_tray_menu(hwnd);
                     if selected != 0 {
-                        crate::execute_menu_command(hwnd.0 as isize, selected, &config_selections);
+                        commands::execute_menu_command(
+                            hwnd.0 as isize,
+                            selected,
+                            &config_selections,
+                        );
                     }
                 }
                 LRESULT(0)
@@ -336,7 +380,7 @@ unsafe fn load_app_icon(h_instance: Option<HINSTANCE>, exe_dir: &Path) -> HICON 
 unsafe fn remove_tray_icon(hwnd: HWND) {
     unsafe {
         let nid = NOTIFYICONDATAW {
-            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            cbSize: mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
             uID: TRAY_UID,
             ..Default::default()
@@ -353,7 +397,7 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigSelection>) {
     unsafe {
         let (exe_dir, icons, core_mode) = {
-            let app = match state::app_state() {
+            let app = match app_state::app_state() {
                 Some(app) => app,
                 None => return (0, HashMap::new()),
             };
@@ -362,7 +406,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigSelection>) {
 
         // 锁已释放才做状态查询: 进程快照和文件存在性检查都是几十毫秒级的
         // 系统调用, 放在锁内会阻塞需要写状态的后台线程。
-        let states = state::core_states(&exe_dir);
+        let states = process::core_states(&exe_dir);
 
         let Ok(menu) = CreatePopupMenu() else {
             return (0, HashMap::new());
@@ -527,14 +571,14 @@ unsafe fn append_separator(menu: HMENU) {
 
 unsafe fn append_item(menu: HMENU, id: u16, label: &str) {
     unsafe {
-        let w = state::wide(label);
+        let w = windows_strings::wide(label);
         let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(w.as_ptr()));
     }
 }
 
 unsafe fn append_disabled_item(menu: HMENU, label: &str) {
     unsafe {
-        let w = state::wide(label);
+        let w = windows_strings::wide(label);
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(w.as_ptr()));
     }
 }
@@ -542,7 +586,7 @@ unsafe fn append_disabled_item(menu: HMENU, label: &str) {
 /// 添加菜单项, `disabled` 为 true 时灰掉禁用。
 unsafe fn append_item_or_disabled(menu: HMENU, id: u16, label: &str, disabled: bool) {
     unsafe {
-        let w = state::wide(label);
+        let w = windows_strings::wide(label);
         let flags = if disabled {
             MF_STRING | MF_GRAYED
         } else {
@@ -558,7 +602,7 @@ unsafe fn append_item_or_disabled(menu: HMENU, id: u16, label: &str, disabled: b
 /// 这是 Win32 菜单项附加位图的标准做法。
 unsafe fn append_status_item(menu: HMENU, label: &str, hbmp: isize) {
     unsafe {
-        let w = state::wide(label);
+        let w = windows_strings::wide(label);
         let position = GetMenuItemCount(Some(menu)) as u32;
         let _ = AppendMenuW(menu, MF_STRING, 0, PCWSTR(w.as_ptr()));
 
@@ -567,7 +611,7 @@ unsafe fn append_status_item(menu: HMENU, label: &str, hbmp: isize) {
         }
 
         let mii = MENUITEMINFOW {
-            cbSize: size_of::<MENUITEMINFOW>() as u32,
+            cbSize: mem::size_of::<MENUITEMINFOW>() as u32,
             fMask: MIIM_BITMAP,
             hbmpItem: HBITMAP(hbmp as _),
             ..Default::default()
@@ -578,7 +622,7 @@ unsafe fn append_status_item(menu: HMENU, label: &str, hbmp: isize) {
 
 unsafe fn append_submenu(menu: HMENU, submenu: HMENU, label: &str) {
     unsafe {
-        let w = state::wide(label);
+        let w = windows_strings::wide(label);
         let _ = AppendMenuW(
             menu,
             MF_STRING | MF_POPUP,
@@ -599,7 +643,7 @@ unsafe fn append_config_items(
     unsafe {
         let mut added = 0;
 
-        for (id, path) in (base_id..).zip(state::find_json_configs(dirs)) {
+        for (id, path) in (base_id..).zip(config_selection::find_json_configs(dirs)) {
             if id >= base_id + 900 {
                 break;
             }

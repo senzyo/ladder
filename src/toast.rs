@@ -4,18 +4,20 @@
 //! 首次运行时会在开始菜单创建快捷方式并设置 AUMID (AppUserModelID) ,
 //! 这是 Windows 识别应用身份以显示 Toast 通知的必要条件。
 
-use std::ffi::c_void;
-use std::os::windows::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::ffi::{OsStr, c_void};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::error;
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
 use windows::Win32::UI::Shell::{IShellLinkW, SetCurrentProcessExplicitAppUserModelID, ShellLink};
-use windows::core::{HSTRING, Interface};
+use windows::core::HSTRING;
+use windows_sys::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows_sys::core::GUID;
 
-use crate::error::AppError;
+use crate::app_error::AppError;
+use crate::windows_strings;
 
 const AUMID: &str = "Ladder";
 const SHORTCUT_NAME: &str = "ladder";
@@ -30,7 +32,7 @@ static ICON_URI: OnceLock<String> = OnceLock::new();
 ///
 /// 设置当前进程的 AUMID, 并在开始菜单 Programs 目录创建快捷方式。
 /// Windows 要求应用必须有带 AUMID 的快捷方式才能显示 Toast 通知。
-pub fn setup(exe_path: &std::path::Path) -> Result<(), AppError> {
+pub fn setup(exe_path: &Path) -> Result<(), AppError> {
     unsafe {
         SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(AUMID))
             .map_err(|e| AppError::Msg(format!("设置 AUMID 失败: {e}")))?;
@@ -124,8 +126,8 @@ fn show_toast_xml(xml_str: &str, tag: Option<&str>) -> Result<(), AppError> {
 fn fallback_msgbox(title: &str, err: &str) {
     let msg = format!("Toast 通知失败: {err}");
     unsafe {
-        let title_wide = crate::state::wide(title);
-        let msg_wide = crate::state::wide(&msg);
+        let title_wide = windows_strings::wide(title);
+        let msg_wide = windows_strings::wide(&msg);
         windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
             std::ptr::null_mut(),
             msg_wide.as_ptr(),
@@ -141,10 +143,7 @@ fn fallback_msgbox(title: &str, err: &str) {
 // ═══════════════════════════════════════════════
 
 /// 确保开始菜单快捷方式存在。如果旧版以 AUMID 命名的快捷方式存在则删除 (迁移) 。
-fn ensure_shortcut(
-    exe_path: &std::path::Path,
-    icon_path: &std::path::Path,
-) -> Result<(), AppError> {
+fn ensure_shortcut(exe_path: &Path, icon_path: &Path) -> Result<(), AppError> {
     let programs_dir = get_programs_dir()?;
     let lnk_path = programs_dir.join(format!("{}.lnk", SHORTCUT_NAME));
 
@@ -158,11 +157,9 @@ fn ensure_shortcut(
     create_shortcut(exe_path, icon_path, &lnk_path)
 }
 
-fn create_shortcut(
-    exe_path: &std::path::Path,
-    icon_path: &std::path::Path,
-    lnk_path: &std::path::Path,
-) -> Result<(), AppError> {
+fn create_shortcut(exe_path: &Path, icon_path: &Path, lnk_path: &Path) -> Result<(), AppError> {
+    use windows::core::Interface;
+
     unsafe {
         let shell_link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
             .map_err(|e| AppError::Msg(format!("创建 ShellLink 失败: {e}")))?;
@@ -193,11 +190,11 @@ fn create_shortcut(
 /// Windows Toast 通知系统通过 AUMID 识别应用身份。不仅进程需要调用
 /// `SetCurrentProcessExplicitAppUserModelID`, 开始菜单中的快捷方式
 /// 也需要写入相同的 AUMID, 否则通知无法关联到应用图标。
-fn set_shortcut_aumid(lnk_path: &std::path::Path) -> Result<(), AppError> {
-    unsafe {
-        use windows_sys::Win32::System::Com::StructuredStorage::PROPVARIANT;
+fn set_shortcut_aumid(lnk_path: &Path) -> Result<(), AppError> {
+    use std::os::windows::ffi::OsStrExt;
 
-        let lnk_wide: Vec<u16> = std::ffi::OsStr::new(&lnk_path.to_string_lossy().as_ref())
+    unsafe {
+        let lnk_wide: Vec<u16> = OsStr::new(&lnk_path.to_string_lossy().as_ref())
             .encode_wide()
             .chain(Some(0))
             .collect();
@@ -221,10 +218,7 @@ fn set_shortcut_aumid(lnk_path: &std::path::Path) -> Result<(), AppError> {
 
         let prop_store = &*(pps as *const IPropertyStoreW);
 
-        let aumid_wide: Vec<u16> = std::ffi::OsStr::new(AUMID)
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
+        let aumid_wide: Vec<u16> = OsStr::new(AUMID).encode_wide().chain(Some(0)).collect();
 
         // 手动构建 PROPVARIANT 结构体:
         // 偏移 0: VT_LPWSTR 类型标签 (u16)
@@ -274,7 +268,7 @@ fn get_programs_dir() -> Result<PathBuf, AppError> {
 const VT_LPWSTR: i32 = 31;
 
 /// PKEY_AppUserModel_ID 属性的 GUID (来自 propkey.h) 。
-const GUID_PKEY_AUMID: windows_sys::core::GUID = windows_sys::core::GUID {
+const GUID_PKEY_AUMID: GUID = GUID {
     data1: 0x9F4C2855,
     data2: 0x9F79,
     data3: 0x4B39,
@@ -282,7 +276,7 @@ const GUID_PKEY_AUMID: windows_sys::core::GUID = windows_sys::core::GUID {
 };
 
 /// IPropertyStore 接口的 IID。
-const IID_IPROPERTY_STORE: windows_sys::core::GUID = windows_sys::core::GUID {
+const IID_IPROPERTY_STORE: GUID = GUID {
     data1: 0x886D8EEB,
     data2: 0x8CF2,
     data3: 0x4446,
@@ -291,7 +285,7 @@ const IID_IPROPERTY_STORE: windows_sys::core::GUID = windows_sys::core::GUID {
 
 #[repr(C)]
 struct PROPERTYKEY_S {
-    fmtid: windows_sys::core::GUID,
+    fmtid: GUID,
     pid: u32,
 }
 
@@ -302,7 +296,7 @@ struct PROPERTYKEY_S {
 struct IPropertyStoreVtbl {
     query_interface: unsafe extern "system" fn(
         this: *mut c_void,
-        riid: *const windows_sys::core::GUID,
+        riid: *const GUID,
         ppv: *mut *mut c_void,
     ) -> i32,
     add_ref: unsafe extern "system" fn(this: *mut c_void) -> u32,
@@ -313,7 +307,7 @@ struct IPropertyStoreVtbl {
     set_value: unsafe extern "system" fn(
         this: *mut c_void,
         key: *const PROPERTYKEY_S,
-        propvar: *const windows_sys::Win32::System::Com::StructuredStorage::PROPVARIANT,
+        propvar: *const PROPVARIANT,
     ) -> i32,
     commit: unsafe extern "system" fn(this: *mut c_void) -> i32,
 }

@@ -1,15 +1,19 @@
 //! 统一错误类型定义。
 
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+use std::io;
+
 /// 应用统一错误类型。
 #[derive(Debug)]
 pub enum AppError {
     Msg(String),
-    Io(std::io::Error),
+    Io(io::Error),
     Json(serde_json::Error),
 }
 
-impl std::fmt::Display for AppError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for AppError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Msg(s) => write!(f, "{s}"),
             Self::Io(e) => write!(f, "IO 错误: {e}"),
@@ -18,10 +22,10 @@ impl std::fmt::Display for AppError {
     }
 }
 
-impl std::error::Error for AppError {}
+impl Error for AppError {}
 
-impl From<std::io::Error> for AppError {
-    fn from(e: std::io::Error) -> Self {
+impl From<io::Error> for AppError {
+    fn from(e: io::Error) -> Self {
         Self::Io(e)
     }
 }
