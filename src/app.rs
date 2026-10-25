@@ -1,7 +1,6 @@
 //! 应用启动、消息循环与正常退出资源清理。
 
 use std::fs;
-use std::sync::Mutex;
 use tracing::{info, warn};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
@@ -67,15 +66,13 @@ fn run_application() -> Result<(), AppError> {
 
     let icons = unsafe { tray::load_status_icons(&exe_dir) };
 
-    app_state::APP
-        .set(Mutex::new(AppState {
-            exe_dir: exe_dir.clone(),
-            icons,
-            settings: app_settings,
-            child_sing_box: None,
-            child_xray: None,
-        }))
-        .map_err(|_| AppError::Msg("初始化状态失败".into()))?;
+    app_state::initialize(AppState {
+        exe_dir: exe_dir.clone(),
+        icons,
+        settings: app_settings,
+        child_sing_box: None,
+        child_xray: None,
+    })?;
 
     unsafe {
         let h_instance = GetModuleHandleW(None)
@@ -87,9 +84,9 @@ fn run_application() -> Result<(), AppError> {
         tray::run_message_loop();
     }
 
-    if let Some(app) = app_state::app_state() {
+    let _ = app_state::with_app_state(|app| {
         app.icons.delete();
-    }
+    });
 
     Ok(())
 }

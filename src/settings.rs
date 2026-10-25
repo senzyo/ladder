@@ -1,3 +1,5 @@
+//! 应用设置、JSON 加载保存与校验警告。
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,10 +20,12 @@ pub enum CoreMode {
 }
 
 impl CoreMode {
+    #[must_use]
     pub fn runs_sing_box(&self) -> bool {
         matches!(self, Self::SingBox | Self::Both)
     }
 
+    #[must_use]
     pub fn runs_xray(&self) -> bool {
         matches!(self, Self::Xray | Self::Both)
     }
@@ -99,7 +103,7 @@ impl Default for Ruleset {
 }
 
 /// 下载配置。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Download {
     #[serde(default)]
     pub core: CoreDownload,
@@ -156,19 +160,6 @@ impl Default for Log {
     }
 }
 
-impl Default for Download {
-    fn default() -> Self {
-        Download {
-            core: CoreDownload::default(),
-            retry: Retry {
-                max_retries: default_max_retries(),
-                delay_secs: default_retry_delay(),
-            },
-            ruleset: Ruleset::default(),
-        }
-    }
-}
-
 const ALLOWED_LEVELS: &[&str] = &["debug", "info", "warn", "error"];
 
 /// 规则集更新间隔上限 (天) 。
@@ -182,6 +173,7 @@ const MAX_LOG_SIZE_MB: u64 = 4096;
 impl Settings {
     /// 从 `exe_dir/settings.json` 加载配置。
     /// 文件不存在或格式错误时打印警告并返回默认值。
+    #[must_use]
     pub fn load(exe_dir: &Path) -> Self {
         let path = exe_dir.join("settings.json");
 
@@ -197,7 +189,7 @@ impl Settings {
         };
 
         match parse_settings(&text) {
-            Ok((settings, warnings)) => {
+            Ok(ParsedSettings { settings, warnings }) => {
                 for w in warnings {
                     push_warning(w);
                 }
@@ -222,6 +214,7 @@ impl Settings {
     }
 
     /// 取出加载期间收集的警告。调用后清空, 仅首次调用返回内容。
+    #[must_use]
     pub fn take_warnings() -> Vec<String> {
         LOAD_WARNINGS
             .lock()
@@ -232,6 +225,7 @@ impl Settings {
 
     /// 校验配置值合法性, 非法值回退到默认值。
     /// 返回校验过程中产生的警告信息, 由调用方决定如何输出。
+    #[must_use]
     fn validate(&mut self) -> Vec<String> {
         let mut warnings = Vec::new();
 
@@ -282,12 +276,18 @@ impl Settings {
     }
 }
 
-/// 解析并校验 JSON 配置字符串, 返回配置与校验警告列表。
+/// 解析后的配置和按校验顺序收集的警告, 不参与配置文件序列化。
+struct ParsedSettings {
+    settings: Settings,
+    warnings: Vec<String>,
+}
+
+/// 解析并校验 JSON 配置字符串, 返回修正后的配置与校验警告列表。
 /// 解析失败时返回错误, 由调用方决定回退策略。
-fn parse_settings(text: &str) -> Result<(Settings, Vec<String>), serde_json::Error> {
+fn parse_settings(text: &str) -> Result<ParsedSettings, serde_json::Error> {
     let mut settings = serde_json::from_str::<Settings>(text)?;
     let warnings = settings.validate();
-    Ok((settings, warnings))
+    Ok(ParsedSettings { settings, warnings })
 }
 
 fn push_warning(msg: String) {
@@ -303,14 +303,25 @@ mod tests {
 
     #[test]
     fn test_parse_settings_defaults() {
-        let (s, warnings) = parse_settings("{}").expect("测试 JSON 应能完成设置解析和校验");
+        let ParsedSettings {
+            settings: s,
+            warnings,
+        } = parse_settings("{}").expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.log.level, "debug");
         assert_eq!(s.log.max_size_mb, 5);
         assert_eq!(s.download.retry.max_retries, 3);
         assert_eq!(s.download.retry.delay_secs, 2);
         assert_eq!(s.download.ruleset.interval_days, 3);
         assert_eq!(s.core.mode, CoreMode::Xray);
-        assert!(warnings.is_empty());
+        assert!(
+            warnings.is_empty(),
+            "省略所有字段应使用默认值且不产生校验警告"
+        );
+        assert_eq!(
+            serde_json::to_value(&s).expect("解析后的默认设置应能序列化"),
+            serde_json::to_value(Settings::default()).expect("默认设置应能序列化"),
+            "JSON 缺省字段和直接构造的默认设置必须一致"
+        );
     }
 
     #[test]
@@ -320,7 +331,10 @@ mod tests {
 
     #[test]
     fn test_parse_settings_invalid_log_level() {
-        let (s, warnings) = parse_settings(r#"{"log":{"level":"trace"}}"#)
+        let ParsedSettings {
+            settings: s,
+            warnings,
+        } = parse_settings(r#"{"log":{"level":"trace"}}"#)
             .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.log.level, "debug");
         assert_eq!(warnings.len(), 1);
@@ -329,7 +343,10 @@ mod tests {
 
     #[test]
     fn test_parse_settings_log_level_normalized() {
-        let (s, warnings) = parse_settings(r#"{"log":{"level":"DEBUG"}}"#)
+        let ParsedSettings {
+            settings: s,
+            warnings,
+        } = parse_settings(r#"{"log":{"level":"DEBUG"}}"#)
             .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.log.level, "debug");
         assert!(warnings.is_empty());
@@ -337,12 +354,18 @@ mod tests {
 
     #[test]
     fn test_parse_settings_max_retries_bounds() {
-        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"max_retries":0}}}"#)
+        let ParsedSettings {
+            settings: s,
+            warnings,
+        } = parse_settings(r#"{"download":{"retry":{"max_retries":0}}}"#)
             .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.retry.max_retries, 3);
         assert_eq!(warnings.len(), 1);
 
-        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"max_retries":11}}}"#)
+        let ParsedSettings {
+            settings: s,
+            warnings,
+        } = parse_settings(r#"{"download":{"retry":{"max_retries":11}}}"#)
             .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.retry.max_retries, 10);
         assert_eq!(warnings.len(), 1);
@@ -350,12 +373,18 @@ mod tests {
 
     #[test]
     fn test_parse_settings_delay_secs_bounds() {
-        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"delay_secs":0}}}"#)
+        let ParsedSettings {
+            settings: s,
+            warnings,
+        } = parse_settings(r#"{"download":{"retry":{"delay_secs":0}}}"#)
             .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.retry.delay_secs, 2);
         assert_eq!(warnings.len(), 1);
 
-        let (s, warnings) = parse_settings(r#"{"download":{"retry":{"delay_secs":31}}}"#)
+        let ParsedSettings {
+            settings: s,
+            warnings,
+        } = parse_settings(r#"{"download":{"retry":{"delay_secs":31}}}"#)
             .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.retry.delay_secs, 30);
         assert_eq!(warnings.len(), 1);
@@ -363,14 +392,20 @@ mod tests {
 
     #[test]
     fn test_parse_settings_interval_days_bounds() {
-        let (s, warnings) = parse_settings(r#"{"download":{"ruleset":{"interval_days":100000}}}"#)
+        let ParsedSettings {
+            settings: s,
+            warnings,
+        } = parse_settings(r#"{"download":{"ruleset":{"interval_days":100000}}}"#)
             .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.ruleset.interval_days, MAX_INTERVAL_DAYS);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("interval_days"));
 
         // 0 是合法值, 语义为每次启动都更新规则集
-        let (s, warnings) = parse_settings(r#"{"download":{"ruleset":{"interval_days":0}}}"#)
+        let ParsedSettings {
+            settings: s,
+            warnings,
+        } = parse_settings(r#"{"download":{"ruleset":{"interval_days":0}}}"#)
             .expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.ruleset.interval_days, 0);
         assert!(warnings.is_empty());
@@ -392,7 +427,10 @@ mod tests {
                 }
             }
         }"#;
-        let (s, warnings) = parse_settings(json).expect("测试 JSON 应能完成设置解析和校验");
+        let ParsedSettings {
+            settings: s,
+            warnings,
+        } = parse_settings(json).expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.download.ruleset.interval_days, 7);
         assert_eq!(s.download.ruleset.entries.len(), 1);
         let entry = &s.download.ruleset.entries["geoip"];
@@ -413,7 +451,8 @@ mod tests {
                 }
             }
         }"#;
-        let (s, _) = parse_settings(json).expect("测试 JSON 应能完成设置解析和校验");
+        let ParsedSettings { settings: s, .. } =
+            parse_settings(json).expect("测试 JSON 应能完成设置解析和校验");
         let out = serde_json::to_string(&s).expect("已解析的设置应能序列化");
         let alpha = out.find("alpha").expect("应含 alpha");
         let zeta = out.find("zeta").expect("应含 zeta");
@@ -430,12 +469,49 @@ mod tests {
             },
             "core": {"mode": "both"}
         }"#;
-        let (s, warnings) = parse_settings(json).expect("测试 JSON 应能完成设置解析和校验");
+        let ParsedSettings {
+            settings: s,
+            warnings,
+        } = parse_settings(json).expect("测试 JSON 应能完成设置解析和校验");
         assert_eq!(s.log.level, "info");
         assert_eq!(s.download.core.gh_proxy, "https://proxy.example.com/");
         assert_eq!(s.download.retry.max_retries, 5);
         assert_eq!(s.download.retry.delay_secs, 3);
         assert_eq!(s.core.mode, CoreMode::Both);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_parse_settings_corrections_keep_warning_order() {
+        let parsed = parse_settings(
+            r#"{
+                "log": {"level": "trace", "max_size_mb": 4097},
+                "download": {
+                    "retry": {"max_retries": 0, "delay_secs": 31},
+                    "ruleset": {"interval_days": 366}
+                }
+            }"#,
+        )
+        .expect("多个需修正字段的 JSON 应能解析");
+
+        assert_eq!(parsed.settings.log.level, "debug");
+        assert_eq!(parsed.settings.log.max_size_mb, MAX_LOG_SIZE_MB);
+        assert_eq!(parsed.settings.download.retry.max_retries, 3);
+        assert_eq!(parsed.settings.download.retry.delay_secs, 30);
+        assert_eq!(
+            parsed.settings.download.ruleset.interval_days,
+            MAX_INTERVAL_DAYS
+        );
+        assert_eq!(
+            parsed.warnings,
+            [
+                "无效的日志级别 \"trace\", 可选值: [\"debug\", \"info\", \"warn\", \"error\"], 回退到 \"debug\"",
+                "max_retries 不能为 0, 回退到默认值 3",
+                "delay_secs 超出上限 30, 已自动限制",
+                "interval_days 超出上限 365, 已自动限制",
+                "log.max_size_mb 超出上限 4096, 已自动限制",
+            ],
+            "具名解析结果应保留所有修正和原校验顺序对应的警告"
+        );
     }
 }

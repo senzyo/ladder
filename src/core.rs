@@ -17,6 +17,7 @@ impl Core {
     pub const ALL: [Core; 2] = [Core::SingBox, Core::Xray];
 
     /// 日志与通知里使用的名称。
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Core::SingBox => "sing-box",
@@ -25,6 +26,7 @@ impl Core {
     }
 
     /// 可执行文件名。
+    #[must_use]
     pub fn exe_name(self) -> &'static str {
         match self {
             Core::SingBox => "sing-box.exe",
@@ -33,6 +35,7 @@ impl Core {
     }
 
     /// 核心的工作目录 (放可执行文件、规则集等) 。
+    #[must_use]
     pub fn core_dir(self, exe_dir: &Path) -> PathBuf {
         let name = match self {
             Core::SingBox => "sing-box_core",
@@ -42,11 +45,13 @@ impl Core {
     }
 
     /// 可执行文件的完整路径。
+    #[must_use]
     pub fn exe_path(self, exe_dir: &Path) -> PathBuf {
         self.core_dir(exe_dir).join(self.exe_name())
     }
 
     /// 当前生效的配置文件路径。
+    #[must_use]
     pub fn active_config(self, exe_dir: &Path) -> PathBuf {
         let name = match self {
             Core::SingBox => "sing-box.json",
@@ -56,11 +61,13 @@ impl Core {
     }
 
     /// 可切换配置所在的目录。
+    #[must_use]
     pub fn config_dir(self, exe_dir: &Path) -> PathBuf {
         exe_dir.join("configs").join(self.label())
     }
 
     /// 更新核心时需要从 release zip 里取出的文件。
+    #[must_use]
     pub fn artifacts(self) -> CoreArtifacts {
         match self {
             Core::SingBox => CoreArtifacts {
@@ -92,6 +99,7 @@ pub struct CoreArtifacts {
 
 impl CoreArtifacts {
     /// 是否需要提取该文件名。
+    #[must_use]
     pub fn wants(&self, file_name: &str) -> bool {
         self.required.contains(&file_name) || self.optional.contains(&file_name)
     }

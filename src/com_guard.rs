@@ -5,6 +5,7 @@ use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUn
 use crate::app_error::AppError;
 
 /// COM 初始化守卫, Drop 时自动调用 CoUninitialize。
+#[must_use = "保留守卫直到当前线程的 COM 操作结束"]
 pub(crate) struct ComGuard;
 
 impl ComGuard {

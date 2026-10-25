@@ -225,21 +225,13 @@ fn run_update_command(hwnd: isize, guard: FlagGuard, cmd: UpdateCommand) {
             return;
         }
     };
-    let (gh_proxy, max_retries, delay_secs) = {
-        let app = match app_state::app_state() {
-            Some(a) => a,
-            None => {
-                error!("应用状态不可用");
-                tray::show_error(hwnd, "操作失败", "应用状态不可用");
-                return;
-            }
-        };
+    let Some((gh_proxy, retry)) = app_state::with_app_state(|app| {
         let s = &app.settings;
-        (
-            s.download.core.gh_proxy.clone(),
-            s.download.retry.max_retries,
-            s.download.retry.delay_secs,
-        )
+        (s.download.core.gh_proxy.clone(), s.download.retry.clone())
+    }) else {
+        error!("应用状态不可用");
+        tray::show_error(hwnd, "操作失败", "应用状态不可用");
+        return;
     };
     spawn_background("bg-update", guard, move || {
         info!("{}", cmd.label);
@@ -248,7 +240,7 @@ fn run_update_command(hwnd: isize, guard: FlagGuard, cmd: UpdateCommand) {
         if let Err(e) = process::stop_all() {
             warn!("更新前终止进程失败: {e}");
         }
-        if let Err(e) = (cmd.run)(&exe_dir, &gh_proxy, max_retries, delay_secs) {
+        if let Err(e) = (cmd.run)(&exe_dir, &gh_proxy, retry.max_retries, retry.delay_secs) {
             error!("更新失败: {e}");
             toast::show_toast("更新失败", &e.to_string());
         }
@@ -261,23 +253,23 @@ fn run_switch_core(guard: FlagGuard, new_mode: CoreMode) {
         if let Err(e) = process::stop_all() {
             warn!("切换核心前终止进程失败: {e}");
         }
-        {
-            let mut app = match app_state::app_state_mut() {
-                Some(a) => a,
-                None => {
-                    error!("应用状态不可用");
-                    toast::show_toast("操作失败", "应用状态不可用");
-                    return;
-                }
-            };
+        let saved = app_state::with_mut_app_state(|app| {
             app.settings.core.mode = new_mode;
-            if let Err(e) = app.settings.save(&app.exe_dir) {
+            let result = app.settings.save(&app.exe_dir);
+            if let Err(e) = &result {
                 error!("保存核心模式失败: {e}");
                 toast::show_toast("操作失败", &e.to_string());
-                return;
+            }
+            result
+        });
+        match saved {
+            Some(Ok(())) => info!("核心模式已切换为: {new_mode:?}"),
+            Some(Err(_)) => {}
+            None => {
+                error!("应用状态不可用");
+                toast::show_toast("操作失败", "应用状态不可用");
             }
         }
-        info!("核心模式已切换为: {new_mode:?}");
     });
 }
 

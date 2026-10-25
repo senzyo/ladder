@@ -12,6 +12,8 @@ pub struct ConfigSelection {
 }
 
 /// 从多个目录中收集所有 .json 文件, 按文件名排序并去重。
+/// 无法读取的目录或条目会被跳过；同名配置保留最先扫描到的路径。
+#[must_use]
 pub fn find_json_configs(dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 

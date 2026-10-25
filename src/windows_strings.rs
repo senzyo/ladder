@@ -3,6 +3,7 @@
 use std::ffi::OsStr;
 
 /// 将字符串转为 null 结尾的 UTF-16 Vec。
+#[must_use]
 pub fn wide(value: &str) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
 

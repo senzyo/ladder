@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use crate::app_error::AppError;
 use crate::core::Core;
@@ -41,13 +41,20 @@ impl AppState {
 }
 
 /// 全局应用状态, 通过 OnceLock + Mutex 实现线程安全的单例。
-pub static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
+static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
+
+/// 安装应用状态。重复初始化时保持原状态并返回错误。
+pub fn initialize(app: AppState) -> Result<(), AppError> {
+    APP.set(Mutex::new(app))
+        .map_err(|_| AppError::Msg("初始化状态失败".into()))
+}
 
 /// 布尔标志的 RAII 守卫: 获取成功即置位, Drop 时清零。
 ///
 /// 用于"同一类操作同时只允许一个"的场景。手工配对 `store(false)` 时, 任何
 /// 一条提前返回路径漏掉释放, 标志就永久置位、对应功能彻底失效; 交给 Drop
 /// 之后, 提前返回、线程结束和闭包被丢弃都会自动释放。
+#[must_use = "必须持有守卫直到操作结束, 丢弃守卫会立即释放标志"]
 pub struct FlagGuard(&'static AtomicBool);
 
 impl FlagGuard {
@@ -80,27 +87,160 @@ pub fn acquire_busy() -> Option<FlagGuard> {
     FlagGuard::acquire(&BUSY)
 }
 
-/// 获取只读应用状态。Mutex 中毒时恢复并继续使用。
-pub fn app_state() -> Option<MutexGuard<'static, AppState>> {
-    Some(APP.get()?.lock().unwrap_or_else(|e| e.into_inner()))
+/// 在锁内只读访问状态, 未初始化时不执行闭包并返回 `None`。
+///
+/// 状态借用不能逃出闭包。闭包内不得再次访问全局状态; 耗时操作应在取得快照后执行。
+pub fn with_app_state<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&AppState) -> R,
+{
+    with_state(&APP, |app| f(app))
 }
 
-/// 获取可变应用状态。语义与 `app_state()` 相同,
-/// Mutex::lock 返回 `MutexGuard` 总是可变的。
-pub fn app_state_mut() -> Option<MutexGuard<'static, AppState>> {
-    app_state()
+/// 在锁内修改状态, 未初始化时不执行闭包并返回 `None`。
+///
+/// 闭包可以移入或取出拥有的值, 但不得再次获取状态锁。设置修改及保存必须在同一次
+/// 访问中完成, 保存失败不回滚内存修改; 调用方负责处理闭包返回的错误。
+pub fn with_mut_app_state<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut AppState) -> R,
+{
+    with_state(&APP, f)
+}
+
+fn with_state<F, R>(state: &OnceLock<Mutex<AppState>>, f: F) -> Option<R>
+where
+    F: FnOnce(&mut AppState) -> R,
+{
+    // R4 仅收口访问接口, 中毒处理由下一批故障策略统一替换。
+    let mut app = state.get()?.lock().unwrap_or_else(|e| e.into_inner());
+    Some(f(&mut app))
 }
 
 /// 获取 exe 所在目录。
 pub fn exe_dir() -> Result<PathBuf, AppError> {
-    app_state()
-        .map(|app| app.exe_dir.clone())
-        .ok_or_else(|| AppError::Msg("应用状态不可用".into()))
+    with_app_state(|app| app.exe_dir.clone()).ok_or_else(|| AppError::Msg("应用状态不可用".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::CoreMode;
+    use std::sync::{TryLockError, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    fn local_state(exe_dir: PathBuf) -> OnceLock<Mutex<AppState>> {
+        OnceLock::from(Mutex::new(AppState {
+            exe_dir,
+            icons: StatusIcons::default(),
+            settings: Settings::default(),
+            child_sing_box: None,
+            child_xray: None,
+        }))
+    }
+
+    #[test]
+    fn test_uninitialized_state_does_not_call_closure() {
+        let state = OnceLock::new();
+        let result = with_state(&state, |_| panic!("未初始化时不得执行状态闭包"));
+        assert!(result.is_none(), "未初始化必须与闭包返回值区分");
+    }
+
+    #[test]
+    fn test_state_closure_moves_owned_values_and_releases_lock() {
+        let state = local_state(PathBuf::new());
+        let directory = PathBuf::from("owned-directory");
+        with_state(&state, |app| app.exe_dir = directory).expect("局部状态应已初始化");
+        let directory = with_state(&state, |app| std::mem::take(&mut app.exe_dir))
+            .expect("应能从闭包取出拥有的值");
+        assert_eq!(directory, PathBuf::from("owned-directory"));
+        let app = state
+            .get()
+            .expect("局部状态应已初始化")
+            .try_lock()
+            .expect("闭包返回后必须释放锁");
+        assert!(app.exe_dir.as_os_str().is_empty(), "取出后原字段应为空");
+    }
+
+    #[test]
+    fn test_state_mutation_and_save_are_serialized() {
+        let directory = tempfile::tempdir().expect("应能创建设置测试目录");
+        let state = local_state(directory.path().to_path_buf());
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (save_tx, save_rx) = mpsc::channel();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let first_state = &state;
+            let first = scope.spawn(move || {
+                with_state(first_state, |app| {
+                    app.settings.core.mode = CoreMode::SingBox;
+                    locked_tx.send(()).expect("主线程应等待持锁信号");
+                    save_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("主线程应允许首次保存");
+                    app.settings.save(&app.exe_dir)
+                })
+                .expect("局部状态应已初始化")
+                .expect("首次设置保存应成功");
+            });
+            locked_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("首个工作线程应已修改状态并持锁");
+            assert!(
+                matches!(
+                    state.get().expect("状态应存在").try_lock(),
+                    Err(TryLockError::WouldBlock)
+                ),
+                "修改后、保存前仍必须持锁"
+            );
+            let second = scope.spawn(|| {
+                waiting_tx.send(()).expect("主线程应等待第二次访问");
+                with_state(&state, |app| {
+                    app.settings.log.max_size_mb = 19;
+                    app.settings.save(&app.exe_dir)
+                })
+                .expect("局部状态应已初始化")
+                .expect("第二次设置保存应成功");
+            });
+            waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("第二个线程应准备访问状态");
+            save_tx.send(()).expect("首个线程应等待保存信号");
+            first.join().expect("首个设置线程不应 panic");
+            second.join().expect("第二个设置线程不应 panic");
+        });
+
+        let saved: Settings = serde_json::from_str(
+            &std::fs::read_to_string(directory.path().join("settings.json"))
+                .expect("应能读取最终设置"),
+        )
+        .expect("保存的设置应可解析");
+        assert_eq!(
+            saved.core.mode,
+            CoreMode::SingBox,
+            "后一次保存必须保留前一次修改, 不能用旧快照覆盖"
+        );
+        assert_eq!(saved.log.max_size_mb, 19);
+    }
+
+    #[test]
+    fn test_state_save_failure_keeps_memory_change_and_returns_error() {
+        let directory = tempfile::tempdir().expect("应能创建设置测试目录");
+        let state = local_state(directory.path().join("missing-parent"));
+        let saved = with_state(&state, |app| {
+            app.settings.core.mode = CoreMode::Both;
+            app.settings.save(&app.exe_dir)
+        })
+        .expect("局部状态应已初始化");
+        assert!(saved.is_err(), "缺失父目录的保存错误必须传出闭包");
+        assert_eq!(
+            with_state(&state, |app| app.settings.core.mode),
+            Some(CoreMode::Both),
+            "保存失败保持已修改的内存状态, 不新增回滚"
+        );
+    }
 
     /// BUSY 是全局状态, 相关断言集中在一个测试里, 避免并行执行时互相干扰。
     #[test]
@@ -113,14 +253,12 @@ mod tests {
 
         // panic 展开时同样释放 (dev profile 是 unwind) , 否则一次后台操作
         // panic 就会永久锁死菜单
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let result = std::panic::catch_unwind(|| {
+        let result = std::thread::spawn(|| {
             let _guard = acquire_busy().expect("panic 测试应能获取");
             panic!("测试用 panic");
-        });
-        std::panic::set_hook(prev_hook);
-        assert!(result.is_err(), "闭包应当 panic");
+        })
+        .join();
+        assert!(result.is_err(), "工作线程应当 panic");
         assert!(acquire_busy().is_some(), "panic 展开后应已释放");
     }
 

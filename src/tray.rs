@@ -41,6 +41,7 @@ use crate::windows_strings;
 use tracing::warn;
 
 /// 三个状态图标的 GDI 位图句柄, 0 表示加载失败。
+#[must_use = "状态图标应保存到应用状态, 并在退出时显式释放"]
 #[derive(Clone, Copy, Default)]
 pub struct StatusIcons {
     pub running: isize,
@@ -50,6 +51,7 @@ pub struct StatusIcons {
 
 impl StatusIcons {
     /// 取进程状态对应的位图句柄。
+    #[must_use]
     pub fn handle_for(self, state: CoreStatus) -> isize {
         match state {
             CoreStatus::Running => self.running,
@@ -78,6 +80,35 @@ pub const WM_TRAY_ICON: u32 = WM_APP + 1;
 const TRAY_UID: u32 = 1;
 
 static TRAY_HWND: OnceLock<isize> = OnceLock::new();
+
+/// 显示菜单前取得的状态快照, 不持有应用状态锁。
+struct MenuSnapshot {
+    exe_dir: PathBuf,
+    icons: StatusIcons,
+    core_mode: CoreMode,
+}
+
+/// 菜单关闭后的选择及对应的候选配置, ID 为 0 表示没有选择命令。
+#[must_use]
+#[derive(Default)]
+struct MenuSelection {
+    command_id: u16,
+    config_selections: HashMap<u16, ConfigSelection>,
+}
+
+/// 单核菜单使用的核心身份及命令 ID。
+struct CoreMenuItems {
+    core: Core,
+    restart_id: u16,
+    stop_id: u16,
+    update_id: u16,
+    config_base: u16,
+}
+
+enum MenuItemState {
+    Enabled,
+    Disabled,
+}
 
 // 菜单 ID 分段规划: 101-199 重启, 201-299 终止, 301-399 更新, 999 退出,
 // 1000-1999 sing-box 配置, 2000-2999 xray 配置。
@@ -245,6 +276,7 @@ pub unsafe fn load_status_icons(exe_dir: &Path) -> StatusIcons {
 /// 流程: LoadImageW 加载 ICO → 创建兼容 DC → 创建 DIB Section →
 /// DrawIconEx 绘制到位图 → 清理中间资源 → 返回位图句柄。
 /// 菜单项需要位图句柄 (而非图标句柄) 来显示状态图标。
+#[must_use = "加载成功的位图需要保存并显式释放"]
 pub(crate) unsafe fn load_icon_bitmap(exe_dir: &Path, icon_name: &str) -> isize {
     unsafe {
         let icon_path = exe_dir.join("icons").join(icon_name);
@@ -328,12 +360,12 @@ unsafe extern "system" fn wnd_proc(
             WM_TRAY_ICON => {
                 let event = lparam.0 as u32;
                 if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
-                    let (selected, config_selections) = show_tray_menu(hwnd);
-                    if selected != 0 {
+                    let selection = show_tray_menu(hwnd);
+                    if selection.command_id != 0 {
                         commands::execute_menu_command(
                             hwnd.0 as isize,
-                            selected,
-                            &config_selections,
+                            selection.command_id,
+                            &selection.config_selections,
                         );
                     }
                 }
@@ -394,14 +426,19 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 /// 菜单根据当前核心模式 (xray / sing-box / both) 动态构建。
 /// Mutex 仅在读取状态时持有, TrackPopupMenu 在锁外执行,
 /// 避免模态消息循环重入窗口过程时因 Mutex 不可重入导致死锁。
-unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigSelection>) {
+unsafe fn show_tray_menu(hwnd: HWND) -> MenuSelection {
     unsafe {
-        let (exe_dir, icons, core_mode) = {
-            let app = match app_state::app_state() {
-                Some(app) => app,
-                None => return (0, HashMap::new()),
-            };
-            (app.exe_dir.clone(), app.icons, app.settings.core.mode)
+        let Some(MenuSnapshot {
+            exe_dir,
+            icons,
+            core_mode,
+        }) = app_state::with_app_state(|app| MenuSnapshot {
+            exe_dir: app.exe_dir.clone(),
+            icons: app.icons,
+            core_mode: app.settings.core.mode,
+        })
+        else {
+            return MenuSelection::default();
         };
 
         // 锁已释放才做状态查询: 进程快照和文件存在性检查都是几十毫秒级的
@@ -409,7 +446,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigSelection>) {
         let states = process::core_states(&exe_dir);
 
         let Ok(menu) = CreatePopupMenu() else {
-            return (0, HashMap::new());
+            return MenuSelection::default();
         };
 
         let status_label = |s: CoreStatus, name: &str| match s {
@@ -480,35 +517,35 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigSelection>) {
             append_submenu(menu, xray_menu, "切换 xray 配置");
         } else {
             // 单核模式: 操作项为直接可点击的一级菜单
-            let (restart_id, stop_id, update_id, core, config_base) = if core_mode.runs_xray() {
-                (
-                    ID_RESTART_XRAY,
-                    ID_STOP_XRAY,
-                    ID_UPDATE_XRAY,
-                    Core::Xray,
-                    ID_XRAY_CONFIG_BASE,
-                )
+            let items = if core_mode.runs_xray() {
+                CoreMenuItems {
+                    core: Core::Xray,
+                    restart_id: ID_RESTART_XRAY,
+                    stop_id: ID_STOP_XRAY,
+                    update_id: ID_UPDATE_XRAY,
+                    config_base: ID_XRAY_CONFIG_BASE,
+                }
             } else {
-                (
-                    ID_RESTART_SING,
-                    ID_STOP_SING,
-                    ID_UPDATE_SING,
-                    Core::SingBox,
-                    ID_SING_CONFIG_BASE,
-                )
+                CoreMenuItems {
+                    core: Core::SingBox,
+                    restart_id: ID_RESTART_SING,
+                    stop_id: ID_STOP_SING,
+                    update_id: ID_UPDATE_SING,
+                    config_base: ID_SING_CONFIG_BASE,
+                }
             };
 
-            append_item(menu, restart_id, "重新启动");
-            append_item(menu, stop_id, "终止运行");
-            append_item(menu, update_id, "更新核心");
+            append_item(menu, items.restart_id, "重新启动");
+            append_item(menu, items.stop_id, "终止运行");
+            append_item(menu, items.update_id, "更新核心");
 
             let config_menu = new_submenu();
             append_config_items(
                 &mut config_selections,
                 config_menu,
-                core,
-                config_base,
-                &[core.config_dir(&exe_dir)],
+                items.core,
+                items.config_base,
+                &[items.core.config_dir(&exe_dir)],
             );
             append_submenu(menu, config_menu, "切换配置");
         }
@@ -520,19 +557,31 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigSelection>) {
             switch_menu,
             ID_SWITCH_CORE_XRAY,
             "仅用 xray",
-            core_mode == CoreMode::Xray,
+            if core_mode == CoreMode::Xray {
+                MenuItemState::Disabled
+            } else {
+                MenuItemState::Enabled
+            },
         );
         append_item_or_disabled(
             switch_menu,
             ID_SWITCH_CORE_SING,
             "仅用 sing-box",
-            core_mode == CoreMode::SingBox,
+            if core_mode == CoreMode::SingBox {
+                MenuItemState::Disabled
+            } else {
+                MenuItemState::Enabled
+            },
         );
         append_item_or_disabled(
             switch_menu,
             ID_SWITCH_CORE_BOTH,
             "全部启用",
-            core_mode == CoreMode::Both,
+            if core_mode == CoreMode::Both {
+                MenuItemState::Disabled
+            } else {
+                MenuItemState::Enabled
+            },
         );
         append_submenu(menu, switch_menu, "切换核心");
         append_item(menu, ID_OPEN_DIR, "打开程序目录");
@@ -555,10 +604,14 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigSelection>) {
 
         let _ = DestroyMenu(menu);
 
-        (selected.0 as u16, config_selections)
+        MenuSelection {
+            command_id: selected.0 as u16,
+            config_selections,
+        }
     }
 }
 
+#[must_use]
 fn new_submenu() -> HMENU {
     unsafe { CreatePopupMenu().unwrap_or_default() }
 }
@@ -583,16 +636,18 @@ unsafe fn append_disabled_item(menu: HMENU, label: &str) {
     }
 }
 
-/// 添加菜单项, `disabled` 为 true 时灰掉禁用。
-unsafe fn append_item_or_disabled(menu: HMENU, id: u16, label: &str, disabled: bool) {
+/// 添加菜单项, 禁用时灰显且不分配命令 ID。
+unsafe fn append_item_or_disabled(menu: HMENU, id: u16, label: &str, state: MenuItemState) {
     unsafe {
         let w = windows_strings::wide(label);
-        let flags = if disabled {
-            MF_STRING | MF_GRAYED
-        } else {
-            MF_STRING
+        let flags = match state {
+            MenuItemState::Enabled => MF_STRING,
+            MenuItemState::Disabled => MF_STRING | MF_GRAYED,
         };
-        let item_id = if disabled { 0 } else { id as usize };
+        let item_id = match state {
+            MenuItemState::Enabled => id as usize,
+            MenuItemState::Disabled => 0,
+        };
         let _ = AppendMenuW(menu, flags, item_id, PCWSTR(w.as_ptr()));
     }
 }
@@ -643,7 +698,8 @@ unsafe fn append_config_items(
     unsafe {
         let mut added = 0;
 
-        for (id, path) in (base_id..).zip(config_selection::find_json_configs(dirs)) {
+        let config_items = (base_id..).zip(config_selection::find_json_configs(dirs));
+        for (id, path) in config_items {
             if id >= base_id + 900 {
                 break;
             }
@@ -667,6 +723,7 @@ unsafe fn append_config_items(
 /// 将字符串转为 UTF-16 并填充到固定长度缓冲区。
 /// `N` 是缓冲区长度 (含 null 终止符) , 超出部分被截断。
 /// NOTIFYICONDATAW.szTip 要求 128 个 u16 的固定长度数组。
+/// 调用方须保证 `N > 0`, 为 null 终止符保留空间。
 fn to_wide_padded<const N: usize>(s: &str) -> [u16; N] {
     let mut buf = [0u16; N];
     let wide: Vec<u16> = s.encode_utf16().collect();

@@ -79,6 +79,20 @@ const XRAY_ZIP_NAME: &str = if cfg!(target_arch = "aarch64") {
     "Xray-windows-64.zip"
 };
 
+/// 已选定发行版的版本号和资产列表, 保留 GitHub 资产字段供下载时读取。
+#[derive(Debug)]
+struct ReleaseInfo {
+    version: String,
+    assets: Vec<Value>,
+}
+
+/// 下载所需的地址与校验值, 避免两个字符串的位置含义混淆。
+#[derive(Debug)]
+struct DownloadAsset {
+    url: String,
+    expected_hash: String,
+}
+
 /// 依次更新 sing-box 和 xray。
 pub fn update_cores(
     exe_dir: &Path,
@@ -100,7 +114,10 @@ pub fn update_sing_box(
     let exe_path = Core::SingBox.exe_path(exe_dir);
 
     let local = get_local_version(&exe_path, "version");
-    let (remote_ver, assets) = fetch_sing_box_release()?;
+    let ReleaseInfo {
+        version: remote_ver,
+        assets,
+    } = fetch_sing_box_release()?;
     debug!("[sing-box] 版本比较: local={local}, remote={remote_ver}");
 
     if !is_newer(&local, &remote_ver) {
@@ -115,7 +132,10 @@ pub fn update_sing_box(
     );
     let zip_path = exe_dir.join(&zip_name);
 
-    let (download_url, expected_hash) = find_asset(&assets, &zip_name)?;
+    let DownloadAsset {
+        url: download_url,
+        expected_hash,
+    } = find_asset(&assets, &zip_name)?;
     debug!("[sing-box] 下载链接: {download_url}, SHA256: {expected_hash}");
 
     crate::toast::show_toast("sing-box", &format!("检测到新版本 v{remote_ver}"));
@@ -159,7 +179,10 @@ pub fn update_xray(
     let exe_path = Core::Xray.exe_path(exe_dir);
 
     let local = get_local_version(&exe_path, "version");
-    let (remote_ver, assets) = fetch_xray_release(XRAY_ZIP_NAME)?;
+    let ReleaseInfo {
+        version: remote_ver,
+        assets,
+    } = fetch_xray_release(XRAY_ZIP_NAME)?;
     debug!("[xray] 版本比较: local={local}, remote={remote_ver}");
 
     if !is_newer(&local, &remote_ver) {
@@ -171,7 +194,10 @@ pub fn update_xray(
     let zip_name = XRAY_ZIP_NAME;
     let zip_path = exe_dir.join(zip_name);
 
-    let (download_url, expected_hash) = find_asset(&assets, zip_name)?;
+    let DownloadAsset {
+        url: download_url,
+        expected_hash,
+    } = find_asset(&assets, zip_name)?;
     debug!("[xray] 下载链接: {download_url}, SHA256: {expected_hash}");
 
     crate::toast::show_toast("xray", &format!("检测到新版本 v{remote_ver}"));
@@ -208,6 +234,7 @@ pub fn update_xray(
 /// 必须用 `hidden_command`: sing-box 和 xray 都是控制台程序, release 构建的
 /// 本程序是 GUI 子系统, 用裸 Command 启动会分配新控制台, 每次检查版本闪一次
 /// 黑窗。debug 构建有控制台可继承, 因此这个问题只在 release 下可见。
+#[must_use]
 pub(crate) fn get_local_version(exe_path: &Path, version_arg: &str) -> String {
     let output = match crate::process::hidden_command(exe_path)
         .arg(version_arg)
@@ -261,6 +288,7 @@ fn extract_version(text: &str) -> Option<String> {
 
 /// 比较两个版本号, remote > local 时返回 true。
 /// 缺失的段按 0 处理, 因此 "1.0" 等价于 "1.0.0"。
+#[must_use]
 fn is_newer(local: &str, remote: &str) -> bool {
     let local: Vec<u32> = local.split('.').filter_map(|s| s.parse().ok()).collect();
     let remote: Vec<u32> = remote.split('.').filter_map(|s| s.parse().ok()).collect();
@@ -279,7 +307,7 @@ fn is_newer(local: &str, remote: &str) -> bool {
 }
 
 /// 调用 GitHub Releases API 获取 sing-box 最新正式版的版本号和 assets 列表。
-fn fetch_sing_box_release() -> Result<(String, Vec<Value>), AppError> {
+fn fetch_sing_box_release() -> Result<ReleaseInfo, AppError> {
     let api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
     debug!("请求 GitHub API: {api_url}");
     let body =
@@ -288,22 +316,26 @@ fn fetch_sing_box_release() -> Result<(String, Vec<Value>), AppError> {
     let json: Value = serde_json::from_str(&body)
         .map_err(|e| AppError::Msg(format!("解析 GitHub API 响应失败: {e}")))?;
 
-    let tag = json["tag_name"]
+    parse_release(&json)
+}
+
+/// 读取选定发行版。缺少 tag 是错误; 缺失或非数组的 assets 仍按空列表处理。
+fn parse_release(release: &Value) -> Result<ReleaseInfo, AppError> {
+    let tag = release["tag_name"]
         .as_str()
-        .ok_or(AppError::Msg("GitHub API 响应缺少 tag_name".into()))?
-        .to_string();
+        .ok_or(AppError::Msg("GitHub API 响应缺少 tag_name".into()))?;
 
     let version = tag.trim_start_matches('v').to_string();
-    let assets: Vec<Value> = json["assets"].as_array().cloned().unwrap_or_default();
+    let assets = release["assets"].as_array().cloned().unwrap_or_default();
 
     debug!("GitHub API 响应: tag={tag}, assets 数量={}", assets.len());
-    Ok((version, assets))
+    Ok(ReleaseInfo { version, assets })
 }
 
 /// 调用 GitHub Releases API 获取 xray 最新版本（含 pre-release）的版本号和 assets 列表。
 ///
 /// 遍历 `/releases` 返回的列表，跳过 draft，返回第一个包含 `zip_name` 的 release。
-fn fetch_xray_release(zip_name: &str) -> Result<(String, Vec<Value>), AppError> {
+fn fetch_xray_release(zip_name: &str) -> Result<ReleaseInfo, AppError> {
     let api_url = "https://api.github.com/repos/XTLS/Xray-core/releases";
     debug!("请求 GitHub API: {api_url}");
     let body =
@@ -312,19 +344,21 @@ fn fetch_xray_release(zip_name: &str) -> Result<(String, Vec<Value>), AppError> 
     let releases: Vec<Value> = serde_json::from_str(&body)
         .map_err(|e| AppError::Msg(format!("解析 GitHub API 响应失败: {e}")))?;
 
-    for release in &releases {
+    select_xray_release(&releases, zip_name)
+}
+
+/// 按 API 顺序选第一个非草稿且包含目标资产的发行版, 不跳过其缺失 tag 的错误。
+fn select_xray_release(releases: &[Value], zip_name: &str) -> Result<ReleaseInfo, AppError> {
+    for release in releases {
         if release["draft"].as_bool() == Some(true) {
             continue;
         }
-        let assets = release["assets"].as_array().cloned().unwrap_or_default();
+        let assets = release["assets"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if assets.iter().any(|a| a["name"].as_str() == Some(zip_name)) {
-            let tag = release["tag_name"]
-                .as_str()
-                .ok_or(AppError::Msg("GitHub API 响应缺少 tag_name".into()))?
-                .to_string();
-            let version = tag.trim_start_matches('v').to_string();
-            debug!("GitHub API 响应: tag={tag}, assets 数量={}", assets.len());
-            return Ok((version, assets));
+            return parse_release(release);
         }
     }
 
@@ -334,7 +368,7 @@ fn fetch_xray_release(zip_name: &str) -> Result<(String, Vec<Value>), AppError> 
 /// 从 release assets 中查找指定文件名的下载 URL 和 digest 哈希值。
 ///
 /// 未找到文件或 digest 缺失时返回错误。
-fn find_asset(assets: &[Value], file_name: &str) -> Result<(String, String), AppError> {
+fn find_asset(assets: &[Value], file_name: &str) -> Result<DownloadAsset, AppError> {
     let asset = assets
         .iter()
         .find(|a| a["name"].as_str() == Some(file_name))
@@ -354,7 +388,10 @@ fn find_asset(assets: &[Value], file_name: &str) -> Result<(String, String), App
         .ok_or_else(|| AppError::Msg(format!("digest 格式无效: {digest}")))?
         .to_string();
 
-    Ok((url, hash))
+    Ok(DownloadAsset {
+        url,
+        expected_hash: hash,
+    })
 }
 
 /// 带重试的下载。启用代理时将代理 URL 前缀拼接到下载链接。
@@ -489,6 +526,7 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
 /// 把字节序列编码成小写十六进制字符串。
 ///
 /// 逐字节 `format!` 会为每个字节分配一个 String, 这里一次分配到位。
+#[must_use]
 fn to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -704,6 +742,7 @@ fn replace_failed(
 ///
 /// 按与替换相反的顺序恢复。已经换成新版的文件也会被还原, 因此回滚成功后整个
 /// 核心目录回到更新前的状态, 不会留下版本错配的组合。
+#[must_use = "必须报告未能恢复的文件"]
 fn rollback(core_dir: &Path, renamed: &[(&str, PathBuf)]) -> Vec<String> {
     let mut unrecovered = Vec::new();
     for (name, old) in renamed.iter().rev() {
@@ -720,7 +759,8 @@ fn rollback(core_dir: &Path, renamed: &[(&str, PathBuf)]) -> Vec<String> {
 
 /// 删除清单内文件的指定后缀副本。
 fn remove_suffixed(core_dir: &Path, artifacts: &CoreArtifacts, suffix: &str) {
-    for name in artifacts.required.iter().chain(artifacts.optional) {
+    let names = artifacts.required.iter().chain(artifacts.optional);
+    for name in names {
         let path = core_dir.join(format!("{name}.{suffix}"));
         if !path.exists() {
             continue;
@@ -745,6 +785,7 @@ fn remove_suffixed(core_dir: &Path, artifacts: &CoreArtifacts, suffix: &str) {
 /// 4. 校验通过后移动到 `xray_core/{name}.dat`
 ///
 /// 返回成功更新的规则集名称列表 (供调用方更新 `last_update`) 。
+#[must_use = "成功更新的条目需要保存更新时间"]
 pub fn update_ruleset(
     exe_dir: &Path,
     ruleset: &Ruleset,
@@ -1161,6 +1202,140 @@ mod tests {
 
         assert_download_timeout(result, "下载失败:");
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn test_parse_release_preserves_version_and_assets() {
+        let json = serde_json::json!({
+            "tag_name": "vv1.2.3-beta",
+            "assets": [{
+                "name": "core.zip",
+                "browser_download_url": "https://example.invalid/core.zip",
+                "digest": "sha256:AbCd"
+            }]
+        });
+
+        let release = parse_release(&json).expect("有效发行版应返回具名结果");
+
+        assert_eq!(release.version, "1.2.3-beta");
+        assert_eq!(
+            release.assets.as_slice(),
+            json["assets"].as_array().expect("测试资产是数组")
+        );
+        let asset = find_asset(&release.assets, "core.zip").expect("发行版中应能找到目标资产");
+        assert_eq!(asset.url, "https://example.invalid/core.zip");
+        assert_eq!(asset.expected_hash, "AbCd");
+    }
+
+    #[test]
+    fn test_parse_release_keeps_missing_field_behavior() {
+        for json in [
+            serde_json::json!({"tag_name": "v1.0"}),
+            serde_json::json!({"tag_name": "v1.0", "assets": null}),
+            serde_json::json!({"tag_name": "v1.0", "assets": {}}),
+        ] {
+            let release = parse_release(&json).expect("非数组资产仍按空列表处理");
+            assert_eq!(release.version, "1.0");
+            assert!(release.assets.is_empty(), "缺失或非数组资产应为空: {json}");
+        }
+        let error =
+            parse_release(&serde_json::json!({"assets": []})).expect_err("缺少 tag_name 必须报错");
+        assert_eq!(error.to_string(), "GitHub API 响应缺少 tag_name");
+    }
+
+    #[test]
+    fn test_select_xray_release_keeps_first_matching_non_draft() {
+        let releases = [
+            serde_json::json!({"draft": true, "assets": [{"name": "core.zip"}]}),
+            serde_json::json!({"assets": [{"name": "other.zip"}]}),
+            serde_json::json!({"tag_name": "v4.0", "assets": null}),
+            serde_json::json!({
+                "tag_name": "v3.0-beta", "prerelease": true,
+                "assets": [{"name": "core.zip", "digest": "sha256:first"}]
+            }),
+            serde_json::json!({
+                "tag_name": "v2.0", "draft": false,
+                "assets": [{"name": "core.zip", "digest": "sha256:later"}]
+            }),
+        ];
+
+        let release = select_xray_release(&releases, "core.zip")
+            .expect("应跳过草稿和无目标资产的发行版, 接受预发布版本");
+
+        assert_eq!(release.version, "3.0-beta");
+        assert_eq!(release.assets[0]["digest"], "sha256:first");
+        let error = select_xray_release(&releases, "missing.zip")
+            .expect_err("所有发行版均不含目标文件时应报错");
+        assert_eq!(error.to_string(), "未找到包含 missing.zip 的 release");
+    }
+
+    #[test]
+    fn test_select_xray_release_does_not_skip_missing_tag() {
+        let releases = [
+            serde_json::json!({"assets": [{"name": "core.zip"}]}),
+            serde_json::json!({"tag_name": "v2.0", "assets": [{"name": "core.zip"}]}),
+        ];
+
+        let error = select_xray_release(&releases, "core.zip")
+            .expect_err("首个匹配发行版缺少 tag 时不能静默选择后续版本");
+
+        assert_eq!(error.to_string(), "GitHub API 响应缺少 tag_name");
+    }
+
+    #[test]
+    fn test_find_asset_keeps_digest_tolerance() {
+        for (digest, expected_hash) in [
+            ("sha256:AbCd", "AbCd"),
+            ("raw-hash", "raw-hash"),
+            ("prefix:extra:last", "last"),
+            ("sha256:", ""),
+            ("", ""),
+        ] {
+            let assets = [serde_json::json!({
+                "name": "core.zip",
+                "browser_download_url": "https://example.invalid/core.zip",
+                "digest": digest
+            })];
+
+            let asset = find_asset(&assets, "core.zip")
+                .expect("digest 仍按最后一个冒号后的字符串读取, 不新增严格校验");
+
+            assert_eq!(asset.url, "https://example.invalid/core.zip");
+            assert_eq!(asset.expected_hash, expected_hash, "digest={digest:?}");
+        }
+    }
+
+    #[test]
+    fn test_find_asset_keeps_first_match_and_required_fields() {
+        let cases = [
+            (
+                serde_json::json!({"name": "other.zip"}),
+                "未找到发布文件: core.zip",
+            ),
+            (
+                serde_json::json!({"name": "core.zip"}),
+                "发布文件缺少下载链接: core.zip",
+            ),
+            (
+                serde_json::json!({"name": "core.zip", "browser_download_url": "url"}),
+                "发布文件缺少 digest: core.zip",
+            ),
+        ];
+        for (asset, expected_error) in cases {
+            let error =
+                find_asset(&[asset], "core.zip").expect_err("缺少目标资产或必需字段时应保留错误");
+            assert_eq!(error.to_string(), expected_error);
+        }
+
+        let assets = [
+            serde_json::json!({"name": "core.zip"}),
+            serde_json::json!({
+                "name": "core.zip", "browser_download_url": "later", "digest": "sha256:later"
+            }),
+        ];
+        let error =
+            find_asset(&assets, "core.zip").expect_err("首个同名资产缺少字段时不能改选后续资产");
+        assert_eq!(error.to_string(), "发布文件缺少下载链接: core.zip");
     }
 
     #[test]

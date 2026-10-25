@@ -19,6 +19,7 @@ const SINGLE_INSTANCE_MUTEX: &str = "Global\\Ladder.SingleInstance";
 /// 第一个实例创建命名互斥体并持有句柄; 后续实例创建同一互斥体时
 /// 收到 ERROR_ALREADY_EXISTS, 据此判定已存在运行中的实例。
 /// 句柄在 Drop 时关闭, 进程异常退出时内核也会自动释放互斥体, 无残留锁。
+#[must_use = "应用运行期间必须持有单实例守卫"]
 pub(crate) struct SingleInstanceGuard {
     handle: HANDLE,
 }

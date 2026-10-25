@@ -42,6 +42,7 @@ unsafe extern "system" {
 }
 
 /// 创建不显示控制台窗口的子进程 Command。
+#[must_use]
 pub fn hidden_command(program: impl AsRef<OsStr>) -> Command {
     use std::os::windows::process::CommandExt;
 
@@ -94,6 +95,7 @@ fn for_each_process(mut visit: impl FnMut(&str, u32) -> bool) {
 }
 
 /// 通过 Win32 ToolHelp API 枚举所有与 `exe_name` 匹配的进程, 返回 PID 列表。
+#[must_use]
 pub fn find_pids_by_name(exe_name: &str) -> Vec<u32> {
     let mut pids = Vec::new();
     for_each_process(|name, pid| {
@@ -109,10 +111,12 @@ pub fn find_pids_by_name(exe_name: &str) -> Vec<u32> {
 ///
 /// 每个名字单独枚举一遍是纯粹的浪费: CreateToolhelp32Snapshot 要复制整张
 /// 进程表, 进程多的机器上单次就要几十毫秒。全部命中后提前结束遍历。
+#[must_use]
 pub fn running_flags<const N: usize>(names: &[&str; N]) -> [bool; N] {
     let mut found = [false; N];
     for_each_process(|name, _| {
-        for (flag, target) in found.iter_mut().zip(names) {
+        let targets = found.iter_mut().zip(names);
+        for (flag, target) in targets {
             if !*flag && name.eq_ignore_ascii_case(target) {
                 *flag = true;
             }
@@ -123,6 +127,7 @@ pub fn running_flags<const N: usize>(names: &[&str; N]) -> [bool; N] {
 }
 
 /// 两个核心的安装与运行状态。
+#[must_use]
 pub struct CoreStates {
     pub sing_box: CoreStatus,
     pub xray: CoreStatus,
@@ -171,7 +176,8 @@ fn forward_stderr(child: &mut Child, label: &str) {
         let name = format!("stderr-{label}");
         let _ = Builder::new().name(name).spawn(move || {
             let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
+            let lines = reader.lines().map_while(Result::ok);
+            for line in lines {
                 warn!("[{label}] {line}");
             }
         });
@@ -200,9 +206,7 @@ pub fn start_sing_box_at(exe_dir: &Path) -> Result<(), AppError> {
         .spawn()
         .map_err(|e| AppError::Msg(format!("启动 sing-box 失败: {e}")))?;
     forward_stderr(&mut child, core.label());
-    if let Some(mut app) = app_state::app_state_mut() {
-        app.set_child(core, child);
-    }
+    let _ = app_state::with_mut_app_state(|app| app.set_child(core, child));
 
     Ok(())
 }
@@ -253,9 +257,7 @@ pub fn start_xray_at(exe_dir: &Path) -> Result<(), AppError> {
     }
 
     forward_stderr(&mut child, core.label());
-    if let Some(mut app) = app_state::app_state_mut() {
-        app.set_child(core, child);
-    }
+    let _ = app_state::with_mut_app_state(|app| app.set_child(core, child));
 
     Ok(())
 }
@@ -286,13 +288,13 @@ pub fn kill_cores_without_state() {
 /// 再通过进程名枚举兜底 (覆盖其他来源启动的同名进程) 。
 pub fn stop_processes(cores: &[Core]) -> Result<(), AppError> {
     // 阶段 1: 从 mutex 中取出 Child 句柄 (持锁时间极短)
-    let children: Vec<(Core, Option<Child>)> = match app_state::app_state_mut() {
-        Some(mut app) => cores
+    let children: Vec<(Core, Option<Child>)> = app_state::with_mut_app_state(|app| {
+        cores
             .iter()
             .map(|&core| (core, app.take_child(core)))
-            .collect(),
-        None => cores.iter().map(|&core| (core, None)).collect(),
-    };
+            .collect()
+    })
+    .unwrap_or_else(|| cores.iter().map(|&core| (core, None)).collect());
     // 阶段 2: kill (锁已释放, 不阻塞其他线程)
     for (core, child) in children {
         if let Some(mut c) = child {
@@ -336,6 +338,7 @@ static RULESET_UPDATING: AtomicBool = AtomicBool::new(false);
 /// 查询规则集更新标志。
 ///
 /// 供更新核心前的互斥检查使用: 两者都是几十 MB 的下载, 不并行抢带宽。
+#[must_use]
 pub fn ruleset_updating() -> bool {
     RULESET_UPDATING.load(Ordering::SeqCst)
 }
@@ -370,30 +373,27 @@ fn spawn_ruleset_update() {
 /// 分两阶段获取锁: 下载前克隆数据释放锁, 下载完成后再获取锁更新 `last_update`,
 /// 避免长时间持锁阻塞托盘菜单。
 fn run_ruleset_update() {
-    let (exe_dir, ruleset, max_retries, delay_secs) = {
-        let app = match app_state::app_state() {
-            Some(a) => a,
-            None => return,
-        };
+    let Some((exe_dir, ruleset, retry)) = app_state::with_app_state(|app| {
         (
             app.exe_dir.clone(),
             app.settings.download.ruleset.clone(),
-            app.settings.download.retry.max_retries,
-            app.settings.download.retry.delay_secs,
+            app.settings.download.retry.clone(),
         )
+    }) else {
+        return;
     };
 
     debug!("[ruleset] 等待 5 秒让网络就绪...");
     thread::sleep(Duration::from_secs(5));
 
-    let updated = update::update_ruleset(&exe_dir, &ruleset, max_retries, delay_secs);
+    let updated = update::update_ruleset(&exe_dir, &ruleset, retry.max_retries, retry.delay_secs);
 
     if !updated.is_empty() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if let Some(mut app) = app_state::app_state_mut() {
+        let _ = app_state::with_mut_app_state(|app| {
             for name in &updated {
                 if let Some(entry) = app.settings.download.ruleset.entries.get_mut(name) {
                     entry.last_update = Some(now);
@@ -402,7 +402,7 @@ fn run_ruleset_update() {
             if let Err(e) = app.settings.save(&exe_dir) {
                 warn!("[ruleset] 保存配置失败: {e}");
             }
-        }
+        });
     }
 }
 
