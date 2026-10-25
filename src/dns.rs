@@ -38,7 +38,8 @@ struct PhysicalAdapter {
 /// 这与 `Get-NetAdapter -Physical` 使用相同的检测机制。
 fn get_physical_adapters() -> Vec<PhysicalAdapter> {
     let mut adapters = Vec::new();
-    let mut table_ptr: *mut windows::Win32::NetworkManagement::IpHelper::MIB_IF_TABLE2 = std::ptr::null_mut();
+    let mut table_ptr: *mut windows::Win32::NetworkManagement::IpHelper::MIB_IF_TABLE2 =
+        std::ptr::null_mut();
 
     let result = unsafe { GetIfTable2(&mut table_ptr) };
     if result != NO_ERROR || table_ptr.is_null() {
@@ -68,7 +69,11 @@ fn get_physical_adapters() -> Vec<PhysicalAdapter> {
         }
 
         // 提取接口别名 (UTF-16 字符串)
-        let alias_end = row.Alias.iter().position(|&c| c == 0).unwrap_or(row.Alias.len());
+        let alias_end = row
+            .Alias
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(row.Alias.len());
         let alias = String::from_utf16_lossy(&row.Alias[..alias_end]);
 
         // 提取接口 GUID
@@ -159,7 +164,11 @@ fn set_registry_name_server(reg_path: &str, value: &str, alias: &str, protocol: 
             if let Err(e) = key.set_string("NameServer", value) {
                 warn!("设置 {alias} 的 {protocol} DNS 失败: {e}");
             } else {
-                let display_value = if value.is_empty() { "DHCP 自动获取" } else { value };
+                let display_value = if value.is_empty() {
+                    "DHCP 自动获取"
+                } else {
+                    value
+                };
                 debug!("已设置 {alias} 的 {protocol} DNS 为 '{display_value}'");
             }
         }

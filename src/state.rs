@@ -116,13 +116,13 @@ impl CoreArtifacts {
 }
 
 #[derive(Clone)]
-pub struct ConfigAction {
+pub struct ConfigSelection {
     pub core: Core,
     pub path: PathBuf,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum ProcessState {
+pub enum CoreStatus {
     NotInstalled,
     NotRunning,
     Running,
@@ -138,11 +138,11 @@ pub struct StatusIcons {
 
 impl StatusIcons {
     /// 取进程状态对应的位图句柄。
-    pub fn handle_for(self, state: ProcessState) -> isize {
+    pub fn handle_for(self, state: CoreStatus) -> isize {
         match state {
-            ProcessState::Running => self.running,
-            ProcessState::NotRunning => self.not_running,
-            ProcessState::NotInstalled => self.not_installed,
+            CoreStatus::Running => self.running,
+            CoreStatus::NotRunning => self.not_running,
+            CoreStatus::NotInstalled => self.not_installed,
         }
     }
 
@@ -352,8 +352,8 @@ pub fn running_flags<const N: usize>(names: &[&str; N]) -> [bool; N] {
 
 /// 两个核心的安装与运行状态。
 pub struct CoreStates {
-    pub sing_box: ProcessState,
-    pub xray: ProcessState,
+    pub sing_box: CoreStatus,
+    pub xray: CoreStatus,
 }
 
 /// 查询两个核心的安装与运行状态。
@@ -362,7 +362,8 @@ pub struct CoreStates {
 /// 毫秒级的系统调用, 调用方应当先从 Mutex 里复制出 exe_dir、释放锁, 再调用
 /// 本函数, 否则打开托盘菜单期间会一直持锁, 阻塞需要写状态的后台线程。
 pub fn core_states(exe_dir: &Path) -> CoreStates {
-    let [sing_box_installed, xray_installed] = Core::ALL.map(|core| core.exe_path(exe_dir).exists());
+    let [sing_box_installed, xray_installed] =
+        Core::ALL.map(|core| core.exe_path(exe_dir).exists());
 
     // 两个核心都没装就不必枚举进程
     let [sing_box_running, xray_running] = if sing_box_installed || xray_installed {
@@ -372,16 +373,16 @@ pub fn core_states(exe_dir: &Path) -> CoreStates {
     };
 
     CoreStates {
-        sing_box: process_state(sing_box_installed, sing_box_running),
-        xray: process_state(xray_installed, xray_running),
+        sing_box: core_status(sing_box_installed, sing_box_running),
+        xray: core_status(xray_installed, xray_running),
     }
 }
 
-fn process_state(installed: bool, running: bool) -> ProcessState {
+fn core_status(installed: bool, running: bool) -> CoreStatus {
     match (installed, running) {
-        (false, _) => ProcessState::NotInstalled,
-        (true, true) => ProcessState::Running,
-        (true, false) => ProcessState::NotRunning,
+        (false, _) => CoreStatus::NotInstalled,
+        (true, true) => CoreStatus::Running,
+        (true, false) => CoreStatus::NotRunning,
     }
 }
 
@@ -454,11 +455,14 @@ mod tests {
     }
 
     #[test]
-    fn test_process_state_mapping() {
-        assert!(matches!(process_state(false, false), ProcessState::NotInstalled));
-        assert!(matches!(process_state(false, true), ProcessState::NotInstalled));
-        assert!(matches!(process_state(true, false), ProcessState::NotRunning));
-        assert!(matches!(process_state(true, true), ProcessState::Running));
+    fn test_core_status_mapping() {
+        assert!(matches!(
+            core_status(false, false),
+            CoreStatus::NotInstalled
+        ));
+        assert!(matches!(core_status(false, true), CoreStatus::NotInstalled));
+        assert!(matches!(core_status(true, false), CoreStatus::NotRunning));
+        assert!(matches!(core_status(true, true), CoreStatus::Running));
     }
 
     /// 这些路径是 Release 目录结构的一部分, 改动会破坏已有安装, 钉在测试里。
@@ -466,11 +470,23 @@ mod tests {
     fn test_core_paths() {
         let base = Path::new("base");
 
-        assert_eq!(Core::SingBox.exe_path(base), base.join("sing-box_core/sing-box.exe"));
+        assert_eq!(
+            Core::SingBox.exe_path(base),
+            base.join("sing-box_core/sing-box.exe")
+        );
         assert_eq!(Core::Xray.exe_path(base), base.join("xray_core/xray.exe"));
-        assert_eq!(Core::SingBox.active_config(base), base.join("configs/sing-box.json"));
-        assert_eq!(Core::Xray.active_config(base), base.join("configs/xray.json"));
-        assert_eq!(Core::SingBox.config_dir(base), base.join("configs/sing-box"));
+        assert_eq!(
+            Core::SingBox.active_config(base),
+            base.join("configs/sing-box.json")
+        );
+        assert_eq!(
+            Core::Xray.active_config(base),
+            base.join("configs/xray.json")
+        );
+        assert_eq!(
+            Core::SingBox.config_dir(base),
+            base.join("configs/sing-box")
+        );
         assert_eq!(Core::Xray.config_dir(base), base.join("configs/xray"));
     }
 
@@ -498,7 +514,10 @@ mod tests {
 
         let found = find_json_configs(&[dir.path().to_path_buf()]);
 
-        let names: Vec<_> = found.iter().map(|p| p.file_name().unwrap().to_owned()).collect();
+        let names: Vec<_> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
         assert_eq!(names, ["a.json", "b.json"], "只收 .json 且按文件名排序");
     }
 
@@ -516,7 +535,10 @@ mod tests {
 
         let found = find_json_configs(&[first, second]);
 
-        let names: Vec<_> = found.iter().map(|p| p.file_name().unwrap().to_owned()).collect();
+        let names: Vec<_> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
         assert_eq!(names, ["other.json", "same.json"]);
     }
 

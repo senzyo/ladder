@@ -35,8 +35,15 @@ pub fn setup(exe_path: &std::path::Path) -> Result<(), AppError> {
         SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(AUMID))
             .map_err(|e| AppError::Msg(format!("设置 AUMID 失败: {e}")))?;
     }
-    let icon_path = exe_path.parent().unwrap_or(exe_path).join("icons").join("ladder.ico");
-    let _ = ICON_URI.set(format!("file:///{}", icon_path.to_string_lossy().replace('\\', "/")));
+    let icon_path = exe_path
+        .parent()
+        .unwrap_or(exe_path)
+        .join("icons")
+        .join("ladder.ico");
+    let _ = ICON_URI.set(format!(
+        "file:///{}",
+        icon_path.to_string_lossy().replace('\\', "/")
+    ));
     ensure_shortcut(exe_path, &icon_path)?;
     Ok(())
 }
@@ -95,11 +102,12 @@ fn xml_escape(s: &str) -> String {
 }
 
 fn show_toast_xml(xml_str: &str, tag: Option<&str>) -> Result<(), AppError> {
-    let xml = XmlDocument::new().map_err(|e| AppError::Msg(format!("创建 XmlDocument 失败: {e}")))?;
+    let xml =
+        XmlDocument::new().map_err(|e| AppError::Msg(format!("创建 XmlDocument 失败: {e}")))?;
     xml.LoadXml(&HSTRING::from(xml_str))
         .map_err(|e| AppError::Msg(format!("加载 toast XML 失败: {e}")))?;
-    let toast =
-        ToastNotification::CreateToastNotification(&xml).map_err(|e| AppError::Msg(format!("创建 toast 失败: {e}")))?;
+    let toast = ToastNotification::CreateToastNotification(&xml)
+        .map_err(|e| AppError::Msg(format!("创建 toast 失败: {e}")))?;
     if let Some(t) = tag {
         toast
             .SetTag(&HSTRING::from(t))
@@ -133,7 +141,10 @@ fn fallback_msgbox(title: &str, err: &str) {
 // ═══════════════════════════════════════════════
 
 /// 确保开始菜单快捷方式存在。如果旧版以 AUMID 命名的快捷方式存在则删除 (迁移) 。
-fn ensure_shortcut(exe_path: &std::path::Path, icon_path: &std::path::Path) -> Result<(), AppError> {
+fn ensure_shortcut(
+    exe_path: &std::path::Path,
+    icon_path: &std::path::Path,
+) -> Result<(), AppError> {
     let programs_dir = get_programs_dir()?;
     let lnk_path = programs_dir.join(format!("{}.lnk", SHORTCUT_NAME));
 
@@ -142,7 +153,8 @@ fn ensure_shortcut(exe_path: &std::path::Path, icon_path: &std::path::Path) -> R
         let _ = std::fs::remove_file(&old_lnk);
     }
 
-    std::fs::create_dir_all(&programs_dir).map_err(|e| AppError::Msg(format!("创建 Programs 目录失败: {e}")))?;
+    std::fs::create_dir_all(&programs_dir)
+        .map_err(|e| AppError::Msg(format!("创建 Programs 目录失败: {e}")))?;
     create_shortcut(exe_path, icon_path, &lnk_path)
 }
 
@@ -209,7 +221,10 @@ fn set_shortcut_aumid(lnk_path: &std::path::Path) -> Result<(), AppError> {
 
         let prop_store = &*(pps as *const IPropertyStoreW);
 
-        let aumid_wide: Vec<u16> = std::ffi::OsStr::new(AUMID).encode_wide().chain(Some(0)).collect();
+        let aumid_wide: Vec<u16> = std::ffi::OsStr::new(AUMID)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
 
         // 手动构建 PROPVARIANT 结构体:
         // 偏移 0: VT_LPWSTR 类型标签 (u16)
@@ -226,19 +241,24 @@ fn set_shortcut_aumid(lnk_path: &std::path::Path) -> Result<(), AppError> {
         let hr = ((*prop_store.0).set_value)(pps, &pkey, &pv);
         if hr != 0 {
             ((*prop_store.0).release)(pps);
-            return Err(AppError::Msg(format!("IPropertyStore::SetValue 失败: 0x{hr:08X}")));
+            return Err(AppError::Msg(format!(
+                "IPropertyStore::SetValue 失败: 0x{hr:08X}"
+            )));
         }
         let hr = ((*prop_store.0).commit)(pps);
         ((*prop_store.0).release)(pps);
         if hr != 0 {
-            return Err(AppError::Msg(format!("IPropertyStore::Commit 失败: 0x{hr:08X}")));
+            return Err(AppError::Msg(format!(
+                "IPropertyStore::Commit 失败: 0x{hr:08X}"
+            )));
         }
     }
     Ok(())
 }
 
 fn get_programs_dir() -> Result<PathBuf, AppError> {
-    let appdata = std::env::var("APPDATA").map_err(|_| AppError::Msg("无法获取 APPDATA 路径".into()))?;
+    let appdata =
+        std::env::var("APPDATA").map_err(|_| AppError::Msg("无法获取 APPDATA 路径".into()))?;
     Ok(PathBuf::from(appdata)
         .join("Microsoft")
         .join("Windows")

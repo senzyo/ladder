@@ -16,10 +16,12 @@ use tracing::{debug, info, warn};
 
 use serde_json::Value;
 use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Threading::{CREATE_NO_WINDOW, OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+use windows::Win32::System::Threading::{
+    CREATE_NO_WINDOW, OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+};
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_DevNode_Status, CM_Get_Device_ID_List_SizeW, CM_Get_Device_ID_ListW, CM_Locate_DevNodeW, CR_SUCCESS,
-    DN_HAS_PROBLEM, DN_STARTED,
+    CM_Get_DevNode_Status, CM_Get_Device_ID_List_SizeW, CM_Get_Device_ID_ListW, CM_Locate_DevNodeW,
+    CR_SUCCESS, DN_HAS_PROBLEM, DN_STARTED,
 };
 
 use crate::dns;
@@ -97,8 +99,10 @@ pub fn start_xray_at(exe_dir: &Path) -> Result<(), AppError> {
     state::ensure_exists(&config)?;
 
     // 一次性读取并解析配置, 用于 TUN 检测和接口名随机化
-    let text = fs::read_to_string(&config).map_err(|e| AppError::Msg(format!("读取 xray 配置失败: {e}")))?;
-    let json: Value = serde_json::from_str(&text).map_err(|e| AppError::Msg(format!("解析 xray 配置失败: {e}")))?;
+    let text = fs::read_to_string(&config)
+        .map_err(|e| AppError::Msg(format!("读取 xray 配置失败: {e}")))?;
+    let json: Value = serde_json::from_str(&text)
+        .map_err(|e| AppError::Msg(format!("解析 xray 配置失败: {e}")))?;
 
     // 检测是否有 TUN inbound
     let has_tun = json
@@ -165,7 +169,10 @@ pub fn kill_cores_without_state() {
 pub fn stop_processes(cores: &[state::Core]) -> Result<(), AppError> {
     // 阶段 1: 从 mutex 中取出 Child 句柄 (持锁时间极短)
     let children: Vec<(state::Core, Option<std::process::Child>)> = match state::app_state_mut() {
-        Some(mut app) => cores.iter().map(|&core| (core, app.take_child(core))).collect(),
+        Some(mut app) => cores
+            .iter()
+            .map(|&core| (core, app.take_child(core)))
+            .collect(),
         None => cores.iter().map(|&core| (core, None)).collect(),
     };
     // 阶段 2: kill (锁已释放, 不阻塞其他线程)
@@ -229,10 +236,12 @@ fn spawn_ruleset_update() {
         return;
     };
 
-    let spawned = std::thread::Builder::new().name("bg-ruleset".into()).spawn(move || {
-        let _guard = guard;
-        run_ruleset_update();
-    });
+    let spawned = std::thread::Builder::new()
+        .name("bg-ruleset".into())
+        .spawn(move || {
+            let _guard = guard;
+            run_ruleset_update();
+        });
 
     // 线程创建失败时闭包连同 guard 一起在此 drop, 标志不会泄漏
     if let Err(e) = spawned {
@@ -326,16 +335,21 @@ const XRAY_SETTINGS_PATTERN: &str = "\"settings\": {";
 /// 如果配置中没有 type=tun 的 inbound, 静默跳过 (用户可能不使用 TUN 功能) 。
 /// 如果 tun inbound 缺少 interface_name 字段, 自动写入随机化后的值。
 fn randomize_sing_box_tun_name(config_path: &Path) -> Result<(), AppError> {
-    let text = fs::read_to_string(config_path).map_err(|e| AppError::Msg(format!("读取 sing-box 配置失败: {e}")))?;
-    let json: Value = serde_json::from_str(&text).map_err(|e| AppError::Msg(format!("解析 sing-box 配置失败: {e}")))?;
+    let text = fs::read_to_string(config_path)
+        .map_err(|e| AppError::Msg(format!("读取 sing-box 配置失败: {e}")))?;
+    let json: Value = serde_json::from_str(&text)
+        .map_err(|e| AppError::Msg(format!("解析 sing-box 配置失败: {e}")))?;
     let new_name = random_tun_name();
 
     // 找 tun inbound, 找不到直接跳过
-    let tun_inbound = json.get("inbounds").and_then(Value::as_array).and_then(|inbounds| {
-        inbounds
-            .iter()
-            .find(|inbound| inbound.get("type").and_then(Value::as_str) == Some("tun"))
-    });
+    let tun_inbound = json
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .and_then(|inbounds| {
+            inbounds
+                .iter()
+                .find(|inbound| inbound.get("type").and_then(Value::as_str) == Some("tun"))
+        });
 
     let tun_inbound = match tun_inbound {
         Some(inbound) => inbound,
@@ -354,7 +368,8 @@ fn randomize_sing_box_tun_name(config_path: &Path) -> Result<(), AppError> {
         let old_pattern = format!("\"interface_name\": \"{}\"", old_name);
         let new_pattern = format!("\"interface_name\": \"{}\"", new_name);
         let new_text = text.replacen(&old_pattern, &new_pattern, 1);
-        return fs::write(config_path, new_text).map_err(|e| AppError::Msg(format!("写入 sing-box 配置失败: {e}")));
+        return fs::write(config_path, new_text)
+            .map_err(|e| AppError::Msg(format!("写入 sing-box 配置失败: {e}")));
     }
 
     // 无 interface_name → 紧跟 "type": "tun" 之后插入
@@ -365,15 +380,16 @@ fn randomize_sing_box_tun_name(config_path: &Path) -> Result<(), AppError> {
     // 2. 逗号前置 (", \"key\": \"value\"") 后, 无论紧跟的是另一个字段还是
     //    对象结尾 }, 都不会产生尾随逗号。
     debug!("写入 sing-tun 接口名: {new_name}");
-    let pos = text
-        .find(SING_BOX_TUN_PATTERN)
-        .ok_or(AppError::Msg("未在 sing-box.json 中找到 type=tun 的 inbound".into()))?;
+    let pos = text.find(SING_BOX_TUN_PATTERN).ok_or(AppError::Msg(
+        "未在 sing-box.json 中找到 type=tun 的 inbound".into(),
+    ))?;
     let mut new_text = text;
     new_text.insert_str(
         pos + SING_BOX_TUN_PATTERN.len(),
         &format!(", \"interface_name\": \"{new_name}\""),
     );
-    fs::write(config_path, new_text).map_err(|e| AppError::Msg(format!("写入 sing-box 配置失败: {e}")))
+    fs::write(config_path, new_text)
+        .map_err(|e| AppError::Msg(format!("写入 sing-box 配置失败: {e}")))
 }
 
 /// 随机化 xray 配置中的 TUN 接口名。
@@ -410,7 +426,8 @@ fn randomize_xray_tun_name(config_path: &Path, text: &str, json: &Value) -> Resu
         let old_pattern = format!("\"name\": \"{}\"", old_name);
         let new_pattern = format!("\"name\": \"{}\"", new_name);
         let new_text = text.replacen(&old_pattern, &new_pattern, 1);
-        return fs::write(config_path, new_text).map_err(|e| AppError::Msg(format!("写入 xray 配置失败: {e}")));
+        return fs::write(config_path, new_text)
+            .map_err(|e| AppError::Msg(format!("写入 xray 配置失败: {e}")));
     }
 
     // 无 settings.name → 写入随机名。
@@ -427,11 +444,14 @@ fn randomize_xray_tun_name(config_path: &Path, text: &str, json: &Value) -> Resu
             format!(", \"settings\": {{\"name\": \"{new_name}\"}}"),
         ),
         Some(settings) => {
-            let obj = settings
-                .as_object()
-                .ok_or_else(|| AppError::Msg("xray.json 中 tun inbound 的 settings 不是对象".into()))?;
+            let obj = settings.as_object().ok_or_else(|| {
+                AppError::Msg("xray.json 中 tun inbound 的 settings 不是对象".into())
+            })?;
             let separator = if obj.is_empty() { "" } else { "," };
-            (XRAY_SETTINGS_PATTERN, format!("\"name\": \"{new_name}\"{separator}"))
+            (
+                XRAY_SETTINGS_PATTERN,
+                format!("\"name\": \"{new_name}\"{separator}"),
+            )
         }
     };
     let pos = text
@@ -467,7 +487,8 @@ fn random_tun_name() -> String {
 /// 需要管理员权限; 若权限不足会记录警告但不阻断启动流程。
 pub fn cleanup_network_registry() {
     const PROFILES: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles";
-    const SIGNATURES: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged";
+    const SIGNATURES: &str =
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged";
 
     info!("清理 TUN 相关网络注册表项...");
     clean_tun_entries(PROFILES);
@@ -586,7 +607,9 @@ fn cleanup_orphaned_wintun() {
 
     for id in &instance_ids {
         debug!("移除孤立 WinTUN 设备: {id}");
-        let result = hidden_command("pnputil").args(["/remove-device", id.as_str()]).status();
+        let result = hidden_command("pnputil")
+            .args(["/remove-device", id.as_str()])
+            .status();
         match result {
             Ok(status) => debug!("pnputil /remove-device {id}: {status}"),
             Err(e) => warn!("pnputil /remove-device {id} 执行失败: {e}"),
@@ -648,11 +671,15 @@ mod tests {
     }
 
     fn sing_box_interface_name(json: &Value) -> &str {
-        json["inbounds"][0]["interface_name"].as_str().expect("缺少接口名")
+        json["inbounds"][0]["interface_name"]
+            .as_str()
+            .expect("缺少接口名")
     }
 
     fn xray_tun_name(json: &Value) -> &str {
-        json["inbounds"][0]["settings"]["name"].as_str().expect("缺少接口名")
+        json["inbounds"][0]["settings"]["name"]
+            .as_str()
+            .expect("缺少接口名")
     }
 
     fn randomize_xray(path: &Path) -> Result<(), AppError> {
@@ -733,7 +760,10 @@ mod tests {
     #[test]
     fn test_xray_inserts_into_empty_settings() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "{\"inbounds\": [{\"protocol\": \"tun\", \"settings\": {}}]}");
+        let path = write_config(
+            &dir,
+            "{\"inbounds\": [{\"protocol\": \"tun\", \"settings\": {}}]}",
+        );
 
         randomize_xray(&path).unwrap();
 
@@ -777,7 +807,10 @@ mod tests {
     #[test]
     fn test_xray_rejects_non_object_settings() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "{\"inbounds\": [{\"protocol\": \"tun\", \"settings\": []}]}");
+        let path = write_config(
+            &dir,
+            "{\"inbounds\": [{\"protocol\": \"tun\", \"settings\": []}]}",
+        );
 
         assert!(randomize_xray(&path).is_err());
     }

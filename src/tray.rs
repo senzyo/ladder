@@ -9,26 +9,28 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, GetDC,
-    HBITMAP, HGDIOBJ, ReleaseDC, SelectObject,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
+    DeleteDC, GetDC, HBITMAP, HGDIOBJ, ReleaseDC, SelectObject,
 };
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DI_NORMAL, DefWindowProcW,
-    DestroyIcon, DestroyMenu, DispatchMessageW, DrawIconEx, GetCursorPos, GetMenuItemCount, GetMessageW, HICON, HMENU,
-    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadIconW, LoadImageW, MB_ICONERROR, MB_ICONWARNING,
-    MB_OK, MENUITEMINFOW, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MSG, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetForegroundWindow, SetMenuItemInfoW, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
-    WNDCLASSW, WS_OVERLAPPED,
+    AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW,
+    DI_NORMAL, DefWindowProcW, DestroyIcon, DestroyMenu, DispatchMessageW, DrawIconEx,
+    GetCursorPos, GetMenuItemCount, GetMessageW, HICON, HMENU, IDI_APPLICATION, IMAGE_ICON,
+    LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadIconW, LoadImageW, MB_ICONERROR, MB_ICONWARNING, MB_OK,
+    MENUITEMINFOW, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MSG, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetMenuItemInfoW,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
+    WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{HSTRING, PCWSTR};
 
 use crate::error::AppError;
 use crate::settings::CoreMode;
-use crate::state::{self, ConfigAction, Core, ProcessState};
+use crate::state::{self, ConfigSelection, Core, CoreStatus};
 use tracing::warn;
 
 /// 托盘图标的自定义消息 ID, 当托盘收到鼠标事件时通过此消息通知窗口。
@@ -137,7 +139,11 @@ pub unsafe fn run_message_loop() {
 
 /// 显示错误消息对话框。
 pub fn show_error(hwnd: isize, title: &str, message: &str) {
-    let hwnd = if hwnd == 0 { None } else { Some(HWND(hwnd as _)) };
+    let hwnd = if hwnd == 0 {
+        None
+    } else {
+        Some(HWND(hwnd as _))
+    };
     unsafe {
         let _ = MessageBoxW(
             hwnd,
@@ -150,7 +156,11 @@ pub fn show_error(hwnd: isize, title: &str, message: &str) {
 
 /// 显示警告消息对话框。
 pub fn show_warn(hwnd: isize, title: &str, message: &str) {
-    let hwnd = if hwnd == 0 { None } else { Some(HWND(hwnd as _)) };
+    let hwnd = if hwnd == 0 {
+        None
+    } else {
+        Some(HWND(hwnd as _))
+    };
     unsafe {
         let _ = MessageBoxW(
             hwnd,
@@ -202,7 +212,11 @@ pub(crate) unsafe fn load_icon_bitmap(exe_dir: &Path, icon_name: &str) -> isize 
             warn!("图标文件不存在: {}", icon_path.display());
             return 0;
         }
-        let icon_path_w: Vec<u16> = icon_path.to_string_lossy().encode_utf16().chain(Some(0)).collect();
+        let icon_path_w: Vec<u16> = icon_path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
         let hicon = LoadImageW(
             None,
             PCWSTR(icon_path_w.as_ptr()),
@@ -243,7 +257,9 @@ pub(crate) unsafe fn load_icon_bitmap(exe_dir: &Path, icon_name: &str) -> isize 
         };
 
         let mut pv_bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let Ok(bmp) = CreateDIBSection(Some(screen_dc), &bmi, DIB_RGB_COLORS, &mut pv_bits, None, 0) else {
+        let Ok(bmp) =
+            CreateDIBSection(Some(screen_dc), &bmi, DIB_RGB_COLORS, &mut pv_bits, None, 0)
+        else {
             let _ = DeleteDC(mem_dc);
             let _ = DestroyIcon(hicon);
             return 0;
@@ -261,15 +277,20 @@ pub(crate) unsafe fn load_icon_bitmap(exe_dir: &Path, icon_name: &str) -> isize 
 }
 
 /// 窗口过程: 处理托盘图标鼠标事件和窗口销毁。
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     unsafe {
         match msg {
             WM_TRAY_ICON => {
                 let event = lparam.0 as u32;
                 if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
-                    let (selected, config_actions) = show_tray_menu(hwnd);
+                    let (selected, config_selections) = show_tray_menu(hwnd);
                     if selected != 0 {
-                        crate::execute_menu_command(hwnd.0 as isize, selected, &config_actions);
+                        crate::execute_menu_command(hwnd.0 as isize, selected, &config_selections);
                     }
                 }
                 LRESULT(0)
@@ -288,7 +309,11 @@ unsafe fn load_app_icon(h_instance: Option<HINSTANCE>, exe_dir: &Path) -> HICON 
     unsafe {
         let icon_path = exe_dir.join("icons").join("ladder.ico");
         if icon_path.exists() {
-            let icon_path_w: Vec<u16> = icon_path.to_string_lossy().encode_utf16().chain(Some(0)).collect();
+            let icon_path_w: Vec<u16> = icon_path
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
             let icon = LoadImageW(
                 h_instance,
                 PCWSTR(icon_path_w.as_ptr()),
@@ -325,7 +350,7 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 /// 菜单根据当前核心模式 (xray / sing-box / both) 动态构建。
 /// Mutex 仅在读取状态时持有, TrackPopupMenu 在锁外执行,
 /// 避免模态消息循环重入窗口过程时因 Mutex 不可重入导致死锁。
-unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
+unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigSelection>) {
     unsafe {
         let (exe_dir, icons, core_mode) = {
             let app = match state::app_state() {
@@ -343,10 +368,10 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
             return (0, HashMap::new());
         };
 
-        let status_label = |s: ProcessState, name: &str| match s {
-            ProcessState::Running => format!("{name} 正在运行"),
-            ProcessState::NotRunning => format!("{name} 未在运行"),
-            ProcessState::NotInstalled => format!("{name} 未安装"),
+        let status_label = |s: CoreStatus, name: &str| match s {
+            CoreStatus::Running => format!("{name} 正在运行"),
+            CoreStatus::NotRunning => format!("{name} 未在运行"),
+            CoreStatus::NotInstalled => format!("{name} 未安装"),
         };
 
         // ── 状态项: 仅显示已启用核心 ──
@@ -367,7 +392,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
         append_separator(menu);
 
         // ── 操作项 ──
-        let mut config_actions = HashMap::new();
+        let mut config_selections = HashMap::new();
 
         if core_mode == CoreMode::Both {
             // 双核模式: 重新启动/终止运行/更新核心 均为子菜单
@@ -390,14 +415,14 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
             let sing_menu = new_submenu();
             let xray_menu = new_submenu();
             append_config_items(
-                &mut config_actions,
+                &mut config_selections,
                 sing_menu,
                 Core::SingBox,
                 ID_SING_CONFIG_BASE,
                 &[Core::SingBox.config_dir(&exe_dir)],
             );
             append_config_items(
-                &mut config_actions,
+                &mut config_selections,
                 xray_menu,
                 Core::Xray,
                 ID_XRAY_CONFIG_BASE,
@@ -435,7 +460,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
 
             let config_menu = new_submenu();
             append_config_items(
-                &mut config_actions,
+                &mut config_selections,
                 config_menu,
                 core,
                 config_base,
@@ -486,7 +511,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> (u16, HashMap<u16, ConfigAction>) {
 
         let _ = DestroyMenu(menu);
 
-        (selected.0 as u16, config_actions)
+        (selected.0 as u16, config_selections)
     }
 }
 
@@ -518,7 +543,11 @@ unsafe fn append_disabled_item(menu: HMENU, label: &str) {
 unsafe fn append_item_or_disabled(menu: HMENU, id: u16, label: &str, disabled: bool) {
     unsafe {
         let w = state::wide(label);
-        let flags = if disabled { MF_STRING | MF_GRAYED } else { MF_STRING };
+        let flags = if disabled {
+            MF_STRING | MF_GRAYED
+        } else {
+            MF_STRING
+        };
         let item_id = if disabled { 0 } else { id as usize };
         let _ = AppendMenuW(menu, flags, item_id, PCWSTR(w.as_ptr()));
     }
@@ -550,13 +579,18 @@ unsafe fn append_status_item(menu: HMENU, label: &str, hbmp: isize) {
 unsafe fn append_submenu(menu: HMENU, submenu: HMENU, label: &str) {
     unsafe {
         let w = state::wide(label);
-        let _ = AppendMenuW(menu, MF_STRING | MF_POPUP, submenu.0 as usize, PCWSTR(w.as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | MF_POPUP,
+            submenu.0 as usize,
+            PCWSTR(w.as_ptr()),
+        );
     }
 }
 
 /// 扫描配置目录并将每个 .json 文件添加为菜单项, 最多 900 项。
 unsafe fn append_config_items(
-    map: &mut HashMap<u16, ConfigAction>,
+    map: &mut HashMap<u16, ConfigSelection>,
     menu: HMENU,
     core: Core,
     base_id: u16,
@@ -576,7 +610,7 @@ unsafe fn append_config_items(
                 .unwrap_or("未命名配置")
                 .to_string();
             append_item(menu, id, &label);
-            map.insert(id, ConfigAction { core, path });
+            map.insert(id, ConfigSelection { core, path });
             added += 1;
         }
 

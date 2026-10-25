@@ -31,7 +31,8 @@ use tracing_subscriber::prelude::*;
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Console::{
-    CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, SetConsoleMode,
+    CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle,
+    STD_ERROR_HANDLE, SetConsoleMode,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetSystemTime;
@@ -39,13 +40,13 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
 use windows::core::PCWSTR;
 
-use crate::state::ConfigAction;
+use crate::state::ConfigSelection;
 
 /// COM 初始化守卫, Drop 时自动调用 CoUninitialize。
 struct ComGuard;
 
 impl ComGuard {
-    fn new() -> Result<Self, AppError> {
+    fn try_new() -> Result<Self, AppError> {
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED)
                 .ok()
@@ -144,18 +145,24 @@ fn install_panic_hook() {
 /// 闭包内的 panic 不在这里兜底 —— release 构建是 abort, 展开根本不会发生,
 /// 清理由 `install_panic_hook` 负责。`name` 会成为线程名, panic 日志据此
 /// 指出是哪个后台操作出的问题。
-fn spawn_bg<F: FnOnce() + Send + 'static>(name: &'static str, guard: state::FlagGuard, f: F) {
-    let spawned = std::thread::Builder::new().name(name.to_owned()).spawn(move || {
-        let _busy = guard;
-        let _com = match ComGuard::new() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                warn!("COM 初始化失败: {e}");
-                None
-            }
-        };
-        f();
-    });
+fn spawn_background<F: FnOnce() + Send + 'static>(
+    name: &'static str,
+    guard: state::FlagGuard,
+    f: F,
+) {
+    let spawned = std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let _busy = guard;
+            let _com = match ComGuard::try_new() {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!("COM 初始化失败: {e}");
+                    None
+                }
+            };
+            f();
+        });
 
     if let Err(e) = spawned {
         error!("创建后台线程 [{name}] 失败: {e}");
@@ -209,10 +216,19 @@ where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
     N: for<'a> FormatFields<'a> + 'static,
 {
-    fn format_event(&self, ctx: &FmtContext<'_, S, N>, mut writer: Writer<'_>, event: &Event<'_>) -> std::fmt::Result {
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
         let level = event.metadata().level();
         let color = level_color(level);
-        let reset = if writer.has_ansi_escapes() { ANSI_RESET } else { "" };
+        let reset = if writer.has_ansi_escapes() {
+            ANSI_RESET
+        } else {
+            ""
+        };
         let lc = if writer.has_ansi_escapes() { color } else { "" };
         write_utc_timestamp(&mut writer)?;
         write!(&mut writer, " [{lc}{level}{reset}] ")?;
@@ -233,7 +249,8 @@ fn write_utc_timestamp(writer: &mut Writer<'_>) -> std::fmt::Result {
 
 /// 达到日志上限时写入的最后一条提示。
 const LOG_LIMIT_NOTICE: &[u8] =
-    "\n[日志已达大小上限, 后续内容不再写入。可在 settings.json 的 log.max_size_mb 调整]\n".as_bytes();
+    "\n[日志已达大小上限, 后续内容不再写入。可在 settings.json 的 log.max_size_mb 调整]\n"
+        .as_bytes();
 
 /// 带大小上限的日志文件。
 ///
@@ -318,7 +335,8 @@ fn init_logging(exe_dir: &Path, log: &settings::Log) -> Result<(), AppError> {
         .with_writer(std::io::stderr);
 
     let log_path = exe_dir.join("app.log");
-    let file = std::fs::File::create(log_path).map_err(|e| AppError::Msg(format!("创建日志文件失败: {e}")))?;
+    let file = std::fs::File::create(log_path)
+        .map_err(|e| AppError::Msg(format!("创建日志文件失败: {e}")))?;
     let writer = CappedLogWriter(Arc::new(Mutex::new(CappedFile {
         file,
         written: 0,
@@ -345,7 +363,7 @@ fn init_logging(exe_dir: &Path, log: &settings::Log) -> Result<(), AppError> {
 /// 应用主入口: 初始化 COM → 创建目录 → 加载配置 → 初始化日志和 Toast →
 /// 检测版本 → 创建托盘图标 → 运行消息循环 → 退出时清理 GDI 资源。
 fn run() -> Result<(), AppError> {
-    let _com = ComGuard::new()?;
+    let _com = ComGuard::try_new()?;
 
     let exe_path = std::env::current_exe()?;
     let exe_dir = exe_path
@@ -486,7 +504,7 @@ fn switch_core_mode(id: u16) -> Option<settings::CoreMode> {
 /// 耗时操作 (重启 / 终止 / 更新 / 切换配置) 都交给后台线程, 避免阻塞消息
 /// 循环。忙标志由 `FlagGuard` 管理: 交给后台线程的分支在线程结束时释放,
 /// 其余分支在本函数返回时释放, 提前返回不会漏。
-fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, ConfigAction>) {
+fn execute_menu_command(hwnd: isize, id: u16, config_selections: &HashMap<u16, ConfigSelection>) {
     // 打开目录和退出不占用忙标志: 前者只是拉起 explorer, 后者必须随时可用。
     match id {
         tray::ID_OPEN_DIR => return open_exe_dir(),
@@ -505,7 +523,7 @@ fn execute_menu_command(hwnd: isize, id: u16, config_actions: &HashMap<u16, Conf
         run_update_command(hwnd, guard, cmd);
     } else if let Some(mode) = switch_core_mode(id) {
         run_switch_core(guard, mode);
-    } else if let Some(action) = config_actions.get(&id).cloned() {
+    } else if let Some(action) = config_selections.get(&id).cloned() {
         run_config_switch(guard, action);
     } else {
         debug!("忽略未知菜单项: {id}");
@@ -545,7 +563,7 @@ fn run_service_command(hwnd: isize, guard: state::FlagGuard, cmd: ServiceCommand
             return;
         }
     };
-    spawn_bg("bg-restart-stop", guard, move || {
+    spawn_background("bg-restart-stop", guard, move || {
         info!("{}", cmd.label);
         if let Err(err) = (cmd.run)(&exe_dir) {
             error!("操作失败: {err}");
@@ -591,7 +609,7 @@ fn run_update_command(hwnd: isize, guard: state::FlagGuard, cmd: UpdateCommand) 
             s.download.retry.delay_secs,
         )
     };
-    spawn_bg("bg-update", guard, move || {
+    spawn_background("bg-update", guard, move || {
         info!("{}", cmd.label);
         // 放在后台线程里终止进程: stop_all 会枚举进程、逐块物理网卡读写注册表
         // 恢复 DNS 并刷新 DNS 缓存, 在 UI 线程执行会卡住托盘菜单。
@@ -606,7 +624,7 @@ fn run_update_command(hwnd: isize, guard: state::FlagGuard, cmd: UpdateCommand) 
 }
 
 fn run_switch_core(guard: state::FlagGuard, new_mode: settings::CoreMode) {
-    spawn_bg("bg-switch-core", guard, move || {
+    spawn_background("bg-switch-core", guard, move || {
         // 与更新核心同理: stop_all 涉及进程枚举和注册表读写, 不能在 UI 线程做。
         if let Err(e) = process::stop_all() {
             warn!("切换核心前终止进程失败: {e}");
@@ -631,8 +649,8 @@ fn run_switch_core(guard: state::FlagGuard, new_mode: settings::CoreMode) {
     });
 }
 
-fn run_config_switch(guard: state::FlagGuard, action: ConfigAction) {
-    spawn_bg("bg-config-switch", guard, move || {
+fn run_config_switch(guard: state::FlagGuard, action: ConfigSelection) {
+    spawn_background("bg-config-switch", guard, move || {
         let exe_dir = match state::exe_dir() {
             Ok(d) => d,
             Err(e) => {
@@ -680,7 +698,11 @@ mod tests {
         let mut writer = capped(&path, 100);
 
         for _ in 0..10 {
-            assert_eq!(writer.write(&[b'x'; 40]).unwrap(), 40, "超限后也应报告写入成功");
+            assert_eq!(
+                writer.write(&[b'x'; 40]).unwrap(),
+                40,
+                "超限后也应报告写入成功"
+            );
         }
         writer.flush().unwrap();
         drop(writer);

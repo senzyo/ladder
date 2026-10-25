@@ -25,22 +25,9 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 /// 调用次数降到八分之一。
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
-// ureq 3 的所有超时默认都是 None (含 DNS 解析、建连和读取) , 不显式设置的话
-// 服务器接受连接后不发数据就会永久挂起, 下载线程永远不返回。
-//
-// 但各阶段的超时不是各管一段, 配文件下载时必须分清两种语义:
-// - 阶段自身的 deadline 每次读写前重新从当前时刻起算, 也就是空闲超时: 连续
-//   这么久收不到任何数据才算超时
-// - 每个阶段还会带上前一阶段的 deadline 一起比较, 取最先到的那个。前一阶段的
-//   deadline 从它结束的那一刻算起, 不会随读写刷新
-//
-// 响应体的前一阶段正是响应头, 所以 timeout_recv_response 一旦设值, 它就成了
-// "从收完响应头起整个响应体必须下完"的绝对上限, 而不是文档里写的"只管响应
-// 头"。30 秒配 20 MB 的核心 zip 等于要求 700 KB/s, 达不到就必然超时, 重试再
-// 多次也一样 —— 换 CDN 代理时首次回源就是这个情形。
-//
-// 因此文件下载刻意不设 timeout_recv_response, 等响应头改由 timeout_send_request
-// 兜: 它是响应头阶段的前一阶段, 而响应体阶段不看它, 不会传导下去。
+// ureq 3.5 的阶段超时是各阶段的总预算, 不会随零碎数据到达而刷新。
+// 文件下载分别限制建连、发送请求头和接收响应头; 正文只用 timeout_per_read
+// 限制每次底层读取的等待, 不设正文总预算, 让仍在持续传输的慢下载能够完成。
 
 /// GitHub API、校验和等小响应请求的端到端超时。
 const SMALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,7 +38,7 @@ const SMALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// 那一段靠系统解析器自己的超时。
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 文件下载从发出请求到收完响应头的上限。
+/// 文件下载发送请求头和接收响应头各阶段的上限。
 const DOWNLOAD_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 文件下载的空闲超时: 连续这么久没收到任何数据就放弃。
@@ -90,13 +77,23 @@ const XRAY_ZIP_NAME: &str = if cfg!(target_arch = "aarch64") {
 };
 
 /// 依次更新 sing-box 和 xray。
-pub fn update_cores(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_secs: u64) -> Result<(), AppError> {
+pub fn update_cores(
+    exe_dir: &Path,
+    gh_proxy_url: &str,
+    max_retries: u32,
+    delay_secs: u64,
+) -> Result<(), AppError> {
     update_sing_box(exe_dir, gh_proxy_url, max_retries, delay_secs)?;
     update_xray(exe_dir, gh_proxy_url, max_retries, delay_secs)
 }
 
 /// 检查并更新 sing-box。
-pub fn update_sing_box(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_secs: u64) -> Result<(), AppError> {
+pub fn update_sing_box(
+    exe_dir: &Path,
+    gh_proxy_url: &str,
+    max_retries: u32,
+    delay_secs: u64,
+) -> Result<(), AppError> {
     let exe_path = Core::SingBox.exe_path(exe_dir);
 
     let local = get_local_version(&exe_path, "version");
@@ -109,7 +106,10 @@ pub fn update_sing_box(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, del
         return Ok(());
     }
 
-    let zip_name = format!("sing-box-{}-windows-{}.zip", remote_ver, SINGBOX_ARCH_SUFFIX);
+    let zip_name = format!(
+        "sing-box-{}-windows-{}.zip",
+        remote_ver, SINGBOX_ARCH_SUFFIX
+    );
     let zip_path = exe_dir.join(&zip_name);
 
     let (download_url, expected_hash) = find_asset(&assets, &zip_name)?;
@@ -147,7 +147,12 @@ pub fn update_sing_box(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, del
 }
 
 /// 检查并更新 xray。
-pub fn update_xray(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_secs: u64) -> Result<(), AppError> {
+pub fn update_xray(
+    exe_dir: &Path,
+    gh_proxy_url: &str,
+    max_retries: u32,
+    delay_secs: u64,
+) -> Result<(), AppError> {
     let exe_path = Core::Xray.exe_path(exe_dir);
 
     let local = get_local_version(&exe_path, "version");
@@ -201,7 +206,10 @@ pub fn update_xray(exe_dir: &Path, gh_proxy_url: &str, max_retries: u32, delay_s
 /// 本程序是 GUI 子系统, 用裸 Command 启动会分配新控制台, 每次检查版本闪一次
 /// 黑窗。debug 构建有控制台可继承, 因此这个问题只在 release 下可见。
 pub(crate) fn get_local_version(exe_path: &Path, version_arg: &str) -> String {
-    let output = match crate::process::hidden_command(exe_path).arg(version_arg).output() {
+    let output = match crate::process::hidden_command(exe_path)
+        .arg(version_arg)
+        .output()
+    {
         Ok(out) => out,
         Err(e) => {
             warn!("获取版本失败 ({}): {e}", exe_path.display());
@@ -271,10 +279,11 @@ fn is_newer(local: &str, remote: &str) -> bool {
 fn fetch_sing_box_release() -> Result<(String, Vec<Value>), AppError> {
     let api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
     debug!("请求 GitHub API: {api_url}");
-    let body = get_text(api_url).map_err(|e| AppError::Msg(format!("请求 GitHub API 失败: {e}")))?;
+    let body =
+        get_text(api_url).map_err(|e| AppError::Msg(format!("请求 GitHub API 失败: {e}")))?;
 
-    let json: Value =
-        serde_json::from_str(&body).map_err(|e| AppError::Msg(format!("解析 GitHub API 响应失败: {e}")))?;
+    let json: Value = serde_json::from_str(&body)
+        .map_err(|e| AppError::Msg(format!("解析 GitHub API 响应失败: {e}")))?;
 
     let tag = json["tag_name"]
         .as_str()
@@ -294,10 +303,11 @@ fn fetch_sing_box_release() -> Result<(String, Vec<Value>), AppError> {
 fn fetch_xray_release(zip_name: &str) -> Result<(String, Vec<Value>), AppError> {
     let api_url = "https://api.github.com/repos/XTLS/Xray-core/releases";
     debug!("请求 GitHub API: {api_url}");
-    let body = get_text(api_url).map_err(|e| AppError::Msg(format!("请求 GitHub API 失败: {e}")))?;
+    let body =
+        get_text(api_url).map_err(|e| AppError::Msg(format!("请求 GitHub API 失败: {e}")))?;
 
-    let releases: Vec<Value> =
-        serde_json::from_str(&body).map_err(|e| AppError::Msg(format!("解析 GitHub API 响应失败: {e}")))?;
+    let releases: Vec<Value> = serde_json::from_str(&body)
+        .map_err(|e| AppError::Msg(format!("解析 GitHub API 响应失败: {e}")))?;
 
     for release in &releases {
         if release["draft"].as_bool() == Some(true) {
@@ -361,7 +371,11 @@ fn download_core_with_retry(
     };
     debug!(
         "下载准备: url={url}, 代理={}, hash={expected_hash}",
-        if gh_proxy_url.is_empty() { "禁用" } else { "启用" },
+        if gh_proxy_url.is_empty() {
+            "禁用"
+        } else {
+            "启用"
+        },
     );
 
     for attempt in 1..=max_retries {
@@ -399,36 +413,60 @@ fn download_core_with_retry(
 
 /// 下载单个文件到指定路径, 已存在时先删除。
 fn download_file(url: &str, dest: &Path) -> Result<(), AppError> {
+    download_file_with_timeouts(
+        ureq::get(url),
+        dest,
+        DOWNLOAD_CONNECT_TIMEOUT,
+        DOWNLOAD_HEADER_TIMEOUT,
+        DOWNLOAD_STALL_TIMEOUT,
+    )
+}
+
+/// 使用给定时限下载, 让本地服务测试能覆盖相同配置和落盘路径。
+fn download_file_with_timeouts(
+    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+    dest: &Path,
+    connect_timeout: Duration,
+    header_timeout: Duration,
+    stall_timeout: Duration,
+) -> Result<(), AppError> {
     if dest.exists() {
         let _ = fs::remove_file(dest);
     }
 
-    let resp = ureq::get(url)
+    let resp = request
         .config()
-        .timeout_connect(Some(DOWNLOAD_CONNECT_TIMEOUT))
-        .timeout_send_request(Some(DOWNLOAD_HEADER_TIMEOUT))
-        // 不要给 timeout_recv_response 设值: 见文件开头的说明, 它会变成整个
-        // 响应体的绝对上限, 慢链路上必定超时
-        .timeout_recv_body(Some(DOWNLOAD_STALL_TIMEOUT))
+        .timeout_connect(Some(connect_timeout))
+        .timeout_send_request(Some(header_timeout))
+        .timeout_recv_response(Some(header_timeout))
+        .timeout_per_read(Some(stall_timeout))
+        .timeout_recv_body(None)
         .build()
         .header("User-Agent", USER_AGENT)
         .call()
         .map_err(|e| AppError::Msg(format!("下载失败: {e}")))?;
 
     let mut reader = resp.into_body().into_reader();
-    let mut file = fs::File::create(dest).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
+    let mut file =
+        fs::File::create(dest).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
 
     // io::copy 分不清是读取还是写入出错, 用中性描述: 这里最常见的是接收超时,
     // 写成"写入文件失败"会把人往磁盘问题上引
-    let bytes = io::copy(&mut reader, &mut file).map_err(|e| AppError::Msg(format!("下载数据失败: {e}")))?;
-    info!("下载完成: {} ({:.1} MB)", dest.display(), bytes as f64 / 1_048_576.0);
+    let bytes = io::copy(&mut reader, &mut file)
+        .map_err(|e| AppError::Msg(format!("下载数据失败: {e}")))?;
+    info!(
+        "下载完成: {} ({:.1} MB)",
+        dest.display(),
+        bytes as f64 / 1_048_576.0
+    );
 
     Ok(())
 }
 
 /// 计算文件的 SHA256 哈希值, 返回小写十六进制字符串。
 fn sha256_file(path: &Path) -> Result<String, AppError> {
-    let mut file = fs::File::open(path).map_err(|e| AppError::Msg(format!("打开文件计算 SHA256 失败: {e}")))?;
+    let mut file = fs::File::open(path)
+        .map_err(|e| AppError::Msg(format!("打开文件计算 SHA256 失败: {e}")))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; HASH_BUFFER_SIZE];
     loop {
@@ -511,7 +549,11 @@ fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
 /// 按文件名匹配而不是按 zip 内路径: sing-box 的包有一层带版本号的顶层目录,
 /// 原先靠拼 `sing-box-{ver}-windows-{arch}/` 前缀剥离, 官方一旦改了命名规则,
 /// 所有条目都会被静默跳过 —— 更新"成功"却一个文件也没换。
-fn extract_artifacts(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts) -> Result<(), AppError> {
+fn extract_artifacts(
+    zip_path: &Path,
+    core_dir: &Path,
+    artifacts: &CoreArtifacts,
+) -> Result<(), AppError> {
     fs::create_dir_all(core_dir).map_err(|e| AppError::Msg(format!("创建核心目录失败: {e}")))?;
     remove_suffixed(core_dir, artifacts, NEW_SUFFIX);
 
@@ -527,10 +569,16 @@ fn extract_artifacts(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts
 /// 解压到 `.new` 并逐个替换到位, 失败时由调用方清理 `.new`。
 ///
 /// 替换中途失败会先回滚已改名的旧文件, 再把错误返回给调用方。
-fn stage_and_replace(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts) -> Result<(), AppError> {
-    let file = fs::File::open(zip_path).map_err(|e| AppError::Msg(format!("打开 zip 文件失败: {e}")))?;
+fn stage_and_replace(
+    zip_path: &Path,
+    core_dir: &Path,
+    artifacts: &CoreArtifacts,
+) -> Result<(), AppError> {
+    let file =
+        fs::File::open(zip_path).map_err(|e| AppError::Msg(format!("打开 zip 文件失败: {e}")))?;
     let reader = BufReader::new(file);
-    let mut archive = zip::ZipArchive::new(reader).map_err(|e| AppError::Msg(format!("解析 zip 文件失败: {e}")))?;
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|e| AppError::Msg(format!("解析 zip 文件失败: {e}")))?;
 
     let mut staged: Vec<String> = Vec::new();
 
@@ -543,11 +591,14 @@ fn stage_and_replace(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts
             continue;
         }
 
-        // enclosed_name 会拒绝绝对路径、含 NULL 字节, 以及用 .. 逃出目标目录的
+        // enclosed_name 会移除开头的路径前缀, 并拒绝含 NULL 字节或逃出目标目录的
         // 条目。不能改用 name() 自行拼接后 starts_with 判断: Path::starts_with
         // 是按组件的词法比较、不解析 .., core_dir/../evil 会被判定为子路径。
         let Some(entry_path) = entry.enclosed_name() else {
-            warn!("zip 条目路径不安全, 跳过: {}", entry.name());
+            warn!(
+                "zip 条目路径不安全, 跳过: {}",
+                entry.name().as_deref().unwrap_or("<无法读取文件名>")
+            );
             continue;
         };
 
@@ -563,7 +614,8 @@ fn stage_and_replace(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts
         }
 
         let tmp_path = core_dir.join(format!("{name}.{NEW_SUFFIX}"));
-        let mut out = fs::File::create(&tmp_path).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
+        let mut out =
+            fs::File::create(&tmp_path).map_err(|e| AppError::Msg(format!("创建文件失败: {e}")))?;
         io::copy(&mut entry, &mut out).map_err(|e| AppError::Msg(format!("解压文件失败: {e}")))?;
         debug!("已解压 {name} -> {}", tmp_path.display());
         staged.push(name.to_string());
@@ -612,15 +664,28 @@ fn stage_and_replace(zip_path: &Path, core_dir: &Path, artifacts: &CoreArtifacts
 /// 核心文件了, 界面上会显示成未安装。所以必须把已挪走的旧文件放回去; 万一连
 /// 恢复都失败, 错误信息要指名道姓地给出需要手工处理的路径, 而不是只说一句
 /// "更新失败"。
-fn replace_failed(core_dir: &Path, renamed: &[(&str, PathBuf)], name: &str, action: &str, err: &io::Error) -> AppError {
+fn replace_failed(
+    core_dir: &Path,
+    renamed: &[(&str, PathBuf)],
+    name: &str,
+    action: &str,
+    err: &io::Error,
+) -> AppError {
     let unrecovered = rollback(core_dir, renamed);
     if unrecovered.is_empty() {
-        return AppError::Msg(format!("{action} {name} 失败: {err} (已恢复到更新前的版本)"));
+        return AppError::Msg(format!(
+            "{action} {name} 失败: {err} (已恢复到更新前的版本)"
+        ));
     }
 
     let paths: Vec<String> = unrecovered
         .iter()
-        .map(|n| core_dir.join(format!("{n}.{OLD_SUFFIX}")).display().to_string())
+        .map(|n| {
+            core_dir
+                .join(format!("{n}.{OLD_SUFFIX}"))
+                .display()
+                .to_string()
+        })
         .collect();
     AppError::Msg(format!(
         "{action} {name} 失败: {err}; 以下文件未能自动恢复, 请手动去掉 .{OLD_SUFFIX} 后缀: {}",
@@ -699,18 +764,25 @@ pub fn update_ruleset(
 
         info!("[ruleset] {name}: 开始更新");
 
-        let expected_hash = match download_and_parse_sha256sum(&entry.sha256sum, max_retries, delay_secs) {
-            Ok(hash) => hash,
-            Err(e) => {
-                warn!("[ruleset] {name}: 获取 SHA256 校验和失败: {e}");
-                continue;
-            }
-        };
+        let expected_hash =
+            match download_and_parse_sha256sum(&entry.sha256sum, max_retries, delay_secs) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    warn!("[ruleset] {name}: 获取 SHA256 校验和失败: {e}");
+                    continue;
+                }
+            };
 
         let dat_path = Core::Xray.core_dir(exe_dir).join(format!("{name}.dat"));
         let tmp_path = Core::Xray.core_dir(exe_dir).join(format!("{name}.dat.tmp"));
 
-        match download_ruleset_with_retry(&entry.dat, &tmp_path, &expected_hash, max_retries, delay_secs) {
+        match download_ruleset_with_retry(
+            &entry.dat,
+            &tmp_path,
+            &expected_hash,
+            max_retries,
+            delay_secs,
+        ) {
             Ok(_) => {
                 if let Err(e) = fs::rename(&tmp_path, &dat_path) {
                     warn!("[ruleset] {name}: 移动文件失败: {e}");
@@ -733,7 +805,11 @@ pub fn update_ruleset(
 /// 带重试地下载 sha256sum 文件并解析出哈希值。
 ///
 /// 文件格式: `<hash>  <filename>`
-fn download_and_parse_sha256sum(url: &str, max_retries: u32, delay_secs: u64) -> Result<String, AppError> {
+fn download_and_parse_sha256sum(
+    url: &str,
+    max_retries: u32,
+    delay_secs: u64,
+) -> Result<String, AppError> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
             debug!("SHA256 校验和下载第 {attempt}/{max_retries} 次重试, 等待 {delay_secs}s...");
@@ -761,7 +837,9 @@ fn download_and_parse_sha256sum(url: &str, max_retries: u32, delay_secs: u64) ->
         }
     }
 
-    Err(AppError::Msg("获取 SHA256 校验和失败, 已达到最大重试次数".into()))
+    Err(AppError::Msg(
+        "获取 SHA256 校验和失败, 已达到最大重试次数".into(),
+    ))
 }
 
 /// 解析 sha256sum 文件内容, 返回哈希值。
@@ -820,10 +898,250 @@ fn download_ruleset_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Instant;
+
+    const TEST_HEADER_TIMEOUT: Duration = Duration::from_millis(300);
+    const TEST_STALL_TIMEOUT: Duration = Duration::from_millis(600);
+
+    /// 服务独立限制 accept、请求读取和响应写入, 不依赖被测客户端正确设置超时。
+    fn spawn_download_server(
+        request_count: usize,
+        mut respond: impl FnMut(usize, &mut TcpStream) -> io::Result<()> + Send + 'static,
+    ) -> (String, thread::JoinHandle<io::Result<Vec<String>>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut paths = Vec::new();
+            for index in 0..request_count {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    format!("等待本地测试请求 {index} 超时, 已收到 {paths:?}"),
+                                ));
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                };
+                // Windows 的 accepted socket 会继承 listener 的非阻塞状态。
+                // 后续请求读取依靠 socket 超时, 必须先显式恢复阻塞模式。
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                stream.set_nodelay(true)?;
+
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    if request.len() >= 8192 || Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "本地测试请求未及时结束",
+                        ));
+                    }
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).map_err(|e| {
+                        io::Error::new(
+                            e.kind(),
+                            format!("读取本地测试请求 {index} 的请求头失败: {e}"),
+                        )
+                    })?;
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                paths.push(
+                    request
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                if let Err(e) = respond(index, &mut stream) {
+                    // 超时用例会提前关闭客户端连接, 服务稍后写入时允许这些错误。
+                    if !matches!(
+                        e.kind(),
+                        io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                    ) {
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(paths)
+        });
+        (url, server)
+    }
+
+    fn assert_download_requests(
+        server: thread::JoinHandle<io::Result<Vec<String>>>,
+        client_result: &Result<(), AppError>,
+        expected_paths: &[&str],
+    ) {
+        let paths = match server.join() {
+            Ok(Ok(paths)) => paths,
+            result => panic!("本地 HTTP 服务失败: {result:?}; 客户端结果: {client_result:?}"),
+        };
+        assert_eq!(paths, expected_paths, "客户端结果: {client_result:?}");
+    }
+
+    fn download_test_file(url: &str, dest: &Path, stall_timeout: Duration) -> Result<(), AppError> {
+        // 显式关闭单次请求的代理, 不修改测试进程的全局代理环境。
+        let request = ureq::get(url).config().proxy(None).build();
+        download_file_with_timeouts(
+            request,
+            dest,
+            Duration::from_secs(2),
+            TEST_HEADER_TIMEOUT,
+            stall_timeout,
+        )
+    }
+
+    fn assert_download_timeout(result: Result<(), AppError>, prefix: &str) {
+        let error = result.unwrap_err().to_string();
+        assert!(error.starts_with(prefix), "意外的失败阶段: {error}");
+        assert!(error.contains("timeout"), "失败原因不是超时: {error}");
+    }
+
+    /// 正文总耗时超过头阶段和逐次读取预算, 但每次发送间隔远短于读取预算。
+    fn send_slow_download(stream: &mut TcpStream) -> io::Result<()> {
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n")?;
+        for byte in b"0123456789abcdef" {
+            thread::sleep(Duration::from_millis(100));
+            stream.write_all(&[*byte])?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_download_times_out_waiting_for_headers() {
+        let (url, server) = spawn_download_server(1, |_, stream| {
+            thread::sleep(Duration::from_millis(900));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone")
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_test_file(&url, &dest, Duration::from_secs(2));
+        assert_download_requests(server, &result, &["/"]);
+
+        assert_download_timeout(result, "下载失败:");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn test_download_times_out_on_slow_headers() {
+        let (url, server) = spawn_download_server(1, |_, stream| {
+            stream.write_all(b"HTTP/1.1 200 OK\r\nX-Slow: ")?;
+            for _ in 0..12 {
+                thread::sleep(Duration::from_millis(80));
+                stream.write_all(b"x")?;
+            }
+            stream.write_all(b"\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone")
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_test_file(&url, &dest, Duration::from_secs(2));
+        assert_download_requests(server, &result, &["/"]);
+
+        assert_download_timeout(result, "下载失败:");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn test_download_times_out_when_body_stalls() {
+        let (url, server) = spawn_download_server(1, |_, stream| {
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\npart",
+            )?;
+            thread::sleep(Duration::from_millis(1800));
+            stream.write_all(b"rest")
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_test_file(&url, &dest, TEST_STALL_TIMEOUT);
+        assert_download_requests(server, &result, &["/"]);
+
+        assert_download_timeout(result, "下载数据失败:");
+        assert_eq!(fs::read(&dest).unwrap(), b"part");
+    }
+
+    #[test]
+    fn test_download_allows_continuous_slow_body() {
+        let (url, server) = spawn_download_server(1, |_, stream| send_slow_download(stream));
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_test_file(&url, &dest, TEST_STALL_TIMEOUT);
+        assert_download_requests(server, &result, &["/"]);
+
+        result.unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"0123456789abcdef");
+    }
+
+    #[test]
+    fn test_download_follows_redirect_to_slow_body() {
+        let (url, server) = spawn_download_server(2, |index, stream| {
+            if index == 0 {
+                stream.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /body\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+            } else {
+                send_slow_download(stream)
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_test_file(&url, &dest, TEST_STALL_TIMEOUT);
+        assert_download_requests(server, &result, &["/", "/body"]);
+
+        result.unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"0123456789abcdef");
+    }
+
+    #[test]
+    fn test_download_times_out_waiting_for_redirected_headers() {
+        let (url, server) = spawn_download_server(2, |index, stream| {
+            if index == 0 {
+                stream.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /body\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+            } else {
+                thread::sleep(Duration::from_millis(900));
+                stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone",
+                )
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_test_file(&url, &dest, Duration::from_secs(2));
+        assert_download_requests(server, &result, &["/", "/body"]);
+
+        assert_download_timeout(result, "下载失败:");
+        assert!(!dest.exists());
+    }
 
     #[test]
     fn test_extract_version_simple() {
-        assert_eq!(extract_version("sing-box version 1.13.13"), Some("1.13.13".into()));
+        assert_eq!(
+            extract_version("sing-box version 1.13.13"),
+            Some("1.13.13".into())
+        );
         assert_eq!(extract_version("Xray 24.12.18"), Some("24.12.18".into()));
         assert_eq!(extract_version("v1.0.0"), Some("1.0.0".into()));
     }
@@ -927,10 +1245,18 @@ mod tests {
     }
 
     fn write_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        write_test_zip_with_compression(path, entries, zip::CompressionMethod::Stored);
+    }
+
+    fn write_test_zip_with_compression(
+        path: &Path,
+        entries: &[(&str, &[u8])],
+        compression: zip::CompressionMethod,
+    ) {
         use std::io::Write as _;
         let file = fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default().compression_method(compression);
         for &(name, data) in entries {
             zip.start_file(name, options).unwrap();
             zip.write_all(data).unwrap();
@@ -966,8 +1292,14 @@ mod tests {
 
         extract(&zip_path, &core_dir).unwrap();
 
-        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "exe");
-        assert_eq!(fs::read_to_string(core_dir.join("extra.dll")).unwrap(), "dll");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            "exe"
+        );
+        assert_eq!(
+            fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
+            "dll"
+        );
         for unwanted in ["geoip.dat", "LICENSE", "README.md"] {
             assert!(!core_dir.join(unwanted).exists(), "{unwanted} 不该被提取");
         }
@@ -980,7 +1312,10 @@ mod tests {
         let zip_path = dir.path().join("core.zip");
         write_test_zip(
             &zip_path,
-            &[("core.exe", &b"new-exe"[..]), ("geoip.dat", &b"official"[..])],
+            &[
+                ("core.exe", &b"new-exe"[..]),
+                ("geoip.dat", &b"official"[..]),
+            ],
         );
         let core_dir = dir.path().join("core");
         fs::create_dir_all(&core_dir).unwrap();
@@ -994,7 +1329,10 @@ mod tests {
             "user-custom",
             "用户配置的规则集被官方版覆盖了"
         );
-        assert_eq!(fs::read_to_string(core_dir.join("cache.db")).unwrap(), "runtime");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("cache.db")).unwrap(),
+            "runtime"
+        );
     }
 
     #[test]
@@ -1008,13 +1346,19 @@ mod tests {
 
         extract(&zip_path, &core_dir).unwrap();
 
-        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "new-exe");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            "new-exe"
+        );
         assert_eq!(
             fs::read_to_string(core_dir.join("core.exe.old")).unwrap(),
             "old-exe",
             "旧文件应保留为 .old 供回退"
         );
-        assert!(!core_dir.join("core.exe.new").exists(), "临时文件应已改名到位");
+        assert!(
+            !core_dir.join("core.exe.new").exists(),
+            "临时文件应已改名到位"
+        );
     }
 
     /// `.old` 留到下一次更新开始时才清理, `.new` 残留也一并清掉。
@@ -1037,29 +1381,44 @@ mod tests {
             "v2",
             ".old 应是本次被替换的版本, 不是上一轮的"
         );
-        assert!(!core_dir.join("extra.dll.new").exists(), "残留的 .new 应被清理");
+        assert!(
+            !core_dir.join("extra.dll.new").exists(),
+            "残留的 .new 应被清理"
+        );
     }
 
     #[test]
     fn test_extract_artifacts_missing_required_keeps_core_dir_intact() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("core.zip");
-        write_test_zip(&zip_path, &[("extra.dll", &b"dll"[..]), ("README.md", &b"readme"[..])]);
+        write_test_zip(
+            &zip_path,
+            &[("extra.dll", &b"dll"[..]), ("README.md", &b"readme"[..])],
+        );
         let core_dir = dir.path().join("core");
         fs::create_dir_all(&core_dir).unwrap();
         fs::write(core_dir.join("core.exe"), b"current").unwrap();
         fs::write(core_dir.join("extra.dll"), b"current-dll").unwrap();
 
         let err = extract(&zip_path, &core_dir).unwrap_err();
-        assert!(err.to_string().contains("core.exe"), "错误应指出缺哪个文件: {err}");
+        assert!(
+            err.to_string().contains("core.exe"),
+            "错误应指出缺哪个文件: {err}"
+        );
 
-        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "current");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            "current"
+        );
         assert_eq!(
             fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
             "current-dll",
             "必需文件缺失时不应替换任何文件"
         );
-        assert!(!core_dir.join("extra.dll.new").exists(), "失败后应清理临时文件");
+        assert!(
+            !core_dir.join("extra.dll.new").exists(),
+            "失败后应清理临时文件"
+        );
     }
 
     /// 本次更新失败时, 上一轮的 `.old` 是用户唯一的回退副本, 不能被清掉。
@@ -1075,12 +1434,100 @@ mod tests {
 
         extract(&zip_path, &core_dir).unwrap_err();
 
-        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "current");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            "current"
+        );
         assert_eq!(
             fs::read_to_string(core_dir.join("core.exe.old")).unwrap(),
             "prev",
             "更新没成功就不该清掉上一轮的回退副本"
         );
+    }
+
+    #[test]
+    fn test_extract_artifacts_accepts_deflated_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("core.zip");
+        let data = vec![0xAB; 32 * 1024];
+        write_test_zip_with_compression(
+            &zip_path,
+            &[("extra.dll", b"new-dll"), ("core.exe", &data)],
+            zip::CompressionMethod::Deflated,
+        );
+        let core_dir = dir.path().join("core");
+
+        extract(&zip_path, &core_dir).unwrap();
+
+        assert_eq!(fs::read(core_dir.join("core.exe")).unwrap(), data);
+        assert_eq!(fs::read(core_dir.join("extra.dll")).unwrap(), b"new-dll");
+    }
+
+    /// 只缩小头部声明的解压大小, 保持实际数据与 CRC 完整, 验证依赖的大小约束。
+    #[test]
+    fn test_extract_artifacts_rejects_understated_size_without_replacing_files() {
+        for compression in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let zip_path = dir.path().join("core.zip");
+            let data = vec![0xAB; 32 * 1024];
+            // 先成功暂存可选文件, 再由必需文件触发错误, 覆盖两份 .new 的清理。
+            write_test_zip_with_compression(
+                &zip_path,
+                &[("extra.dll", b"new-dll"), ("core.exe", &data)],
+                compression,
+            );
+            let (local_header, central_header) = {
+                let mut archive = zip::ZipArchive::new(fs::File::open(&zip_path).unwrap()).unwrap();
+                let entry = archive.by_name("core.exe").unwrap();
+                assert_eq!(entry.size(), data.len() as u64);
+                (
+                    entry.header_start() as usize,
+                    entry.central_header_start() as usize,
+                )
+            };
+            let mut bytes = fs::read(&zip_path).unwrap();
+            // ZIP32 解压大小分别位于 local header +22、central header +24。
+            for offset in [local_header + 22, central_header + 24] {
+                bytes[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
+            }
+            fs::write(&zip_path, bytes).unwrap();
+
+            let core_dir = dir.path().join("core");
+            fs::create_dir_all(&core_dir).unwrap();
+            let original_files = [
+                ("core.exe", "current-exe"),
+                ("extra.dll", "current-dll"),
+                ("core.exe.old", "previous-exe"),
+                ("extra.dll.old", "previous-dll"),
+            ];
+            for (name, content) in original_files {
+                fs::write(core_dir.join(name), content).unwrap();
+            }
+
+            let err = extract(&zip_path, &core_dir).unwrap_err().to_string();
+            assert!(err.starts_with("解压文件失败:"), "{compression:?}: {err}");
+            assert!(
+                err.contains("declared uncompressed size"),
+                "{compression:?}: {err}"
+            );
+
+            for (name, content) in original_files {
+                assert_eq!(
+                    fs::read_to_string(core_dir.join(name)).unwrap(),
+                    content,
+                    "{compression:?}: 读取失败不能替换 {name}"
+                );
+            }
+            for name in ["core.exe", "extra.dll"] {
+                assert!(
+                    !core_dir.join(format!("{name}.{NEW_SUFFIX}")).exists(),
+                    "{compression:?}: 失败后应清理 {name} 的临时文件"
+                );
+            }
+        }
     }
 
     /// 替换中途失败时, 已经挪走的旧文件必须回到原位, 否则核心目录里会缺文件,
@@ -1100,8 +1547,14 @@ mod tests {
         ];
         assert!(rollback(core_dir, &renamed).is_empty(), "应全部恢复成功");
 
-        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "old-exe");
-        assert_eq!(fs::read_to_string(core_dir.join("extra.dll")).unwrap(), "old-dll");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            "old-exe"
+        );
+        assert_eq!(
+            fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
+            "old-dll"
+        );
         assert!(!core_dir.join("core.exe.old").exists());
         assert!(!core_dir.join("extra.dll.old").exists());
     }
@@ -1130,7 +1583,10 @@ mod tests {
         let zip_path = dir.path().join("core.zip");
         write_test_zip(
             &zip_path,
-            &[("core.exe", &b"new-exe"[..]), ("extra.dll", &b"new-dll"[..])],
+            &[
+                ("core.exe", &b"new-exe"[..]),
+                ("extra.dll", &b"new-dll"[..]),
+            ],
         );
         let core_dir = dir.path().join("core");
         fs::create_dir_all(&core_dir).unwrap();
@@ -1139,15 +1595,24 @@ mod tests {
         fs::create_dir_all(core_dir.join(format!("extra.dll.{OLD_SUFFIX}"))).unwrap();
 
         let err = extract(&zip_path, &core_dir).unwrap_err();
-        assert!(err.to_string().contains("extra.dll"), "错误应指出哪个文件失败: {err}");
-        assert!(err.to_string().contains("已恢复"), "回滚成功后要告知用户: {err}");
+        assert!(
+            err.to_string().contains("extra.dll"),
+            "错误应指出哪个文件失败: {err}"
+        );
+        assert!(
+            err.to_string().contains("已恢复"),
+            "回滚成功后要告知用户: {err}"
+        );
 
         assert_eq!(
             fs::read_to_string(core_dir.join("core.exe")).unwrap(),
             "old-exe",
             "已经换成新版的文件必须还原"
         );
-        assert_eq!(fs::read_to_string(core_dir.join("extra.dll")).unwrap(), "old-dll");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
+            "old-dll"
+        );
         assert!(!core_dir.join(format!("core.exe.{NEW_SUFFIX}")).exists());
         assert!(!core_dir.join(format!("extra.dll.{NEW_SUFFIX}")).exists());
     }
@@ -1163,7 +1628,10 @@ mod tests {
 
         extract(&zip_path, &core_dir).unwrap();
 
-        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "exe");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            "exe"
+        );
         assert_eq!(
             fs::read_to_string(core_dir.join("extra.dll")).unwrap(),
             "kept",
@@ -1187,7 +1655,10 @@ mod tests {
 
         extract(&zip_path, &core_dir).unwrap();
 
-        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "exe");
+        assert_eq!(
+            fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+            "exe"
+        );
         assert!(!core_dir.join("sing-box-1.2.3-windows-amd64").exists());
         assert!(!core_dir.join("LICENSE").exists());
     }
@@ -1195,17 +1666,33 @@ mod tests {
     /// 路径穿越条目即使文件名在清单里, 也必须被拒绝。
     #[test]
     fn test_extract_artifacts_rejects_path_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        let zip_path = dir.path().join("core.zip");
-        write_test_zip(&zip_path, &[("../core.exe", &b"pwned"[..]), ("core.exe", &b"good"[..])]);
-        let core_dir = dir.path().join("core");
+        for unsafe_name in [
+            "../core.exe",
+            r"..\core.exe",
+            "dir/../../core.exe",
+            r"\\?\C:\../core.exe",
+            r"\\?\C:\a/../../core.exe",
+            r"\\?\UNC\server\share\../core.exe",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let zip_path = dir.path().join("core.zip");
+            write_test_zip(
+                &zip_path,
+                &[(unsafe_name, &b"pwned"[..]), ("core.exe", &b"good"[..])],
+            );
+            let core_dir = dir.path().join("core");
 
-        extract(&zip_path, &core_dir).unwrap();
+            extract(&zip_path, &core_dir).unwrap();
 
-        assert_eq!(fs::read_to_string(core_dir.join("core.exe")).unwrap(), "good");
-        assert!(
-            !dir.path().join("core.exe").exists(),
-            "路径穿越条目被写到了 core_dir 之外"
-        );
+            assert_eq!(
+                fs::read_to_string(core_dir.join("core.exe")).unwrap(),
+                "good",
+                "{unsafe_name}"
+            );
+            assert!(
+                !dir.path().join("core.exe").exists(),
+                "路径穿越条目被写到了 core_dir 之外: {unsafe_name}"
+            );
+        }
     }
 }

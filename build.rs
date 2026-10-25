@@ -37,7 +37,9 @@ fn main() {
         let mut resource = winresource::WindowsResource::new();
         resource.set_manifest(manifest);
         resource.set_icon("icons/ladder.ico");
-        resource.compile().expect("failed to compile Windows resources");
+        resource
+            .compile()
+            .expect("failed to compile Windows resources");
 
         // OUT_DIR 形如 target/debug/build/<crate>/out, 向上三级到达 profile 目录
         let out_dir = std::env::var("OUT_DIR").unwrap();
@@ -49,7 +51,10 @@ fn main() {
 
         // 将图标、配置、settings.json 复制到输出目录, 使可执行文件能通过相对路径访问
         copy_dir(std::path::Path::new("icons"), &profile_dir.join("icons"));
-        copy_dir(std::path::Path::new("configs"), &profile_dir.join("configs"));
+        copy_dir(
+            std::path::Path::new("configs"),
+            &profile_dir.join("configs"),
+        );
         let _ = std::fs::copy("settings.json", profile_dir.join("settings.json"));
         let _ = std::fs::copy("README.md", profile_dir.join("README.md"));
         let _ = std::fs::copy("LICENSE", profile_dir.join("LICENSE"));
@@ -59,7 +64,9 @@ fn main() {
 /// 递归复制目录, 目标目录不存在时自动创建。
 fn copy_dir(src: &std::path::Path, dest: &std::path::Path) {
     let _ = std::fs::create_dir_all(dest);
-    let Ok(entries) = std::fs::read_dir(src) else { return };
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
     for entry in entries.flatten() {
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());

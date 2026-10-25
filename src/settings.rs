@@ -28,7 +28,7 @@ impl CoreMode {
 
 /// 核心配置。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct Core {
+pub struct CoreSettings {
     #[serde(default)]
     pub mode: CoreMode,
 }
@@ -43,7 +43,7 @@ pub struct Settings {
     #[serde(default)]
     pub download: Download,
     #[serde(default)]
-    pub core: Core,
+    pub core: CoreSettings,
 }
 
 /// 加载期间收集的警告信息, 供 init_logging 之后通过 tracing 输出。
@@ -187,7 +187,10 @@ impl Settings {
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
-                push_warning(format!("读取配置文件失败 ({}), 使用默认配置: {e}", path.display()));
+                push_warning(format!(
+                    "读取配置文件失败 ({}), 使用默认配置: {e}",
+                    path.display()
+                ));
                 return Self::default();
             }
         };
@@ -200,7 +203,10 @@ impl Settings {
                 settings
             }
             Err(e) => {
-                push_warning(format!("解析配置文件失败 ({}), 使用默认配置: {e}", path.display()));
+                push_warning(format!(
+                    "解析配置文件失败 ({}), 使用默认配置: {e}",
+                    path.display()
+                ));
                 Self::default()
             }
         }
@@ -209,7 +215,8 @@ impl Settings {
     /// 将当前配置写入 `exe_dir/settings.json`。
     pub fn save(&self, exe_dir: &Path) -> Result<(), AppError> {
         let path = exe_dir.join("settings.json");
-        let json = serde_json::to_string_pretty(self).map_err(|e| AppError::Msg(format!("序列化配置失败: {e}")))?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| AppError::Msg(format!("序列化配置失败: {e}")))?;
         std::fs::write(&path, json).map_err(|e| AppError::Msg(format!("写入配置文件失败: {e}")))
     }
 
@@ -256,13 +263,17 @@ impl Settings {
 
         // interval_days 允许为 0, 语义是每次启动都更新规则集。
         if self.download.ruleset.interval_days > MAX_INTERVAL_DAYS {
-            warnings.push(format!("interval_days 超出上限 {MAX_INTERVAL_DAYS}, 已自动限制"));
+            warnings.push(format!(
+                "interval_days 超出上限 {MAX_INTERVAL_DAYS}, 已自动限制"
+            ));
             self.download.ruleset.interval_days = MAX_INTERVAL_DAYS;
         }
 
         // max_size_mb 允许为 0, 语义是不限制日志大小。
         if self.log.max_size_mb > MAX_LOG_SIZE_MB {
-            warnings.push(format!("log.max_size_mb 超出上限 {MAX_LOG_SIZE_MB}, 已自动限制"));
+            warnings.push(format!(
+                "log.max_size_mb 超出上限 {MAX_LOG_SIZE_MB}, 已自动限制"
+            ));
             self.log.max_size_mb = MAX_LOG_SIZE_MB;
         }
 
@@ -345,13 +356,15 @@ mod tests {
 
     #[test]
     fn test_parse_settings_interval_days_bounds() {
-        let (s, warnings) = parse_settings(r#"{"download":{"ruleset":{"interval_days":100000}}}"#).unwrap();
+        let (s, warnings) =
+            parse_settings(r#"{"download":{"ruleset":{"interval_days":100000}}}"#).unwrap();
         assert_eq!(s.download.ruleset.interval_days, MAX_INTERVAL_DAYS);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("interval_days"));
 
         // 0 是合法值, 语义为每次启动都更新规则集
-        let (s, warnings) = parse_settings(r#"{"download":{"ruleset":{"interval_days":0}}}"#).unwrap();
+        let (s, warnings) =
+            parse_settings(r#"{"download":{"ruleset":{"interval_days":0}}}"#).unwrap();
         assert_eq!(s.download.ruleset.interval_days, 0);
         assert!(warnings.is_empty());
     }
