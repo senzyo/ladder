@@ -16,14 +16,23 @@
       - 适用于 ARM64/ARM64EC 的 MSVC 生成工具(最新版)
 - LLVM/Clang
 
+### 检查与测试
+
+```powershell
+cargo fmt
+cargo clippy --locked
+cargo test --locked
+cargo run --locked
+```
+
 ### 编译
 
 ```powershell
 # amd64
-cargo build --release
+cargo build --release --locked
 
 # arm64 (vcvarsall.bat 路径需根据实际安装调整)
-cmd /c "`"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat`" x64_arm64 && cargo build --release --target aarch64-pc-windows-msvc"
+cmd /c "`"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat`" x64_arm64 && cargo build --release --locked --target aarch64-pc-windows-msvc"
 ```
 
 产出路径:
@@ -31,12 +40,4 @@ cmd /c "`"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxili
 ```text
 target\release\ladder.exe                           # amd64
 target\aarch64-pc-windows-msvc\release\ladder.exe   # arm64
-```
-
-### 检查与测试
-
-```powershell
-cargo fmt
-cargo clippy
-cargo test
 ```

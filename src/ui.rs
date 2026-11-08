@@ -331,6 +331,9 @@ impl MainWindow {
                             .child(format!("{} 个文件", state.configs.len())),
                     ),
             )
+            .when_some(state.scan_error.clone(), |el, message| {
+                el.child(error_message(message, colors))
+            })
             .child(files)
     }
 

@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::xray_uses_tun;
+use crate::core_output::CoreOutput;
 use crate::dns::DnsLease;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +49,7 @@ pub struct CoreState {
     pub running: bool,
     pub busy: bool,
     pub error: Option<String>,
+    pub scan_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -245,7 +248,7 @@ fn is_json(path: &Path) -> bool {
 
 struct ManagedChild {
     process: Child,
-    reason: Arc<Mutex<Option<&'static str>>>,
+    output: CoreOutput,
 }
 
 struct Worker {
@@ -326,10 +329,7 @@ impl Worker {
                 };
                 (core, result)
             }
-            Action::Use(core, name) => {
-                let result = self.stop(core).and_then(|_| self.start(core, &name));
-                (core, result)
-            }
+            Action::Use(core, name) => (core, self.use_config(core, &name)),
         };
         let mut snapshot = self.state.lock().unwrap();
         let status = snapshot.core_mut(core);
@@ -339,13 +339,31 @@ impl Worker {
         status.error = result.err();
     }
 
+    fn use_config(&mut self, core: Core, name: &str) -> Result<(), String> {
+        let mut next = self.saved.clone();
+        match core {
+            Core::SingBox => next.sing_box = Some(name.into()),
+            Core::Xray => next.xray = Some(name.into()),
+        }
+        next.store(&self.root)
+            .map_err(|e| format!("保存当前配置失败: {e}"))?;
+        self.saved = next;
+        self.state.lock().unwrap().core_mut(core).current = Some(name.into());
+        self.stop(core)?;
+        self.start(core, name)
+    }
+
     fn refresh(&self) {
         for core in Core::ALL {
             let result = list_configs(&core.config_dir(&self.root));
             let mut snapshot = self.state.lock().unwrap();
+            let state = snapshot.core_mut(core);
             match result {
-                Ok(files) => snapshot.core_mut(core).configs = files,
-                Err(e) => snapshot.core_mut(core).error = Some(e),
+                Ok(files) => {
+                    state.configs = files;
+                    state.scan_error = None;
+                }
+                Err(e) => state.scan_error = Some(e),
             }
         }
     }
@@ -359,15 +377,6 @@ impl Worker {
             return Err("配置文件名无效".into());
         }
         let config = core.config_dir(&self.root).join(name);
-        let text = fs::read_to_string(&config).map_err(|e| format!("读取 {name} 失败: {e}"))?;
-        let json: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
-            .map_err(|e| {
-                format!(
-                    "{name} 不是有效的 JSON (第 {} 行, 第 {} 列) ",
-                    e.line(),
-                    e.column()
-                )
-            })?;
         let assets = self.root.join(format!("{}_core", core.label()));
         let exe = assets.join(format!("{}.exe", core.label()));
         if !exe.is_file() {
@@ -382,7 +391,7 @@ impl Worker {
         }
         command
             .arg("-c")
-            .arg(config)
+            .arg(&config)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -391,12 +400,7 @@ impl Worker {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        let tun = core == Core::Xray
-            && json["inbounds"].as_array().is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry["protocol"].as_str() == Some("tun"))
-            });
+        let tun = core == Core::Xray && xray_uses_tun(&config)?;
         let run = (|| {
             if core == Core::Xray {
                 self.dns.restore()?;
@@ -407,32 +411,11 @@ impl Worker {
             let mut process = command
                 .spawn()
                 .map_err(|e| format!("启动 {} 失败: {e}", core.label()))?;
-            let reason = Arc::new(Mutex::new(None));
-            watch_output(process.stdout.take().unwrap(), reason.clone());
-            watch_output(process.stderr.take().unwrap(), reason.clone());
-            self.children[core as usize] = Some(ManagedChild { process, reason });
-            // 两种核心没有统一的就绪通知。先捕获启动早期退出, 再保存当前配置。
-            for _ in 0..10 {
-                thread::sleep(Duration::from_millis(100));
-                let managed = self.children[core as usize].as_mut().unwrap();
-                if let Some(code) = managed
-                    .process
-                    .try_wait()
-                    .map_err(|e| format!("检查核心状态失败: {e}"))?
-                {
-                    return Err(exit_message(managed, code));
-                }
-            }
-            if self.saved.current(core).as_deref() != Some(name) {
-                let mut next = self.saved.clone();
-                match core {
-                    Core::SingBox => next.sing_box = Some(name.into()),
-                    Core::Xray => next.xray = Some(name.into()),
-                }
-                next.store(&self.root)
-                    .map_err(|e| format!("保存当前配置失败: {e}"))?;
-                self.saved = next;
-            }
+            let output = CoreOutput::capture(
+                process.stdout.take().unwrap(),
+                process.stderr.take().unwrap(),
+            );
+            self.children[core as usize] = Some(ManagedChild { process, output });
             Ok(())
         })();
         if let Err(error) = run {
@@ -460,7 +443,7 @@ impl Worker {
                 Ok(())
             })();
             result.map_err(|e| format!("停止 {} 失败: {e}", core.label()))?;
-            *owned = None;
+            owned.take().unwrap().output.finish();
         }
         self.state.lock().unwrap().core_mut(core).running = false;
         if core == Core::Xray {
@@ -485,62 +468,27 @@ impl Worker {
         let Some(child) = &mut self.children[core as usize] else {
             return;
         };
-        let error = match child.process.try_wait() {
+        let status = match child.process.try_wait() {
             Ok(None) => return,
             Err(e) => {
                 self.state.lock().unwrap().core_mut(core).error =
                     Some(format!("检查核心状态失败: {e}"));
                 return;
             }
-            Ok(Some(code)) => exit_message(child, code),
+            Ok(Some(code)) => code,
         };
+        let child = self.children[core as usize].take().unwrap();
+        let reason = child
+            .output
+            .finish()
+            .unwrap_or("请检查配置内容及核心所需的资源文件");
+        let error = format!("核心已退出 ({status}) 。{reason}");
         let cleanup = self.stop(core);
         self.state.lock().unwrap().core_mut(core).error = Some(match cleanup {
             Ok(()) => error,
             Err(e) => format!("{error}；{e}"),
         });
     }
-}
-
-fn exit_message(child: &ManagedChild, status: std::process::ExitStatus) -> String {
-    let reason = child
-        .reason
-        .lock()
-        .unwrap()
-        .unwrap_or("请检查配置内容及核心所需的资源文件");
-    format!("核心已退出 ({status}) 。{reason}")
-}
-
-// 核心的原始输出可能包含配置里的私密值, 只向界面传递已知的错误分类。
-fn watch_output(mut pipe: impl Read + Send + 'static, reason: Arc<Mutex<Option<&'static str>>>) {
-    thread::spawn(move || {
-        let mut buffer = [0; 4096];
-        while let Ok(size) = pipe.read(&mut buffer) {
-            if size == 0 {
-                break;
-            }
-            let line = String::from_utf8_lossy(&buffer[..size]).to_ascii_lowercase();
-            let cause =
-                if line.contains("address already in use") || line.contains("only one usage") {
-                    "监听端口或地址已被占用"
-                } else if line.contains("access is denied") || line.contains("permission denied") {
-                    "核心没有访问所需资源的权限"
-                } else if line.contains("unknown field")
-                    || line.contains("unsupported")
-                    || line.contains("unknown type")
-                    || line.contains("unknown inbound")
-                    || line.contains("unknown outbound")
-                    || line.contains("unknown config id")
-                {
-                    "当前核心不支持配置中的字段或类型"
-                } else if line.contains("cannot find the file") || line.contains("no such file") {
-                    "核心找不到配置引用的资源文件"
-                } else {
-                    continue;
-                };
-            *reason.lock().unwrap() = Some(cause);
-        }
-    });
 }
 
 #[cfg(test)]
@@ -559,9 +507,21 @@ mod tests {
         }
     }
 
+    fn failed(runtime: &Runtime, core: Core) -> CoreState {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let state = runtime.snapshot().core(core).clone();
+            if !state.busy && !state.running && state.error.is_some() {
+                return state;
+            }
+            assert!(Instant::now() < deadline, "等待核心退出超时: {state:?}");
+            thread::sleep(Duration::from_millis(30));
+        }
+    }
+
     // 真实子进程验证 Windows 句柄归属、带空格的路径和启动失败, 不操作网络接口。
     #[test]
-    fn switch_failure_keeps_last_success_and_leaves_other_processes_running() {
+    fn selection_survives_start_failure_retry_and_restart_without_affecting_other_processes() {
         let folder = tempfile::Builder::new()
             .prefix("梯子 runtime ")
             .tempdir()
@@ -600,7 +560,11 @@ mod tests {
             fs::create_dir(&dir).unwrap();
             fs::copy(&exe, dir.join(format!("{}.exe", core.label()))).unwrap();
             fs::create_dir_all(core.config_dir(root)).unwrap();
-            fs::write(core.config_dir(root).join("日常.JSON"), "{}").unwrap();
+            let config = match core {
+                Core::SingBox => "{ /* comment */ \"log\": {}, }",
+                Core::Xray => "# comment\n{ \"log\": {} }",
+            };
+            fs::write(core.config_dir(root).join("日常.JSON"), config).unwrap();
             fs::write(
                 core.config_dir(root).join("失败.json"),
                 r#"{"fixture_failure": true}"#,
@@ -619,17 +583,40 @@ mod tests {
             assert!(state.running, "{state:?}");
             assert_eq!(state.current.as_deref(), Some("日常.JSON"));
         }
+        let blocked_save = root.join("ladder-state.json.tmp");
+        fs::create_dir(&blocked_save).unwrap();
         runtime
             .send(Action::Use(Core::SingBox, "失败.json".into()))
             .unwrap();
-        assert!(runtime.send(Action::Stop(Core::SingBox)).is_err());
-        let stopped = idle(&runtime, Core::SingBox);
+        let unchanged = idle(&runtime, Core::SingBox);
+        assert!(unchanged.running);
+        assert_eq!(unchanged.current.as_deref(), Some("日常.JSON"));
+        assert!(unchanged.error.unwrap().contains("保存当前配置失败"));
+        assert_eq!(
+            Saved::load(root).unwrap().sing_box.as_deref(),
+            Some("日常.JSON")
+        );
+        fs::remove_dir(blocked_save).unwrap();
+
+        runtime
+            .send(Action::Use(Core::SingBox, "失败.json".into()))
+            .unwrap();
+        let stopped = failed(&runtime, Core::SingBox);
         assert!(!stopped.running);
-        assert_eq!(stopped.current.as_deref(), Some("日常.JSON"));
+        assert_eq!(stopped.current.as_deref(), Some("失败.json"));
+        assert_eq!(
+            Saved::load(root).unwrap().sing_box.as_deref(),
+            Some("失败.json")
+        );
         let error = stopped.error.unwrap();
         assert!(error.contains("42"));
+        assert!(error.contains("核心没有访问所需资源的权限"));
         assert!(!error.contains("PRIVATE_FIXTURE_VALUE"));
         assert!(runtime.snapshot().xray.running);
+        runtime.send(Action::Start(Core::SingBox)).unwrap();
+        let retry = failed(&runtime, Core::SingBox);
+        assert_eq!(retry.current.as_deref(), Some("失败.json"));
+        assert!(retry.error.unwrap().contains("42"));
         runtime
             .send(Action::Set(Setting::AutoSingBox, true))
             .unwrap();
@@ -640,11 +627,63 @@ mod tests {
         assert!(external.try_wait().unwrap().is_none());
 
         let reopened = Runtime::open(root.to_owned()).unwrap();
-        assert!(idle(&reopened, Core::SingBox).running);
+        let restarted = failed(&reopened, Core::SingBox);
+        assert_eq!(restarted.current.as_deref(), Some("失败.json"));
+        assert!(restarted.error.unwrap().contains("42"));
         assert!(!reopened.snapshot().xray.running);
         assert!(reopened.snapshot().settings.minimize_to_tray);
         reopened.shutdown().unwrap();
         external.kill().unwrap();
         external.wait().unwrap();
+    }
+
+    #[test]
+    fn selection_is_saved_even_when_the_core_is_missing() {
+        let folder = tempfile::tempdir().unwrap();
+        let runtime = Runtime::open(folder.path().to_owned()).unwrap();
+        runtime
+            .send(Action::Use(Core::SingBox, "选中的配置.json".into()))
+            .unwrap();
+        let state = failed(&runtime, Core::SingBox);
+        assert_eq!(state.current.as_deref(), Some("选中的配置.json"));
+        assert!(state.error.unwrap().contains("未找到核心程序"));
+        assert_eq!(
+            Saved::load(folder.path()).unwrap().sing_box.as_deref(),
+            Some("选中的配置.json")
+        );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn recovering_config_directory_clears_only_the_scan_error() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        for core in Core::ALL {
+            fs::create_dir_all(core.config_dir(root)).unwrap();
+        }
+        let config_dir = Core::SingBox.config_dir(root);
+        fs::write(config_dir.join("配置.json"), "{}").unwrap();
+        let state = Arc::new(Mutex::new(Snapshot::default()));
+        state.lock().unwrap().sing_box.error = Some("核心退出错误".into());
+        let worker = Worker {
+            root: root.to_owned(),
+            state: state.clone(),
+            saved: Saved::default(),
+            children: [None, None],
+            dns: DnsLease::new(root),
+        };
+        worker.refresh();
+        assert_eq!(state.lock().unwrap().sing_box.configs, vec!["配置.json"]);
+        fs::remove_file(config_dir.join("配置.json")).unwrap();
+        fs::remove_dir(&config_dir).unwrap();
+        worker.refresh();
+        assert!(state.lock().unwrap().sing_box.scan_error.is_some());
+        fs::create_dir(&config_dir).unwrap();
+        fs::write(config_dir.join("恢复.json"), "{}").unwrap();
+        worker.refresh();
+        let snapshot = state.lock().unwrap();
+        assert!(snapshot.sing_box.scan_error.is_none());
+        assert_eq!(snapshot.sing_box.configs, vec!["恢复.json"]);
+        assert_eq!(snapshot.sing_box.error.as_deref(), Some("核心退出错误"));
     }
 }

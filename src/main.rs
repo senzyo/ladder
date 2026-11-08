@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+mod config;
+mod core_output;
 mod dns;
 mod runtime;
 mod ui;
