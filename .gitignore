@@ -1,0 +1,10 @@
+/target/
+/dist/
+/ladder-state.json
+/ladder-state.json.tmp
+/dns-recovery.json
+/dns-recovery.tmp
+/configs/
+/sing-box_core/
+/xray_core/
+
