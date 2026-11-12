@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::ptr;
 
 use gpui::Window;
@@ -111,11 +110,27 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
     }
     let notepad =
         PathBuf::from(OsString::from_wide(&directory[..length as usize])).join("notepad.exe");
-    Command::new(notepad)
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("无法启动系统记事本: {error}"))
+    let notepad: Vec<u16> = notepad.as_os_str().encode_wide().chain(Some(0)).collect();
+    let quoted_path: Vec<u16> = Some(b'"' as u16)
+        .into_iter()
+        .chain(path.as_os_str().encode_wide())
+        .chain([b'"' as u16, 0])
+        .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            w!("open"),
+            notepad.as_ptr(),
+            quoted_path.as_ptr(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result > 32 {
+        Ok(())
+    } else {
+        Err(format!("无法启动系统记事本 (Windows 错误码 {result})"))
+    }
 }
 
 #[cfg(test)]

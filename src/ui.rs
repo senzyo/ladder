@@ -539,6 +539,12 @@ impl MainWindow {
                 Setting::AutoXray,
                 settings.auto_xray,
             ),
+            (
+                "劫持DNS到本地回环",
+                "下次启动任一核心时，将物理网卡 DNS 设为 127.0.0.1 和 ::1",
+                Setting::HijackDns,
+                settings.hijack_dns,
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -662,10 +668,39 @@ impl Render for MainWindow {
                     .flex_col()
                     .p(px(20.))
                     .gap(px(10.))
+                    .when_some(self.snapshot.dns_recovery_error.clone(), |el, message| {
+                        let busy = self.snapshot.dns_recovery_busy;
+                        el.child(
+                            div()
+                                .flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .child(error_message(message, colors)),
+                                )
+                                .child(action_button(
+                                    if busy {
+                                        "正在恢复 DNS"
+                                    } else {
+                                        "重试恢复 DNS"
+                                    },
+                                    0,
+                                    (!busy).then_some(UiAction::Run(Action::RetryDns)),
+                                    false,
+                                    colors,
+                                    cx,
+                                )),
+                        )
+                    })
                     .when_some(
                         self.command_error
                             .clone()
-                            .or_else(|| self.snapshot.error.clone()),
+                            .or_else(|| self.snapshot.error.clone())
+                            .or_else(|| self.snapshot.dns_task_warning.clone()),
                         |el, message| el.child(error_message(message, colors)),
                     )
                     .child(div().flex_1().min_h(px(0.)).child(page)),
