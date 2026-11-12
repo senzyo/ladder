@@ -2,6 +2,7 @@
 
 mod config;
 mod core_output;
+mod desktop;
 mod dns;
 mod runtime;
 mod ui;
@@ -81,7 +82,7 @@ fn open_main(
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(660.), px(390.))),
+            window_min_size: Some(size(px(660.), px(440.))),
             titlebar: Some(TitlebarOptions {
                 title: Some("Ladder".into()),
                 ..Default::default()

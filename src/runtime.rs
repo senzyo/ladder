@@ -32,6 +32,14 @@ impl Core {
     fn config_dir(self, root: &Path) -> PathBuf {
         root.join("configs").join(self.label())
     }
+
+    fn core_dir(self, root: &Path) -> PathBuf {
+        root.join(format!("{}_core", self.label()))
+    }
+
+    fn executable(self, root: &Path) -> PathBuf {
+        self.core_dir(root).join(format!("{}.exe", self.label()))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -42,12 +50,21 @@ pub struct Settings {
     pub auto_xray: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreOperation {
+    Starting,
+    Stopping,
+    Switching,
+    Restarting,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CoreState {
     pub configs: Vec<String>,
     pub current: Option<String>,
+    pub installed: bool,
     pub running: bool,
-    pub busy: bool,
+    pub operation: Option<CoreOperation>,
     pub error: Option<String>,
     pub scan_error: Option<String>,
 }
@@ -83,9 +100,11 @@ pub enum Setting {
     AutoXray,
 }
 
+#[derive(Clone)]
 pub enum Action {
     Start(Core),
     Stop(Core),
+    Restart(Core),
     Use(Core, String),
     Set(Setting, bool),
 }
@@ -163,10 +182,12 @@ impl Runtime {
             let state = snapshot.core_mut(core);
             state.configs = list_configs(&dir)?;
             state.current = saved.current(core).clone();
-            state.busy = match core {
+            state.installed = core.executable(&root).is_file();
+            let auto = match core {
                 Core::SingBox => saved.settings.auto_sing_box,
                 Core::Xray => saved.settings.auto_xray,
             };
+            state.operation = auto.then_some(CoreOperation::Starting);
         }
         let state = Arc::new(Mutex::new(snapshot));
         let (tx, rx) = mpsc::channel();
@@ -192,23 +213,30 @@ impl Runtime {
         core.config_dir(&self.root)
     }
 
+    pub fn core_dir(&self, core: Core) -> PathBuf {
+        core.core_dir(&self.root)
+    }
+
     pub fn send(&self, action: Action) -> Result<(), String> {
         let mut snapshot = self.state.lock().unwrap();
         let target = match &action {
-            Action::Start(core) | Action::Stop(core) | Action::Use(core, _) => Some(*core),
-            _ => None,
+            Action::Start(core) => Some((*core, CoreOperation::Starting)),
+            Action::Stop(core) => Some((*core, CoreOperation::Stopping)),
+            Action::Restart(core) => Some((*core, CoreOperation::Restarting)),
+            Action::Use(core, _) => Some((*core, CoreOperation::Switching)),
+            Action::Set(_, _) => None,
         };
-        if let Some(core) = target {
+        if let Some((core, operation)) = target {
             let active = snapshot.core_mut(core);
-            if active.busy {
+            if active.operation.is_some() {
                 return Err(format!("{} 正在处理上一项操作", core.label()));
             }
-            active.busy = true;
+            active.operation = Some(operation);
             active.error = None;
         }
         self.tx.send(Request::Action(action)).map_err(|_| {
-            if let Some(core) = target {
-                snapshot.core_mut(core).busy = false;
+            if let Some((core, _)) = target {
+                snapshot.core_mut(core).operation = None;
             }
             "核心管理线程已关闭".to_string()
         })
@@ -324,8 +352,21 @@ impl Worker {
                 let current = self.saved.current(core).clone();
                 let result = match current {
                     None => Err("尚未选择配置, 请在配置列表中点击“使用此配置”".into()),
-                    Some(name) if self.children[core as usize].is_none() => self.start(core, &name),
+                    Some(name) if self.children[core as usize].is_none() => self
+                        .readable_config(core, &name)
+                        .and_then(|config| self.start(core, &config)),
                     Some(_) => Ok(()),
+                };
+                (core, result)
+            }
+            Action::Restart(core) => {
+                let current = self.saved.current(core).clone();
+                let result = match current {
+                    None => Err("尚未选择配置, 请在配置列表中点击“使用此配置”".into()),
+                    Some(name) => self.readable_config(core, &name).and_then(|config| {
+                        self.stop(core)?;
+                        self.start(core, &config)
+                    }),
                 };
                 (core, result)
             }
@@ -333,13 +374,14 @@ impl Worker {
         };
         let mut snapshot = self.state.lock().unwrap();
         let status = snapshot.core_mut(core);
-        status.busy = false;
+        status.operation = None;
         status.running = self.children[core as usize].is_some();
         status.current = self.saved.current(core).clone();
         status.error = result.err();
     }
 
     fn use_config(&mut self, core: Core, name: &str) -> Result<(), String> {
+        let config = self.readable_config(core, name)?;
         let mut next = self.saved.clone();
         match core {
             Core::SingBox => next.sing_box = Some(name.into()),
@@ -350,14 +392,16 @@ impl Worker {
         self.saved = next;
         self.state.lock().unwrap().core_mut(core).current = Some(name.into());
         self.stop(core)?;
-        self.start(core, name)
+        self.start(core, &config)
     }
 
     fn refresh(&self) {
         for core in Core::ALL {
             let result = list_configs(&core.config_dir(&self.root));
+            let installed = core.executable(&self.root).is_file();
             let mut snapshot = self.state.lock().unwrap();
             let state = snapshot.core_mut(core);
+            state.installed = installed;
             match result {
                 Ok(files) => {
                     state.configs = files;
@@ -368,7 +412,7 @@ impl Worker {
         }
     }
 
-    fn start(&mut self, core: Core, name: &str) -> Result<(), String> {
+    fn readable_config(&self, core: Core, name: &str) -> Result<PathBuf, String> {
         let name_path = Path::new(name);
         if !matches!(name_path.components().next(), Some(Component::Normal(_)))
             || name_path.file_name() != Some(OsStr::new(name))
@@ -377,8 +421,18 @@ impl Worker {
             return Err("配置文件名无效".into());
         }
         let config = core.config_dir(&self.root).join(name);
-        let assets = self.root.join(format!("{}_core", core.label()));
-        let exe = assets.join(format!("{}.exe", core.label()));
+        let metadata = fs::File::open(&config)
+            .and_then(|file| file.metadata())
+            .map_err(|error| format!("无法读取配置文件，请检查文件是否存在及访问权限: {error}"))?;
+        if !metadata.is_file() {
+            return Err("所选路径不是配置文件".into());
+        }
+        Ok(config)
+    }
+
+    fn start(&mut self, core: Core, config: &Path) -> Result<(), String> {
+        let assets = core.core_dir(&self.root);
+        let exe = core.executable(&self.root);
         if !exe.is_file() {
             return Err(format!("未找到核心程序: {}", exe.display()));
         }
@@ -391,7 +445,7 @@ impl Worker {
         }
         command
             .arg("-c")
-            .arg(&config)
+            .arg(config)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -400,7 +454,7 @@ impl Worker {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        let tun = core == Core::Xray && xray_uses_tun(&config)?;
+        let tun = core == Core::Xray && xray_uses_tun(config)?;
         let run = (|| {
             if core == Core::Xray {
                 self.dns.restore()?;
@@ -499,7 +553,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let state = runtime.snapshot().core(core).clone();
-            if !state.busy {
+            if state.operation.is_none() {
                 return state;
             }
             assert!(Instant::now() < deadline, "等待核心操作超时: {state:?}");
@@ -511,10 +565,25 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let state = runtime.snapshot().core(core).clone();
-            if !state.busy && !state.running && state.error.is_some() {
+            if state.operation.is_none() && !state.running && state.error.is_some() {
                 return state;
             }
             assert!(Instant::now() < deadline, "等待核心退出超时: {state:?}");
+            thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    fn next_pid(path: &Path, previous: u32) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(pid) = fs::read_to_string(path)
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|pid| *pid != previous)
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "等待测试核心启动超时");
             thread::sleep(Duration::from_millis(30));
         }
     }
@@ -532,12 +601,13 @@ mod tests {
             &source,
             r#"
             fn main() {
-                let file = std::env::args_os().last().unwrap();
-                let config = std::fs::read_to_string(file).unwrap();
+                let file = std::path::PathBuf::from(std::env::args_os().last().unwrap());
+                let config = std::fs::read_to_string(&file).unwrap();
                 if config.contains("fixture_failure") {
                     eprintln!("access is denied: PRIVATE_FIXTURE_VALUE");
                     std::process::exit(42);
                 }
+                std::fs::write(file.with_extension("pid"), std::process::id().to_string()).unwrap();
                 std::thread::sleep(std::time::Duration::from_secs(90));
             }
         "#,
@@ -575,16 +645,48 @@ mod tests {
             .arg(Core::SingBox.config_dir(root).join("日常.JSON"))
             .spawn()
             .unwrap();
+        assert_eq!(
+            next_pid(&Core::SingBox.config_dir(root).join("日常.pid"), 0),
+            external.id()
+        );
         let runtime = Runtime::open(root.to_owned()).unwrap();
+        let mut pids = [external.id(), 0];
         for core in Core::ALL {
             assert_eq!(runtime.snapshot().core(core).configs.len(), 2);
+            assert!(runtime.snapshot().core(core).installed);
             runtime.send(Action::Use(core, "日常.JSON".into())).unwrap();
             let state = idle(&runtime, core);
             assert!(state.running, "{state:?}");
             assert_eq!(state.current.as_deref(), Some("日常.JSON"));
+            pids[core as usize] =
+                next_pid(&core.config_dir(root).join("日常.pid"), pids[core as usize]);
         }
         let blocked_save = root.join("ladder-state.json.tmp");
         fs::create_dir(&blocked_save).unwrap();
+        let saved_before_restart = fs::read(root.join("ladder-state.json")).unwrap();
+        for core in Core::ALL {
+            runtime.send(Action::Restart(core)).unwrap();
+            let restarted = idle(&runtime, core);
+            assert!(restarted.running, "{restarted:?}");
+            assert!(restarted.error.is_none(), "{restarted:?}");
+            assert_eq!(restarted.current.as_deref(), Some("日常.JSON"));
+            pids[core as usize] =
+                next_pid(&core.config_dir(root).join("日常.pid"), pids[core as usize]);
+            let other = match core {
+                Core::SingBox => Core::Xray,
+                Core::Xray => Core::SingBox,
+            };
+            assert!(runtime.snapshot().core(other).running);
+            assert_eq!(
+                fs::read_to_string(other.config_dir(root).join("日常.pid")).unwrap(),
+                pids[other as usize].to_string()
+            );
+            assert!(external.try_wait().unwrap().is_none());
+        }
+        assert_eq!(
+            fs::read(root.join("ladder-state.json")).unwrap(),
+            saved_before_restart
+        );
         runtime
             .send(Action::Use(Core::SingBox, "失败.json".into()))
             .unwrap();
@@ -623,6 +725,20 @@ mod tests {
         runtime
             .send(Action::Set(Setting::MinimizeToTray, true))
             .unwrap();
+        let xray_dir = Core::Xray.config_dir(root);
+        let moved_dir = root.join("移走的配置目录");
+        fs::rename(&xray_dir, &moved_dir).unwrap();
+        runtime.send(Action::Restart(Core::Xray)).unwrap();
+        let restart_without_file = idle(&runtime, Core::Xray);
+        runtime
+            .send(Action::Use(Core::Xray, "失败.json".into()))
+            .unwrap();
+        let switch_without_file = idle(&runtime, Core::Xray);
+        fs::rename(&moved_dir, &xray_dir).unwrap();
+        assert_eq!(
+            fs::read_to_string(xray_dir.join("日常.pid")).unwrap(),
+            pids[Core::Xray as usize].to_string()
+        );
         runtime.shutdown().unwrap();
         assert!(external.try_wait().unwrap().is_none());
 
@@ -635,12 +751,68 @@ mod tests {
         reopened.shutdown().unwrap();
         external.kill().unwrap();
         external.wait().unwrap();
+        for state in [restart_without_file, switch_without_file] {
+            assert!(state.running, "{state:?}");
+            assert!(state.error.is_some());
+            assert_eq!(state.current.as_deref(), Some("日常.JSON"));
+        }
+        assert_eq!(
+            Saved::load(root).unwrap().xray.as_deref(),
+            Some("日常.JSON")
+        );
+    }
+
+    #[test]
+    fn queued_operations_stay_visible_until_handled_and_reject_duplicate_requests() {
+        let folder = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let runtime = Runtime {
+            root: folder.path().to_owned(),
+            state: Arc::new(Mutex::new(Snapshot::default())),
+            tx,
+        };
+        let mut worker = Worker {
+            root: runtime.root.clone(),
+            state: runtime.state.clone(),
+            saved: Saved::default(),
+            children: [None, None],
+            dns: DnsLease::new(folder.path()),
+        };
+        let core = Core::SingBox;
+        for (action, operation) in [
+            (Action::Start(core), CoreOperation::Starting),
+            (Action::Stop(core), CoreOperation::Stopping),
+            (
+                Action::Use(core, "选中.json".into()),
+                CoreOperation::Switching,
+            ),
+            (Action::Restart(core), CoreOperation::Restarting),
+        ] {
+            runtime.send(action).unwrap();
+            assert!(runtime.send(Action::Stop(core)).is_err());
+            assert_eq!(runtime.snapshot().core(core).operation, Some(operation));
+            let Request::Action(queued) = rx.try_recv().unwrap() else {
+                panic!("预期收到核心操作");
+            };
+            worker.action(queued);
+            assert!(runtime.snapshot().core(core).operation.is_none());
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        drop(rx);
+        assert!(runtime.send(Action::Start(core)).is_err());
+        assert!(runtime.snapshot().core(core).operation.is_none());
     }
 
     #[test]
     fn selection_is_saved_even_when_the_core_is_missing() {
         let folder = tempfile::tempdir().unwrap();
         let runtime = Runtime::open(folder.path().to_owned()).unwrap();
+        fs::write(
+            runtime.config_dir(Core::SingBox).join("选中的配置.json"),
+            "{}",
+        )
+        .unwrap();
+        assert!(!runtime.snapshot().sing_box.installed);
         runtime
             .send(Action::Use(Core::SingBox, "选中的配置.json".into()))
             .unwrap();
@@ -674,10 +846,18 @@ mod tests {
         };
         worker.refresh();
         assert_eq!(state.lock().unwrap().sing_box.configs, vec!["配置.json"]);
+        assert!(!state.lock().unwrap().sing_box.installed);
+        let executable = Core::SingBox.executable(root);
+        fs::create_dir(Core::SingBox.core_dir(root)).unwrap();
+        fs::write(&executable, []).unwrap();
+        worker.refresh();
+        assert!(state.lock().unwrap().sing_box.installed);
+        fs::remove_file(executable).unwrap();
         fs::remove_file(config_dir.join("配置.json")).unwrap();
         fs::remove_dir(&config_dir).unwrap();
         worker.refresh();
         assert!(state.lock().unwrap().sing_box.scan_error.is_some());
+        assert!(!state.lock().unwrap().sing_box.installed);
         fs::create_dir(&config_dir).unwrap();
         fs::write(config_dir.join("恢复.json"), "{}").unwrap();
         worker.refresh();

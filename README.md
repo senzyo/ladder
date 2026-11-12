@@ -3,6 +3,9 @@
 软件定位是 **sing-box** 和 **Xray** 的启动器, 功能足够简单, 配置完全由用户自己写 JSON 来决定, 几乎相当于运行裸核的方案, 只不过有 GUI 方便管理。
 
 ## 开发
+
+开发阶段、已确认的 GUI 方案与每轮验收要求见 [开发计划](docs/development-plan.md)。后续界面、运行管理和发布工作按该计划推进。
+
 ### 依赖
 
 - Rust stable toolchain
