@@ -1,8 +1,8 @@
 use crate::desktop;
-use crate::runtime::{Action, Core, CoreOperation, Runtime, Setting, Snapshot};
+use crate::runtime::{Action, Core, CoreOperation, Runtime, Setting, Snapshot, ThemePreference};
 use gpui::{
     Context, Div, ElementId, FocusHandle, FontWeight, Rgba, ScrollHandle, SharedString, Stateful,
-    Timer, Window, WindowAppearance, div, prelude::*, px, rgb, rgba,
+    Task, Timer, Window, WindowAppearance, div, prelude::*, px, rgb, rgba,
 };
 use std::{collections::HashMap, time::Duration};
 
@@ -26,6 +26,8 @@ pub(crate) struct MainWindow {
     selected: [Option<String>; 2],
     config_focus: [HashMap<String, FocusHandle>; 2],
     config_scroll: [ScrollHandle; 2],
+    pending_theme: Option<(ThemePreference, Task<()>)>,
+    titlebar_dark: Option<bool>,
     command_error: Option<String>,
     focus: FocusHandle,
 }
@@ -34,8 +36,12 @@ impl MainWindow {
     pub(crate) fn new(runtime: Runtime, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus);
-        cx.observe_window_appearance(window, |_, _, cx| cx.notify())
-            .detach();
+        cx.observe_window_appearance(window, |view, _, cx| {
+            // GPUI reapplies the system title bar when Windows changes appearance.
+            view.titlebar_dark = None;
+            cx.notify();
+        })
+        .detach();
         cx.spawn(async move |view, cx| {
             loop {
                 Timer::after(Duration::from_millis(250)).await;
@@ -52,6 +58,8 @@ impl MainWindow {
             selected: [None, None],
             config_focus: Default::default(),
             config_scroll: Default::default(),
+            pending_theme: None,
+            titlebar_dark: None,
             command_error: None,
             focus,
         };
@@ -99,6 +107,38 @@ impl MainWindow {
         };
         self.command_error = result.err();
         self.refresh(cx);
+        cx.notify();
+    }
+
+    fn selected_theme(&self) -> ThemePreference {
+        self.pending_theme
+            .as_ref()
+            .map_or(self.snapshot.settings.theme, |(theme, _)| *theme)
+    }
+
+    fn set_theme(&mut self, theme: ThemePreference, cx: &mut Context<Self>) {
+        if self.selected_theme() == theme {
+            return;
+        }
+        match self.runtime.set_theme(theme) {
+            Ok(saved) => {
+                self.command_error = None;
+                let task = cx.spawn(async move |view, cx| {
+                    let result = saved.recv().await;
+                    let _ = view.update(cx, |view, cx| {
+                        view.pending_theme = None;
+                        if result.is_err() {
+                            view.command_error = Some("主题设置未保存，管理线程已关闭。".into());
+                        }
+                        view.refresh(cx);
+                        cx.notify();
+                    });
+                });
+                // Replacing the task cancels the previous preview's completion handler.
+                self.pending_theme = Some((theme, task));
+            }
+            Err(message) => self.command_error = Some(message),
+        }
         cx.notify();
     }
 
@@ -437,7 +477,49 @@ impl MainWindow {
 
     fn settings_page(&self, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
         let settings = &self.snapshot.settings;
-        let mut rows = panel(colors).flex().flex_col().p(px(4.));
+        let mut choices = div()
+            .flex()
+            .gap(px(2.))
+            .p(px(2.))
+            .bg(colors.canvas)
+            .border_1()
+            .border_color(colors.line)
+            .rounded(px(6.));
+        for (index, (theme, label)) in [
+            (ThemePreference::System, "跟随系统"),
+            (ThemePreference::Light, "浅色"),
+            (ThemePreference::Dark, "深色"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let selected = self.selected_theme() == theme;
+            choices = choices.child(
+                control(label, 4 + index as isize, colors, false)
+                    .h(px(28.))
+                    .px(px(8.))
+                    .gap(px(4.))
+                    .when(selected, |el| {
+                        el.bg(colors.selection)
+                            .text_color(colors.accent)
+                            .font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .child(div().w(px(12.)).child(if selected { "✓" } else { "" }))
+                    .child(label)
+                    .on_click(cx.listener(move |view, _, _, cx| view.set_theme(theme, cx))),
+            );
+        }
+        let mut rows = panel(colors).flex().flex_col().p(px(4.)).child(
+            div()
+                .flex()
+                .min_h(px(52.))
+                .px(px(12.))
+                .gap(px(12.))
+                .items_center()
+                .justify_between()
+                .child("主题")
+                .child(choices),
+        );
         for (index, (label, description, key, value)) in [
             (
                 "启动时隐藏主窗口",
@@ -482,7 +564,7 @@ impl MainWindow {
                         .bg(colors.on_accent),
                 );
             rows = rows.child(
-                control(label, 4 + index as isize, colors, false)
+                control(label, 7 + index as isize, colors, false)
                     .min_h(px(68.))
                     .px(px(12.))
                     .py(px(10.))
@@ -527,7 +609,12 @@ impl MainWindow {
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = Colors::new(window.appearance());
+        let dark = self.selected_theme().is_dark(window.appearance());
+        if self.titlebar_dark != Some(dark) {
+            desktop::set_titlebar_dark(window, dark);
+            self.titlebar_dark = Some(dark);
+        }
+        let colors = Colors::new(dark);
         let page = match self.page {
             Page::Core(core) => self.core_page(core, colors, cx),
             Page::Settings => self.settings_page(colors, cx),
@@ -728,12 +815,21 @@ struct Colors {
     error_bg: Rgba,
 }
 
+impl ThemePreference {
+    fn is_dark(self, system: WindowAppearance) -> bool {
+        match self {
+            Self::System => matches!(
+                system,
+                WindowAppearance::Dark | WindowAppearance::VibrantDark
+            ),
+            Self::Light => false,
+            Self::Dark => true,
+        }
+    }
+}
+
 impl Colors {
-    fn new(appearance: WindowAppearance) -> Self {
-        let dark = matches!(
-            appearance,
-            WindowAppearance::Dark | WindowAppearance::VibrantDark
-        );
+    fn new(dark: bool) -> Self {
         let tone = |light, night| rgb(if dark { night } else { light });
         Self {
             canvas: tone(0xf8f9fb, 0x1c1e22),
@@ -753,6 +849,25 @@ impl Colors {
             switch_off: tone(0x737c8b, 0x657184),
             error: tone(0xa62a36, 0xffadb5),
             error_bg: tone(0xfff0f1, 0x3c292e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_system_theme_tracks_changes_in_window_appearance() {
+        for (appearance, dark) in [
+            (WindowAppearance::Light, false),
+            (WindowAppearance::Dark, true),
+            (WindowAppearance::VibrantLight, false),
+            (WindowAppearance::VibrantDark, true),
+        ] {
+            assert_eq!(ThemePreference::System.is_dark(appearance), dark);
+            assert!(!ThemePreference::Light.is_dark(appearance));
+            assert!(ThemePreference::Dark.is_dark(appearance));
         }
     }
 }

@@ -42,9 +42,19 @@ impl Core {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Settings {
+    pub theme: ThemePreference,
     pub minimize_to_tray: bool,
     pub auto_sing_box: bool,
     pub auto_xray: bool,
@@ -111,6 +121,7 @@ pub enum Action {
 
 enum Request {
     Action(Action),
+    SetTheme(ThemePreference, async_channel::Sender<()>),
     Shutdown(mpsc::Sender<Result<(), String>>),
 }
 
@@ -242,6 +253,14 @@ impl Runtime {
         })
     }
 
+    pub fn set_theme(&self, theme: ThemePreference) -> Result<async_channel::Receiver<()>, String> {
+        let (tx, rx) = async_channel::bounded(1);
+        self.tx
+            .send(Request::SetTheme(theme, tx))
+            .map_err(|_| "核心管理线程已关闭".to_string())?;
+        Ok(rx)
+    }
+
     pub fn shutdown(&self) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
         self.tx
@@ -302,6 +321,10 @@ impl Worker {
         loop {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Request::Action(action)) => self.action(action),
+                Ok(Request::SetTheme(theme, reply)) => {
+                    self.update_settings(|settings| settings.theme = theme);
+                    let _ = reply.try_send(());
+                }
                 Ok(Request::Shutdown(reply)) => {
                     let result = self.stop_all();
                     let done = result.is_ok();
@@ -329,23 +352,11 @@ impl Worker {
     fn action(&mut self, action: Action) {
         let (core, result) = match action {
             Action::Set(key, value) => {
-                let mut next = self.saved.clone();
-                match key {
-                    Setting::MinimizeToTray => next.settings.minimize_to_tray = value,
-                    Setting::AutoSingBox => next.settings.auto_sing_box = value,
-                    Setting::AutoXray => next.settings.auto_xray = value,
-                }
-                let saved = next.store(&self.root);
-                let mut snapshot = self.state.lock().unwrap();
-                match saved {
-                    Ok(()) => {
-                        snapshot.settings = next.settings.clone();
-                        self.saved = next;
-                        snapshot.error = None;
-                    }
-                    Err(e) => snapshot.error = Some(format!("保存软件设置失败: {e}")),
-                }
-                return;
+                return self.update_settings(|settings| match key {
+                    Setting::MinimizeToTray => settings.minimize_to_tray = value,
+                    Setting::AutoSingBox => settings.auto_sing_box = value,
+                    Setting::AutoXray => settings.auto_xray = value,
+                });
             }
             Action::Stop(core) => (core, self.stop(core)),
             Action::Start(core) => {
@@ -378,6 +389,21 @@ impl Worker {
         status.running = self.children[core as usize].is_some();
         status.current = self.saved.current(core).clone();
         status.error = result.err();
+    }
+
+    fn update_settings(&mut self, change: impl FnOnce(&mut Settings)) {
+        let mut next = self.saved.clone();
+        change(&mut next.settings);
+        let saved = next.store(&self.root);
+        let mut snapshot = self.state.lock().unwrap();
+        match saved {
+            Ok(()) => {
+                snapshot.settings = next.settings.clone();
+                self.saved = next;
+                snapshot.error = None;
+            }
+            Err(e) => snapshot.error = Some(format!("保存软件设置失败: {e}")),
+        }
     }
 
     fn use_config(&mut self, core: Core, name: &str) -> Result<(), String> {
@@ -801,6 +827,73 @@ mod tests {
         drop(rx);
         assert!(runtime.send(Action::Start(core)).is_err());
         assert!(runtime.snapshot().core(core).operation.is_none());
+    }
+
+    #[test]
+    fn old_state_defaults_to_system_theme_and_preserves_selections_across_theme_changes() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        assert_eq!(
+            Saved::load(root).unwrap().settings.theme,
+            ThemePreference::System
+        );
+        let path = root.join("ladder-state.json");
+        fs::write(
+            &path,
+            r#"{"settings":{"minimize_to_tray":true},"sing_box":"日常.json"}"#,
+        )
+        .unwrap();
+        let mut runtime = Runtime::open(root.to_owned()).unwrap();
+        assert_eq!(runtime.snapshot().settings.theme, ThemePreference::System);
+        for (theme, stored) in [
+            (ThemePreference::Dark, "dark"),
+            (ThemePreference::Light, "light"),
+            (ThemePreference::System, "system"),
+        ] {
+            runtime.set_theme(theme).unwrap().recv_blocking().unwrap();
+            assert_eq!(runtime.snapshot().settings.theme, theme);
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(value["settings"]["theme"], stored);
+            runtime.shutdown().unwrap();
+            runtime = Runtime::open(root.to_owned()).unwrap();
+            let snapshot = runtime.snapshot();
+            assert_eq!(snapshot.settings.theme, theme);
+            assert!(snapshot.settings.minimize_to_tray);
+            assert_eq!(snapshot.sing_box.current.as_deref(), Some("日常.json"));
+        }
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn theme_saves_follow_request_order_and_keep_the_last_successful_choice_on_failure() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        drop(runtime.set_theme(ThemePreference::Dark).unwrap());
+        runtime
+            .set_theme(ThemePreference::Light)
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        assert_eq!(runtime.snapshot().settings.theme, ThemePreference::Light);
+        assert_eq!(
+            Saved::load(root).unwrap().settings.theme,
+            ThemePreference::Light
+        );
+        let path = root.join("ladder-state.json");
+        let previous = fs::read(&path).unwrap();
+        fs::create_dir(root.join("ladder-state.json.tmp")).unwrap();
+        runtime
+            .set_theme(ThemePreference::Dark)
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.settings.theme, ThemePreference::Light);
+        assert!(snapshot.error.unwrap().contains("保存软件设置失败"));
+        assert_eq!(fs::read(path).unwrap(), previous);
+        runtime.shutdown().unwrap();
     }
 
     #[test]

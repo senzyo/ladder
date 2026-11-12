@@ -4,10 +4,40 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 
+use gpui::Window;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::UI::Shell::{SE_ERR_ASSOCINCOMPLETE, SE_ERR_NOASSOC, ShellExecuteW};
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DefWindowProcW, GetForegroundWindow, SW_SHOWNORMAL, WM_NCACTIVATE,
+};
 use windows_sys::w;
+
+pub(crate) fn set_titlebar_dark(window: &Window, dark: bool) {
+    if let Ok(handle) = HasWindowHandle::window_handle(window)
+        && let RawWindowHandle::Win32(raw) = handle.as_raw()
+    {
+        let hwnd = raw.hwnd.get() as HWND;
+        let enabled = i32::from(dark);
+        // HWND 由当前窗口持有，DWM 在这次调用中读取 BOOL。
+        unsafe {
+            let result = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                ptr::from_ref(&enabled).cast(),
+                size_of_val(&enabled) as u32,
+            );
+            if result >= 0 {
+                // Windows 10 需要切换非客户区的激活外观才会刷新标题栏颜色。
+                let active = GetForegroundWindow() == hwnd;
+                DefWindowProcW(hwnd, WM_NCACTIVATE, usize::from(!active), 0);
+                DefWindowProcW(hwnd, WM_NCACTIVATE, usize::from(active), 0);
+            }
+        }
+    }
+}
 
 pub(crate) fn open_folder(path: &Path) -> Result<(), String> {
     let metadata = path
