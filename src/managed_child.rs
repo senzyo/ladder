@@ -14,6 +14,10 @@ use windows_sys::Win32::Foundation::{
     HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    GetThreadErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX,
+    SetThreadErrorMode,
+};
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
@@ -32,9 +36,13 @@ use crate::core_output::CoreOutput;
 use crate::runtime::Core;
 
 pub(crate) struct ManagedChild {
+    process: JobProcess,
+    pub(crate) output: CoreOutput,
+}
+
+pub(crate) struct JobProcess {
     job: OwnedHandle,
     process: OwnedHandle,
-    pub(crate) output: CoreOutput,
 }
 
 fn checked(result: i32) -> io::Result<()> {
@@ -114,7 +122,6 @@ impl ManagedChild {
         assets: &Path,
         config: &Path,
     ) -> io::Result<Self> {
-        let job = create_job()?;
         let stdin = File::open("NUL")?;
         let (stdout, stdout_write) = io::pipe()?;
         let (stderr, stderr_write) = io::pipe()?;
@@ -123,8 +130,6 @@ impl ManagedChild {
             stdout_write.as_raw_handle(),
             stderr_write.as_raw_handle(),
         ];
-        let jobs = [job.as_raw_handle()];
-
         // 三个路径都以实际文件或目录名结尾。Windows 文件名不能包含双引号。
         let mut command = OsString::from("\"");
         command.push(exe);
@@ -137,14 +142,58 @@ impl ManagedChild {
         command.push(" -c \"");
         command.push(config);
         command.push("\"");
+        let env = (core == Core::Xray).then(|| xray_environment(assets));
+        let process = JobProcess::spawn(exe, root, command, env.as_deref(), stdio)?;
+        drop((stdin, stdout_write, stderr_write));
+        Ok(Self {
+            process,
+            output: CoreOutput::capture(stdout, stderr),
+        })
+    }
+
+    pub(crate) fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
+        self.process.try_wait()
+    }
+
+    pub(crate) fn terminate(&self) -> io::Result<()> {
+        self.process.terminate()
+    }
+}
+
+impl JobProcess {
+    pub(crate) fn spawn_version(exe: &Path, stdout: &File) -> io::Result<Self> {
+        let root = exe
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "无法定位核心目录"))?;
+        let stdin = File::open("NUL")?;
+        let stdout = stdout.try_clone()?;
+        let stderr = File::options().write(true).open("NUL")?;
+        let stdio = [
+            stdin.as_raw_handle(),
+            stdout.as_raw_handle(),
+            stderr.as_raw_handle(),
+        ];
+        let mut command = OsString::from("\"");
+        command.push(exe);
+        command.push("\" version");
+        Self::spawn(exe, root, command, None, stdio)
+    }
+
+    fn spawn(
+        exe: &Path,
+        root: &Path,
+        command: OsString,
+        env: Option<&[u16]>,
+        stdio: [HANDLE; 3],
+    ) -> io::Result<Self> {
+        let job = create_job()?;
+        let jobs = [job.as_raw_handle()];
         let wide = |value: &OsStr| value.encode_wide().chain(Some(0)).collect::<Vec<_>>();
         let (exe, root, mut command) = (
             wide(exe.as_os_str()),
             wide(root.as_os_str()),
             wide(&command),
         );
-        let env = (core == Core::Xray).then(|| xray_environment(assets));
-
         // 初始化缓冲区按指针对齐。属性值及句柄保留到 CreateProcessW 返回。
         let mut bytes = 0;
         unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 2, 0, &mut bytes) };
@@ -188,8 +237,14 @@ impl ManagedChild {
                 SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
             })?;
         }
+        let error_mode = unsafe { GetThreadErrorMode() }
+            | SEM_FAILCRITICALERRORS
+            | SEM_NOGPFAULTERRORBOX
+            | SEM_NOOPENFILEERRORBOX;
+        let mut previous_error_mode = 0;
+        checked(unsafe { SetThreadErrorMode(error_mode, &mut previous_error_mode) })?;
         // 系统在新进程运行前完成 Job 归属。启动器在创建期间被强杀也不会遗留暂停的核心。
-        checked(unsafe {
+        let created = checked(unsafe {
             CreateProcessW(
                 exe.as_ptr(),
                 command.as_mut_ptr(),
@@ -197,21 +252,18 @@ impl ManagedChild {
                 ptr::null(),
                 1,
                 CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
-                env.as_ref()
-                    .map_or(ptr::null(), |block| block.as_ptr().cast()),
+                env.map_or(ptr::null(), |block| block.as_ptr().cast()),
                 root.as_ptr(),
                 &startup.StartupInfo,
                 &mut info,
             )
-        })?;
+        });
+        // 只抑制此线程本次创建的系统错误对话，不改变 GUI 或其他线程的错误模式。
+        unsafe { SetThreadErrorMode(previous_error_mode, ptr::null_mut()) };
+        created?;
         let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess) };
         drop(unsafe { OwnedHandle::from_raw_handle(info.hThread) });
-        drop((stdin, stdout_write, stderr_write));
-        Ok(Self {
-            job,
-            process,
-            output: CoreOutput::capture(stdout, stderr),
-        })
+        Ok(Self { job, process })
     }
 
     pub(crate) fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
@@ -243,7 +295,7 @@ impl ManagedChild {
                     ptr::null_mut(),
                 )
             })?;
-            if counts.ActiveProcesses == 0 {
+            if counts.ActiveProcesses == 0 && self.try_wait()?.is_some() {
                 return Ok(());
             }
             if Instant::now() >= deadline {

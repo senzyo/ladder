@@ -7,6 +7,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn main() {
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("version")) {
+        let exe = env::current_exe().unwrap();
+        if exe.file_stem().unwrap() == "xray" {
+            println!("Xray 1.0.0 (Xray, Penetrates Everything.) fixture");
+        } else {
+            println!("sing-box version 1.0.0");
+        }
+        return;
+    }
     let file = PathBuf::from(env::args_os().last().unwrap());
     if env::args_os().nth(1).as_deref() == Some(OsStr::new("--child")) {
         fs::write(file, process::id().to_string()).unwrap();

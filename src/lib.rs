@@ -5,6 +5,7 @@ mod managed_child;
 mod runtime;
 mod scheduler;
 mod ui;
+mod update;
 
 use std::{cell::Cell, process::ExitCode, ptr, rc::Rc};
 

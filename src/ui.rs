@@ -1,5 +1,6 @@
 use crate::desktop;
 use crate::runtime::{Action, Core, CoreOperation, Runtime, Setting, Snapshot, ThemePreference};
+use crate::update::{UpdateChannel, UpdateProgress};
 use gpui::{
     Context, Div, ElementId, FocusHandle, FontWeight, Rgba, ScrollHandle, SharedString, Stateful,
     Task, Timer, Window, WindowAppearance, div, prelude::*, px, rgb, rgba,
@@ -17,6 +18,7 @@ enum UiAction {
     Run(Action),
     OpenFolder(Core),
     Edit(Core, String),
+    SetUpdateChannel(Core, UpdateChannel),
 }
 
 pub(crate) struct MainWindow {
@@ -27,6 +29,7 @@ pub(crate) struct MainWindow {
     config_focus: [HashMap<String, FocusHandle>; 2],
     config_scroll: [ScrollHandle; 2],
     pending_theme: Option<(ThemePreference, Task<()>)>,
+    pending_update_channel: [Option<Task<()>>; 2],
     titlebar_dark: Option<bool>,
     command_error: Option<String>,
     focus: FocusHandle,
@@ -59,6 +62,7 @@ impl MainWindow {
             config_focus: Default::default(),
             config_scroll: Default::default(),
             pending_theme: None,
+            pending_update_channel: [None, None],
             titlebar_dark: None,
             command_error: None,
             focus,
@@ -99,6 +103,9 @@ impl MainWindow {
 
     fn activate(&mut self, action: UiAction, cx: &mut Context<Self>) {
         let result = match action {
+            UiAction::SetUpdateChannel(core, channel) => {
+                return self.set_update_channel(core, channel, cx);
+            }
             UiAction::Run(action) => self.runtime.send(action),
             UiAction::OpenFolder(core) => desktop::open_folder(&self.runtime.config_dir(core)),
             UiAction::Edit(core, name) => {
@@ -107,6 +114,34 @@ impl MainWindow {
         };
         self.command_error = result.err();
         self.refresh(cx);
+        cx.notify();
+    }
+
+    fn set_update_channel(&mut self, core: Core, channel: UpdateChannel, cx: &mut Context<Self>) {
+        if self.snapshot.settings.update_channel(core) == channel
+            || self.pending_update_channel[core_index(core)].is_some()
+        {
+            return;
+        }
+        match self.runtime.set_update_channel(core, channel) {
+            Ok(saved) => {
+                self.command_error = None;
+                self.pending_update_channel[core_index(core)] =
+                    Some(cx.spawn(async move |view, cx| {
+                        let result = saved.recv().await;
+                        let _ = view.update(cx, |view, cx| {
+                            view.pending_update_channel[core_index(core)] = None;
+                            if result.is_err() {
+                                view.command_error =
+                                    Some("版本通道未保存，管理线程已关闭。".into());
+                            }
+                            view.refresh(cx);
+                            cx.notify();
+                        });
+                    }));
+            }
+            Err(message) => self.command_error = Some(message),
+        }
         cx.notify();
     }
 
@@ -210,6 +245,45 @@ impl MainWindow {
     fn core_page(&self, core: Core, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
         let state = self.snapshot.core(core);
         let idle = state.operation.is_none();
+        let channel = self.snapshot.settings.update_channel(core);
+        let can_update = idle
+            && state.update.is_none()
+            && self.pending_update_channel[core_index(core)].is_none();
+        let mut channels = div()
+            .flex()
+            .flex_shrink_0()
+            .gap(px(2.))
+            .p(px(2.))
+            .bg(colors.canvas)
+            .border_1()
+            .border_color(colors.line)
+            .rounded(px(6.));
+        for (index, (option, label)) in [
+            (UpdateChannel::Stable, "稳定版"),
+            (UpdateChannel::Preview, "预览版"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let selected = channel == option;
+            channels = channels.child(
+                action_button(
+                    label,
+                    4 + index as isize,
+                    can_update.then_some(UiAction::SetUpdateChannel(core, option)),
+                    false,
+                    colors,
+                    cx,
+                )
+                .h(px(26.))
+                .min_w(px(0.))
+                .px(px(6.))
+                .border_color(rgba(0))
+                .when(selected, |el| {
+                    el.bg(colors.selection).text_color(colors.accent)
+                }),
+            );
+        }
         let current_exists = state
             .current
             .as_ref()
@@ -221,6 +295,7 @@ impl MainWindow {
             Some(CoreOperation::Stopping) => ("停止中", colors.accent),
             Some(CoreOperation::Switching) => ("切换中", colors.accent),
             Some(CoreOperation::Restarting) => ("重启中", colors.accent),
+            Some(CoreOperation::Updating) => ("替换中", colors.accent),
             None if state.running => ("运行中", colors.running),
             None if !state.installed => ("未安装", colors.muted),
             None => ("已停止", colors.muted),
@@ -265,7 +340,7 @@ impl MainWindow {
                     .gap(px(8.))
                     .child(action_button(
                         "启动",
-                        4,
+                        7,
                         (can_run && !state.running).then_some(UiAction::Run(Action::Start(core))),
                         true,
                         colors,
@@ -273,7 +348,7 @@ impl MainWindow {
                     ))
                     .child(action_button(
                         "停止",
-                        5,
+                        8,
                         (idle && state.running).then_some(UiAction::Run(Action::Stop(core))),
                         false,
                         colors,
@@ -281,7 +356,7 @@ impl MainWindow {
                     ))
                     .child(action_button(
                         "重启",
-                        6,
+                        9,
                         (can_run && state.running).then_some(UiAction::Run(Action::Restart(core))),
                         false,
                         colors,
@@ -304,7 +379,7 @@ impl MainWindow {
             let current = state.current.as_ref() == Some(name);
             let highlighted = selected == Some(name.as_str());
             let file = name.clone();
-            let tab_index = 10 + index as isize;
+            let tab_index = 12 + index as isize;
             // GPUI uses the tracked handle's tab order when a control supplies its own handle.
             let focus = self.config_focus[core_index(core)][name]
                 .clone()
@@ -355,7 +430,7 @@ impl MainWindow {
             );
         }
 
-        let footer_index = 10 + state.configs.len() as isize;
+        let footer_index = 12 + state.configs.len() as isize;
         let edit = selected.map(|name| UiAction::Edit(core, name.to_owned()));
         let apply = selected
             .filter(|name| can_use_config && state.current.as_deref() != Some(*name))
@@ -412,28 +487,67 @@ impl MainWindow {
             .flex()
             .flex_col()
             .gap(px(12.))
-            .child(page_title(if core == Core::Xray {
-                "Xray"
-            } else {
-                "sing-box"
-            }))
-            .child(current_card)
-            .when(!state.installed, |el| {
-                el.child(
-                    caption(
-                        format!(
-                            "尚未安装核心，请将 {}.exe 放入 {}",
-                            core.label(),
-                            self.runtime.core_dir(core).display()
-                        ),
-                        colors,
-                    )
-                    .id("missing-core")
+            .child(
+                div()
                     .flex_shrink_0()
-                    .max_h(px(44.))
-                    .overflow_y_scroll(),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(page_title(if core == Core::Xray {
+                                "Xray"
+                            } else {
+                                "sing-box"
+                            }))
+                            .child(caption(
+                                match &state.version {
+                                    Some(version) => format!("当前版本 v{version}"),
+                                    None if !state.installed => "尚未安装核心".into(),
+                                    None => "当前版本未知".into(),
+                                },
+                                colors,
+                            )),
+                    )
+                    .child(channels)
+                    .child(action_button(
+                        if state.update_error.is_some() {
+                            "重试更新"
+                        } else if state.installed {
+                            "检查并更新"
+                        } else {
+                            "安装核心"
+                        },
+                        6,
+                        can_update.then_some(UiAction::Run(Action::Update(core))),
+                        !state.installed,
+                        colors,
+                        cx,
+                    )),
+            )
+            .when_some(state.update.as_ref(), |el, progress| {
+                el.child(
+                    caption(update_progress_text(progress, channel), colors)
+                        .flex_shrink_0()
+                        .text_color(colors.accent),
                 )
             })
+            .when_some(state.update_message.clone(), |el, message| {
+                el.child(caption(message, colors).flex_shrink_0())
+            })
+            .when_some(state.update_error.clone(), |el, message| {
+                el.child(error_message(message, colors))
+            })
+            .when_some(state.version_error.clone(), |el, message| {
+                el.child(error_message(message, colors))
+            })
+            .child(current_card)
             .when(
                 state.current.is_some() && !current_exists && state.scan_error.is_none(),
                 |el| {
@@ -462,7 +576,7 @@ impl MainWindow {
                     )
                     .child(action_button(
                         "打开目录",
-                        7,
+                        10,
                         Some(UiAction::OpenFolder(core)),
                         false,
                         colors,
@@ -498,13 +612,9 @@ impl MainWindow {
                 control(label, 4 + index as isize, colors, false)
                     .h(px(28.))
                     .px(px(8.))
-                    .gap(px(4.))
                     .when(selected, |el| {
-                        el.bg(colors.selection)
-                            .text_color(colors.accent)
-                            .font_weight(FontWeight::SEMIBOLD)
+                        el.bg(colors.selection).text_color(colors.accent)
                     })
-                    .child(div().w(px(12.)).child(if selected { "✓" } else { "" }))
                     .child(label)
                     .on_click(cx.listener(move |view, _, _, cx| view.set_theme(theme, cx))),
             );
@@ -712,6 +822,29 @@ fn core_index(core: Core) -> usize {
     match core {
         Core::SingBox => 0,
         Core::Xray => 1,
+    }
+}
+
+fn update_progress_text(progress: &UpdateProgress, channel: UpdateChannel) -> String {
+    match progress {
+        UpdateProgress::Checking => match channel {
+            UpdateChannel::Stable => "正在检查官方稳定版…",
+            UpdateChannel::Preview => "正在检查官方版本（含预览版）…",
+        }
+        .into(),
+        UpdateProgress::Downloading { received, total } => {
+            let downloaded = *received as f64 / 1_048_576.0;
+            if *total == 0 {
+                format!("正在下载 · {downloaded:.1} MiB")
+            } else {
+                let percent = (*received as f64 / *total as f64 * 100.0).min(100.0);
+                let size = *total as f64 / 1_048_576.0;
+                format!("正在下载 · {percent:.0}% · {downloaded:.1} / {size:.1} MiB")
+            }
+        }
+        UpdateProgress::Verifying => "正在校验下载文件…".into(),
+        UpdateProgress::Extracting => "正在准备安装文件…".into(),
+        UpdateProgress::Installing => "正在停止目标核心并替换文件…".into(),
     }
 }
 
