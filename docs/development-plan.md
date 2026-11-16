@@ -273,6 +273,14 @@ Windows GUI 验收使用独立 package/lib/bin、实例锁和状态目录，`asI
 
 91 项离线测试、格式检查、Clippy、Debug / Release 构建及独立只读复核通过；两项官方联网安装测试保持忽略。本轮可见验收为 125% 缩放的默认窗口，没有重复完整 DPI、深色、真实 DNS/TUN 或 ARM64 实机矩阵。
 
+### 统一可见滚动条 · 2026-11-16
+
+配置列表、版本列表、两个核心页面外层、版本页面外层、软件设置、长错误信息与应用日志统一使用日志原有样式的滚动条。内容溢出时持续显示，支持滚轮、拖动滑块和点击轨道翻页；短内容不显示滑块，不增加提示文字。保留原列表 ScrollHandle、键盘定位及日志自动跟随逻辑。
+
+`cargo fmt --check`、`cargo clippy --locked --offline --all-targets -- -D warnings` 和 Debug 构建通过。使用 Computer Use 在一个可见的纯 UI 验收窗口中完成实际检查：浅色版本列表滚轮滚动、拖到最后一项、配置列表与日志滚动条显示、设置页和多个长错误的独立滚动、深色版本与设置、短列表无滚动条，以及版本页内外层滚动和轨道翻页。窗口采用测试数据与无副作用 stub，不编入真实 Runtime、DNS、TUN、恢复、核心进程或下载模块；验收后已关闭。证据见[浅色版本](../target/scrollbars-check/evidence/versions-light.png)、[拖到末尾](../target/scrollbars-check/evidence/versions-end.png)、[深色版本](../target/scrollbars-check/evidence/versions-dark.png)、[错误独立滚动](../target/scrollbars-check/evidence/error-end.png)和[内外层滚动](../target/scrollbars-check/evidence/nested-after.png)。本轮未完成最小窗口、完整 DPI 或键盘矩阵。
+
+此前运行完整测试得到 86 项通过、5 项超时失败、2 项忽略，期间用户报告断网，并通过重新连接无线网络、重启 ladder-main 恢复。测试会启动同名模拟核心，ladder-main 按进程名识别核心；未查明断网的直接原因，不能据此断言修改了真实 DNS。完整测试未重跑，后续此类进程测试应放在独立 Windows 沙盒。两轮隐藏 UI 检查分别因未完成窗口尺寸初始化、窗口可见性或焦点断言失败，均不算验收通过；最终以本轮 Computer Use 可见检查为证据。
+
 ## 后续开发注意点
 
 - **配置编辑器权限（暂缓）**。当前 Ladder 以管理员身份调用外部编辑器。标准用户若用另一管理员账户通过 UAC，Windows 可能按该管理员的文件关联和权限打开配置。2026-11-12 决定暂缓修改现有入口，后续开发内置编辑器时一并复核。

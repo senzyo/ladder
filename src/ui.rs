@@ -2,8 +2,8 @@ use crate::desktop;
 use crate::runtime::{Action, Core, CoreOperation, Runtime, Setting, Snapshot, ThemePreference};
 use crate::update::{UpdateChannel, UpdateProgress};
 use gpui::{
-    Context, Div, ElementId, FocusHandle, FontWeight, Rgba, ScrollHandle, SharedString, Stateful,
-    Task, Timer, Window, WindowAppearance, div, prelude::*, px, rgb, rgba,
+    App, Context, Div, ElementId, FocusHandle, FontWeight, Rgba, ScrollHandle, SharedString,
+    Stateful, Task, Timer, Window, WindowAppearance, div, prelude::*, px, rgb, rgba,
 };
 use std::{
     collections::HashMap,
@@ -14,6 +14,10 @@ use std::{
 #[path = "log_view.rs"]
 mod log_view;
 use log_view::LogView;
+
+#[path = "scrollbar.rs"]
+mod scrollbar;
+use scrollbar::scrollbar;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -47,10 +51,13 @@ pub(crate) struct MainWindow {
     selected: [Option<String>; 2],
     config_focus: [HashMap<String, FocusHandle>; 2],
     config_scroll: [ScrollHandle; 2],
+    core_page_scroll: [ScrollHandle; 2],
     pending_theme: Option<(ThemePreference, Task<()>)>,
     show_versions: [bool; 2],
     version_focus: [HashMap<String, [FocusHandle; 2]>; 2],
     version_scroll: [ScrollHandle; 2],
+    version_page_scroll: [ScrollHandle; 2],
+    settings_scroll: ScrollHandle,
     confirm_delete: Option<(Core, String)>,
     titlebar_dark: Option<bool>,
     command_errors: Vec<(FeedbackScope, String)>,
@@ -84,10 +91,13 @@ impl MainWindow {
             selected: [None, None],
             config_focus: Default::default(),
             config_scroll: Default::default(),
+            core_page_scroll: Default::default(),
             pending_theme: None,
             show_versions: [false; 2],
             version_focus: Default::default(),
             version_scroll: Default::default(),
+            version_page_scroll: Default::default(),
+            settings_scroll: Default::default(),
             confirm_delete: None,
             titlebar_dark: None,
             command_errors: Vec::new(),
@@ -446,8 +456,6 @@ impl MainWindow {
             .id(("files", core_index(core)))
             .flex_1()
             .min_h(px(0.))
-            .overflow_y_scroll()
-            .track_scroll(&self.config_scroll[core_index(core)])
             .flex()
             .flex_col()
             .p(px(4.))
@@ -529,7 +537,15 @@ impl MainWindow {
             .min_h(px(120.))
             .flex()
             .flex_col()
-            .child(files)
+            .child(
+                scroll_area(
+                    "config-scroll",
+                    files,
+                    &self.config_scroll[core_index(core)],
+                    colors,
+                )
+                .flex_1(),
+            )
             .child(
                 div()
                     .flex_shrink_0()
@@ -558,9 +574,8 @@ impl MainWindow {
                     ),
             );
 
-        div()
+        let content = div()
             .id(("core-content", core_index(core)))
-            .overflow_y_scroll()
             .size_full()
             .flex()
             .flex_col()
@@ -645,7 +660,14 @@ impl MainWindow {
             .when_some(state.scan_error.clone(), |el, message| {
                 el.child(error_message(message, colors))
             })
-            .child(config_list)
+            .child(config_list);
+        scroll_area(
+            ("core-scroll", core_index(core)),
+            content,
+            &self.core_page_scroll[core_index(core)],
+            colors,
+        )
+        .size_full()
     }
 
     fn versions_page(&self, core: Core, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
@@ -655,8 +677,6 @@ impl MainWindow {
             .id(("version-list", core_index(core)))
             .flex_1()
             .min_h(px(0.))
-            .overflow_y_scroll()
-            .track_scroll(&self.version_scroll[core_index(core)])
             .flex()
             .flex_col();
         for (index, version) in state.versions.iter().enumerate() {
@@ -787,10 +807,9 @@ impl MainWindow {
             );
         }
         let footer_index = 8 + (state.versions.len() * 2) as isize;
-        div()
+        let content = div()
             .id(("versions-content", core_index(core)))
             .size_full()
-            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(px(12.))
@@ -882,7 +901,15 @@ impl MainWindow {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .child(rows),
+                    .child(
+                        scroll_area(
+                            "version-scroll",
+                            rows,
+                            &self.version_scroll[core_index(core)],
+                            colors,
+                        )
+                        .flex_1(),
+                    ),
             )
             .when(state.versions_has_more, |el| {
                 el.child(action_button(
@@ -894,7 +921,14 @@ impl MainWindow {
                     colors,
                     cx,
                 ))
-            })
+            });
+        scroll_area(
+            ("versions-scroll", core_index(core)),
+            content,
+            &self.version_page_scroll[core_index(core)],
+            colors,
+        )
+        .size_full()
     }
 
     fn settings_page(&self, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
@@ -1017,10 +1051,9 @@ impl MainWindow {
                     })),
             );
         }
-        div()
+        let content = div()
             .id("settings-content")
             .size_full()
-            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(px(16.))
@@ -1064,7 +1097,8 @@ impl MainWindow {
                 el.child(error_message(message, colors))
             })
             .child(rows)
-            .child(caption("关闭窗口后，Ladder 将继续在系统托盘运行。", colors))
+            .child(caption("关闭窗口后，Ladder 将继续在系统托盘运行。", colors));
+        scroll_area("settings-scroll", content, &self.settings_scroll, colors).size_full()
     }
 }
 
@@ -1214,20 +1248,68 @@ fn badge(label: &'static str, color: Rgba, colors: Colors) -> Div {
         .child(label)
 }
 
-fn error_message(message: String, colors: Colors) -> Stateful<Div> {
+fn scroll_area(
+    id: impl Into<ElementId>,
+    content: Stateful<Div>,
+    scroll: &ScrollHandle,
+    colors: Colors,
+) -> Stateful<Div> {
     div()
-        .id(SharedString::from(format!("error-{message}")))
+        .id(id)
+        .relative()
+        .flex()
+        .min_h(px(0.))
+        .min_w(px(0.))
+        .child(
+            content
+                .flex_1()
+                .min_w(px(0.))
+                .mr(px(16.))
+                .overflow_y_scroll()
+                .track_scroll(scroll),
+        )
+        .child(
+            scrollbar("scrollbar", scroll, colors)
+                .absolute()
+                .right_0()
+                .top_0()
+                .bottom_0(),
+        )
+}
+
+#[derive(IntoElement)]
+struct ErrorMessage {
+    message: String,
+    colors: Colors,
+}
+
+impl RenderOnce for ErrorMessage {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let id = SharedString::from(format!("error-{}", self.message));
+        let scroll = window.use_keyed_state(id.clone(), cx, |_, _| ScrollHandle::new());
+        scroll_area(
+            id,
+            div()
+                .id("error-text")
+                .max_h(px(64.))
+                .px(px(10.))
+                .py(px(8.))
+                .child(self.message),
+            scroll.read(cx),
+            self.colors,
+        )
         .flex_shrink_0()
         .max_h(px(64.))
-        .overflow_y_scroll()
-        .px(px(10.))
-        .py(px(8.))
         .border_l_2()
-        .border_color(colors.error)
-        .bg(colors.error_bg)
-        .text_color(colors.error)
+        .border_color(self.colors.error)
+        .bg(self.colors.error_bg)
+        .text_color(self.colors.error)
         .text_size(px(12.))
-        .child(message)
+    }
+}
+
+fn error_message(message: String, colors: Colors) -> ErrorMessage {
+    ErrorMessage { message, colors }
 }
 
 fn control(id: impl Into<ElementId>, index: isize, colors: Colors, primary: bool) -> Stateful<Div> {
