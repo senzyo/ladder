@@ -276,7 +276,9 @@ mod system {
                 return if status.success() {
                     Ok(())
                 } else {
-                    Err(io::Error::other(format!("pnputil 退出状态 {status}")))
+                    Err(io::Error::other(
+                        "无法清理残留 TUN 设备，请检查管理员权限及设备是否被占用",
+                    ))
                 };
             }
             if Instant::now() >= deadline {

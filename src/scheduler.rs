@@ -70,11 +70,11 @@ fn check_directory(directory: &Path, script: &str) -> Result<()> {
         Some(3) => "目录权限不符合 SYSTEM 任务要求",
         Some(4) => "恢复目录包含非预期文件、子目录或重解析点",
         Some(5) => "恢复文件权限不符合 SYSTEM 任务要求",
-        Some(code) => bail!(
-            "无法创建或检查 {}（Windows 错误 {code:#010x}）",
+        Some(_) => bail!(
+            "无法创建或检查 {}，请检查目录权限和占用情况",
             directory.display()
         ),
-        None => bail!("无法检查 {}（{status}）", directory.display()),
+        None => bail!("检查 {} 的助手异常结束，请重试", directory.display()),
     };
     bail!("{}：{reason}", directory.display())
 }
@@ -324,7 +324,7 @@ fn ensure_boot_dns_reset_task(exe: &Path, directory: &Path) -> Result<()> {
     let _ = fs::remove_file(xml);
     let status = status.context("无法启动 Windows 任务计划工具")?;
     if !status.success() {
-        bail!("任务计划工具返回 {status}");
+        bail!("无法注册开机 DNS 恢复任务，请检查管理员权限和 Windows 任务计划程序服务");
     }
     Ok(())
 }
