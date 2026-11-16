@@ -53,7 +53,6 @@ pub enum ThemePreference {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(default)]
 pub struct Settings {
     pub theme: ThemePreference,
     pub minimize_to_tray: bool,
@@ -153,7 +152,6 @@ enum Request {
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
 struct Saved {
     settings: Settings,
     sing_box: Option<String>,
@@ -1490,7 +1488,22 @@ mod tests {
     }
 
     #[test]
-    fn old_state_defaults_and_selections_survive_settings_changes() {
+    fn incomplete_state_is_rejected_without_rewriting_it() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("ladder-state.json");
+        for data in [
+            "{}",
+            r#"{"settings":{"minimize_to_tray":true},"sing_box":"日常.json"}"#,
+        ] {
+            fs::write(&path, data).unwrap();
+            let error = Saved::load(folder.path()).err().unwrap();
+            assert!(error.contains("ladder-state.json 格式无效"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn fresh_state_defaults_and_selections_survive_settings_changes() {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
         let defaults = Saved::load(root).unwrap().settings;
@@ -1500,10 +1513,19 @@ mod tests {
             assert_eq!(defaults.update_channel(core), UpdateChannel::Stable);
         }
         let path = root.join("ladder-state.json");
-        let legacy = r#"{"settings":{"minimize_to_tray":true},"sing_box":"日常.json"}"#;
-        fs::write(&path, legacy).unwrap();
+        Saved {
+            settings: Settings {
+                minimize_to_tray: true,
+                ..Settings::default()
+            },
+            sing_box: Some("日常.json".into()),
+            xray: None,
+        }
+        .store(root)
+        .unwrap();
+        let saved = fs::read(&path).unwrap();
         let mut runtime = Runtime::open(root.to_owned()).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), legacy);
+        assert_eq!(fs::read(&path).unwrap(), saved);
         assert_eq!(runtime.snapshot().settings.theme, ThemePreference::System);
         assert!(!runtime.snapshot().settings.hijack_dns);
         for core in Core::ALL {

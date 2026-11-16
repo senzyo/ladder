@@ -146,7 +146,7 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
             (
                 DesktopDns::Portable(DnsLease::new(portable)),
                 Some(format!(
-                    "本次使用便携 DNS 恢复记录，只能由 Ladder 恢复。若旧版开机任务仍在，它可能会将 DNS 重置为自动获取。{error:#}"
+                    "本次使用便携 DNS 恢复记录，只能由 Ladder 恢复。{error:#}"
                 )),
             )
         } else {
@@ -164,9 +164,7 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
         .context("无法定位 Ladder 程序")
         .and_then(|exe| ensure_boot_dns_reset_task(&exe, &directory))
         .err()
-        .map(|error| format!(
-            "更新开机 DNS 恢复任务 Reset_DNS_On_Boot 失败。若旧版任务仍在，它可能在开机时把 DNS 重置为自动获取。{error:#}"
-        ));
+        .map(|error| format!("更新开机 DNS 恢复任务失败：{error:#}"));
     (
         DesktopDns::Machine {
             lease: DnsLease::with_legacy(&directory, portable),
@@ -250,7 +248,7 @@ fn running_image(exe: &Path) -> Result<File> {
 
 fn ensure_boot_dns_reset_task(exe: &Path, directory: &Path) -> Result<()> {
     let helper = directory.join("ladder-dns-recovery.exe");
-    // 从运行中的映像复制内容，新文件继承受保护目录的权限。完整写入后才替换旧版本。
+    // 从运行中的映像复制内容，新文件继承受保护目录的权限。完整写入后才替换恢复程序。
     let staged = helper.with_extension("tmp");
     {
         let mut source = running_image(exe)?;
@@ -267,7 +265,7 @@ fn ensure_boot_dns_reset_task(exe: &Path, directory: &Path) -> Result<()> {
         .collect();
     fs::write(&xml, contents)?;
     let system = system_folder(CSIDL_SYSTEM)?;
-    // /F 原地替换旧版的同名任务，确保旧版重置为自动获取的动作不再生效。
+    // 重复启动时更新同一任务，保持恢复程序和开机动作一致。
     let status = Command::new(system.join("schtasks.exe"))
         .current_dir(&system)
         .args(["/Create", "/TN", TASK_NAME, "/XML"])
