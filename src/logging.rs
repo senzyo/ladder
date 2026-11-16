@@ -28,7 +28,7 @@ pub(crate) enum LogSource {
 }
 
 impl LogSource {
-    pub(crate) const ALL: [Self; 4] = [Self::SingBox, Self::Xray, Self::Mihomo, Self::App];
+    pub(crate) const ALL: [Self; 4] = [Self::Mihomo, Self::SingBox, Self::Xray, Self::App];
 
     pub(crate) fn index(self) -> usize {
         self as usize

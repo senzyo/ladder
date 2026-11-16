@@ -36,3 +36,13 @@ Computer Use 操作独立 `Ladder TODO 隔离验收` 窗口，生产 UI 文件�
 未在本机启动真实 Ladder 或真实核心、修改 DNS/TUN、注册系统任务，也未运行会创建同名核心的完整进程测试。完整测试由新工作流在隔离 runner 执行；真实核心/TUN/DNS/托盘和 ARM64 机器启动仍需发布前隔离验收。
 
 本次只验证本地构建与工作流定义，未推送代码或标签、未运行远端 Actions、未创建 GitHub Release。当前旧正式版不是本实现的升级测试目标，发布后应再用实际前一发行版验证完整联网自升级。
+
+## 后续界面调整验收
+
+- 当前配置增加“编辑”；导航、设置、日志和托盘统一以 mihomo 为首项，默认进入 mihomo。
+- “关于”中的 Ladder、mihomo、sing-box、Xray 显示仓库名称链接。实测鼠标打开 Ladder 仓库、Tab 聚焦后按 Enter 打开 mihomo 仓库；其余链接地址及共用行为经代码审查核对。
+- 移除 gh-proxy 按钮。空输入显示灰色 URL；实测 Tab 补全并保存、手动输入后 Tab 不覆盖、Enter 保存、清空后保存直连、空输入 Shift+Tab 不补全。提示文字本身不写入设置。
+- 复用纯 UI harness，四个生产 UI 文件逐字同步并核对哈希；在 900×600 逻辑像素下检查浅/深色主题、当前配置编辑路径和日志 Tab 顺序。编辑与设置保存使用内存 stub 和固定结果标签，无真实核心、DNS、TUN 或安装操作。
+- `cargo fmt --all -- --check`、`cargo check --locked`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --locked` 通过；安全回归集合 74 项通过。主程序仅构建，未启动。
+- 规范与需求两条独立审查均通过。已修复日志显示顺序与 Tab 顺序不一致，以及前次保存未完成时可能丢弃 Tab 保存请求的问题。
+- 本机证据位于忽略目录 `target/todo-ui-check/evidence/followup-*`；验收程序和临时打开的仓库页面均已关闭。

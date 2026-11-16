@@ -25,7 +25,7 @@ pub enum Core {
 }
 
 impl Core {
-    pub const ALL: [Core; 3] = [Core::SingBox, Core::Xray, Core::Mihomo];
+    pub const ALL: [Core; 3] = [Core::Mihomo, Core::SingBox, Core::Xray];
 
     pub fn label(self) -> &'static str {
         match self {

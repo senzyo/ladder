@@ -6,6 +6,8 @@ use gpui::{
 };
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
+const PROXY_SUGGESTION: &str = "https://gh-proxy.org/";
+
 struct InputLayout {
     line: ShapedLine,
     bounds: Bounds<Pixels>,
@@ -140,6 +142,12 @@ impl ProxyInput {
                     let key = &event.keystroke.key;
                     let modifiers = event.keystroke.modifiers;
                     if key == "tab" {
+                        if !modifiers.modified() && input.text.is_empty() {
+                            input.set_value(PROXY_SUGGESTION.into());
+                            view.save_github_proxy(core, cx);
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
                         return;
                     }
                     if key == "enter" {
@@ -234,7 +242,7 @@ impl ProxyInput {
                     move |bounds, window, _| {
                         let placeholder = text.is_empty();
                         let display = if placeholder {
-                            "留空为直连".to_string()
+                            PROXY_SUGGESTION.to_string()
                         } else {
                             text.clone()
                         };

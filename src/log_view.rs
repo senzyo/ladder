@@ -168,11 +168,11 @@ impl MainWindow {
             .border_1()
             .border_color(colors.line)
             .rounded(px(6.));
-        for item in LogSource::ALL {
+        for (index, item) in LogSource::ALL.into_iter().enumerate() {
             sources = sources.child(
                 control(
                     ("log-source", item.index()),
-                    6 + item.index() as isize,
+                    6 + index as isize,
                     colors,
                     false,
                 )

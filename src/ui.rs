@@ -123,7 +123,7 @@ impl MainWindow {
         let mut view = Self {
             runtime,
             snapshot: Snapshot::default(),
-            page: Page::Core(Core::SingBox),
+            page: Page::Core(Core::Mihomo),
             config_focus: Default::default(),
             config_scroll: Default::default(),
             core_page_scroll: Default::default(),
@@ -387,9 +387,6 @@ impl MainWindow {
     }
 
     fn save_github_proxy(&mut self, core: Core, cx: &mut Context<Self>) {
-        if self.pending_github_proxy.is_some() {
-            return;
-        }
         let scope = FeedbackScope::Versions(core);
         let requested = self.github_proxy.value().to_owned();
         match self.runtime.set_github_proxy(requested.clone()) {
@@ -490,9 +487,9 @@ impl MainWindow {
                     .child(img(self.icon.clone()).size(px(24.)).flex_shrink_0())
                     .child("Ladder"),
             )
-            .child(item(Page::Core(Core::SingBox), "sing-box", 1))
-            .child(item(Page::Core(Core::Xray), "Xray", 2))
-            .child(item(Page::Core(Core::Mihomo), "mihomo", 3))
+            .child(item(Page::Core(Core::Mihomo), "mihomo", 1))
+            .child(item(Page::Core(Core::SingBox), "sing-box", 2))
+            .child(item(Page::Core(Core::Xray), "Xray", 3))
             .child(div().flex_1())
             .child(item(Page::Logs, "日志", 4))
             .child(item(Page::Settings, "设置", 5))
@@ -553,10 +550,11 @@ impl MainWindow {
                 (!state.validation_busy && state.installed && state.scan_error.is_none())
                     .then(|| UiAction::Run(Action::ValidateConfig(core, name.clone()))),
             );
+            let edit = (2, ("编辑", Some(UiAction::Edit(core, name.clone()))));
             let actions;
             if current {
                 buttons = buttons.child(div().child("当前使用"));
-                actions = vec![(1, validate)];
+                actions = vec![(1, validate), edit];
             } else {
                 actions = vec![
                     (
@@ -568,7 +566,7 @@ impl MainWindow {
                         ),
                     ),
                     (1, validate),
-                    (2, ("编辑", Some(UiAction::Edit(core, name.clone())))),
+                    edit,
                     (
                         3,
                         (
@@ -1046,20 +1044,10 @@ impl MainWindow {
                     .gap(px(8.))
                     .child(div().child("GitHub 加速前缀"))
                     .child(self.github_proxy.render(core, colors, cx))
-                    .child(
-                        control("proxy-default", 12, colors, false)
-                            .h(px(30.))
-                            .px(px(8.))
-                            .child("使用 gh-proxy")
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.github_proxy.set_value("https://gh-proxy.org/".into());
-                                view.save_github_proxy(core, cx);
-                            })),
-                    )
-                    .child(action_button("保存", 13, None, false, colors, cx).when(
+                    .child(action_button("保存", 12, None, false, colors, cx).when(
                         self.pending_github_proxy.is_none(),
                         |el| {
-                            el.tab_index(13)
+                            el.tab_index(12)
                                 .cursor_pointer()
                                 .text_color(colors.text)
                                 .bg(colors.panel)
@@ -1199,6 +1187,12 @@ impl MainWindow {
                 settings.minimize_to_tray,
             ),
             (
+                "随 Ladder 启动 mihomo",
+                "使用上次选择的 mihomo 配置",
+                Setting::AutoMihomo,
+                settings.auto_mihomo,
+            ),
+            (
                 "随 Ladder 启动 sing-box",
                 "使用上次选择的 sing-box 配置",
                 Setting::AutoSingBox,
@@ -1209,12 +1203,6 @@ impl MainWindow {
                 "使用上次选择的 Xray 配置",
                 Setting::AutoXray,
                 settings.auto_xray,
-            ),
-            (
-                "随 Ladder 启动 mihomo",
-                "使用上次选择的 mihomo 配置",
-                Setting::AutoMihomo,
-                settings.auto_mihomo,
             ),
             (
                 "劫持DNS到本地回环",
@@ -1363,8 +1351,37 @@ impl MainWindow {
                                     .flex_col()
                                     .whitespace_normal()
                                     .gap(px(4.))
-                                    .child(format!("Ladder {}", env!("CARGO_PKG_VERSION")))
-                                    .child(caption("sing-box · Xray · mihomo", colors)),
+                                    .items_start()
+                                    .child(repository_link(
+                                        format!("Ladder {}", env!("CARGO_PKG_VERSION")),
+                                        "https://github.com/senzyo/ladder",
+                                        15,
+                                        colors,
+                                    ))
+                                    .child(
+                                        div().flex().flex_wrap().gap(px(8.)).children(
+                                            [
+                                                ("mihomo", "https://github.com/MetaCubeX/mihomo"),
+                                                (
+                                                    "sing-box",
+                                                    "https://github.com/SagerNet/sing-box",
+                                                ),
+                                                ("Xray", "https://github.com/XTLS/Xray-core"),
+                                            ]
+                                            .into_iter()
+                                            .enumerate()
+                                            .map(
+                                                |(index, (label, url))| {
+                                                    repository_link(
+                                                        label,
+                                                        url,
+                                                        16 + index as isize,
+                                                        colors,
+                                                    )
+                                                },
+                                            ),
+                                        ),
+                                    ),
                             ),
                     )
                     .child(caption("MIT License", colors))
@@ -1376,14 +1393,14 @@ impl MainWindow {
                             .gap(px(8.))
                             .child(action_button(
                                 "检查更新",
-                                15,
+                                19,
                                 (!update_busy).then_some(UiAction::CheckAppUpdate),
                                 false,
                                 colors,
                                 cx,
                             ))
                             .when_some(update_action, |el, (label, action)| {
-                                el.child(action_button(label, 16, Some(action), true, colors, cx))
+                                el.child(action_button(label, 20, Some(action), true, colors, cx))
                             })
                             .when_some(update_status, |el, status| {
                                 el.child(
@@ -1725,6 +1742,19 @@ fn control(id: impl Into<ElementId>, index: isize, colors: Colors, primary: bool
         .hover(|el| el.bg(hover))
         .active(|el| el.bg(pressed))
         .focus(|el| el.border_color(focus))
+}
+
+fn repository_link(
+    label: impl Into<SharedString>,
+    url: &'static str,
+    index: isize,
+    colors: Colors,
+) -> Stateful<Div> {
+    control(url, index, colors, false)
+        .text_color(colors.accent)
+        .underline()
+        .child(label.into())
+        .on_click(move |_, _, cx| cx.open_url(url))
 }
 
 fn action_button(
