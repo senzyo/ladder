@@ -32,6 +32,11 @@ try {
             if (-not $parent.WaitForExit(60000)) { throw 'Ladder did not exit; update was cancelled.' }
         } finally { $parent.Dispose() }
     }
+    $commit = Join-Path $Stage 'commit'
+    if (-not (Test-Path -LiteralPath $commit -PathType Leaf) -or
+        [IO.File]::ReadAllText($commit) -cne 'commit') {
+        throw 'Ladder did not confirm the update.'
+    }
     $hasher = [Security.Cryptography.SHA256]::Create()
     $inputFile = [IO.File]::OpenRead($Source)
     try { $hash = [BitConverter]::ToString($hasher.ComputeHash($inputFile)).Replace('-', '').ToLowerInvariant() }

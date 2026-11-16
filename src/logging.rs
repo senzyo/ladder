@@ -23,11 +23,12 @@ static LOG: OnceLock<Mutex<LogState>> = OnceLock::new();
 pub(crate) enum LogSource {
     SingBox,
     Xray,
+    Mihomo,
     App,
 }
 
 impl LogSource {
-    pub(crate) const ALL: [Self; 3] = [Self::SingBox, Self::Xray, Self::App];
+    pub(crate) const ALL: [Self; 4] = [Self::SingBox, Self::Xray, Self::Mihomo, Self::App];
 
     pub(crate) fn index(self) -> usize {
         self as usize
@@ -37,6 +38,7 @@ impl LogSource {
         match self {
             Self::SingBox => "sing-box",
             Self::Xray => "Xray",
+            Self::Mihomo => "mihomo",
             Self::App => "Ladder",
         }
     }
@@ -47,7 +49,7 @@ struct LogState {
     path: Option<PathBuf>,
     file: Option<CappedFile>,
     recent: VecDeque<String>,
-    cores: [VecDeque<String>; 2],
+    cores: [VecDeque<String>; 3],
 }
 
 impl LogState {

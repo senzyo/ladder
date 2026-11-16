@@ -108,6 +108,14 @@ fn read_output(
 const LINE_LIMIT: usize = 8 * 1024;
 const HIDDEN_LINE: &str = "[已隐藏敏感日志]";
 
+pub(crate) fn sanitized_output(bytes: &[u8]) -> String {
+    let mut output = Vec::new();
+    let mut lines = OutputLines::default();
+    lines.push(bytes, &mut |line| output.push(line));
+    lines.finish(&mut |line| output.push(line));
+    output.join("\n")
+}
+
 #[derive(Default)]
 enum Escape {
     #[default]

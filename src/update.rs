@@ -87,6 +87,7 @@ fn repository(core: Core) -> &'static str {
     match core {
         Core::SingBox => "SagerNet/sing-box",
         Core::Xray => "XTLS/Xray-core",
+        Core::Mihomo => "MetaCubeX/mihomo",
     }
 }
 
@@ -106,6 +107,19 @@ fn asset_name(core: Core, version: &str) -> String {
             "Xray-windows-64.zip"
         }
         .into(),
+        Core::Mihomo => format!(
+            "mihomo-windows-{}-{}{version}.zip",
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "amd64-v1"
+            },
+            if version.starts_with("alpha-") {
+                ""
+            } else {
+                "v"
+            }
+        ),
     }
 }
 
@@ -113,6 +127,33 @@ fn executable_name(core: Core) -> &'static str {
     match core {
         Core::SingBox => "sing-box.exe",
         Core::Xray => "xray.exe",
+        Core::Mihomo => "mihomo.exe",
+    }
+}
+
+fn matching_asset(core: Core, version: &str, name: &str) -> bool {
+    name == asset_name(core, version)
+        || (core == Core::Mihomo
+            && cfg!(target_arch = "x86_64")
+            && name == asset_name(core, version).replace("amd64-v1", "amd64-compatible"))
+}
+
+fn release_version_name(core: Core, release: &Release) -> Option<String> {
+    if core == Core::Mihomo && release.tag_name == "Prerelease-Alpha" {
+        release.assets.iter().find_map(|asset| {
+            let start = asset.name.find("-alpha-")? + 1;
+            let version = asset.name[start..].strip_suffix(".zip")?;
+            (version_parts(version).is_some() && matching_asset(core, version, &asset.name))
+                .then(|| version.to_owned())
+        })
+    } else {
+        Some(
+            release
+                .tag_name
+                .strip_prefix('v')
+                .unwrap_or(&release.tag_name)
+                .to_owned(),
+        )
     }
 }
 
@@ -129,6 +170,11 @@ fn numeric_version(version: &str) -> Option<Vec<u32>> {
 }
 
 fn version_parts(version: &str) -> Option<(Vec<u32>, Option<&str>)> {
+    if let Some(hash) = version.strip_prefix("alpha-") {
+        return ((7..=40).contains(&hash.len())
+            && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| (vec![0], Some(version)));
+    }
     fn valid_identifiers(value: &str) -> bool {
         value.split('.').all(|part| {
             !part.is_empty()
@@ -218,17 +264,25 @@ fn parse_release(core: Core, data: &[u8]) -> Result<Download, String> {
 }
 
 fn release_download(core: Core, release: Release) -> Result<Download, String> {
-    let version = release
-        .tag_name
-        .strip_prefix('v')
-        .unwrap_or(&release.tag_name);
-    let Some((_, prerelease)) = version_parts(version) else {
+    let version = release_version_name(core, &release).ok_or("官方响应不是可安装的版本")?;
+    let Some((_, prerelease)) = version_parts(&version) else {
         return Err("官方响应不是可安装的版本".into());
     };
     if release.draft {
         return Err("官方响应不是已发布的可安装版本".into());
     }
-    let name = asset_name(core, version);
+    let name = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == asset_name(core, &version))
+        .or_else(|| {
+            release
+                .assets
+                .iter()
+                .find(|asset| matching_asset(core, &version, &asset.name))
+        })
+        .map(|asset| asset.name.clone())
+        .ok_or("官方发布版本缺少当前架构的 Windows 安装包")?;
     let mut assets = release
         .assets
         .into_iter()
@@ -263,7 +317,7 @@ fn release_download(core: Core, release: Release) -> Result<Download, String> {
             .expect("digest was validated");
     }
     Ok(Download {
-        version: version.into(),
+        version: version.clone(),
         channel: if release.prerelease || prerelease.is_some() {
             UpdateChannel::Preview
         } else {
@@ -282,16 +336,15 @@ fn parse_releases(core: Core, data: &[u8]) -> Result<ReleasePage, String> {
     let has_more = releases.len() == 30;
     let mut versions = Vec::new();
     for release in releases {
-        let version = release
-            .tag_name
-            .strip_prefix('v')
-            .unwrap_or(&release.tag_name);
+        let Some(version) = release_version_name(core, &release) else {
+            continue;
+        };
         if release.draft
-            || version_parts(version).is_none()
+            || version_parts(&version).is_none()
             || !release
                 .assets
                 .iter()
-                .any(|asset| asset.name == asset_name(core, version))
+                .any(|asset| matching_asset(core, &version, &asset.name))
         {
             continue;
         }
@@ -302,8 +355,8 @@ fn parse_releases(core: Core, data: &[u8]) -> Result<ReleasePage, String> {
             continue;
         }
         versions.push(CoreVersion {
-            version: version.into(),
-            channel: if release.prerelease || version_parts(version).unwrap().1.is_some() {
+            version: version.clone(),
+            channel: if release.prerelease || version_parts(&version).unwrap().1.is_some() {
                 UpdateChannel::Preview
             } else {
                 UpdateChannel::Stable
@@ -316,12 +369,18 @@ fn parse_releases(core: Core, data: &[u8]) -> Result<ReleasePage, String> {
     Ok(ReleasePage { versions, has_more })
 }
 
-fn release_data(core: Core, endpoint: &str, cancelled: &AtomicBool) -> Result<Vec<u8>, String> {
+fn release_data(
+    core: Core,
+    endpoint: &str,
+    prefix: &str,
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, String> {
     check_cancelled(cancelled)?;
     let url = format!(
         "https://api.github.com/repos/{}/{endpoint}",
         repository(core)
     );
+    let url = crate::github::url(prefix, &url)?;
     let data = ureq::get(&url)
         .config()
         .https_only(true)
@@ -343,6 +402,7 @@ fn release_data(core: Core, endpoint: &str, cancelled: &AtomicBool) -> Result<Ve
 pub fn fetch_releases(
     core: Core,
     page: u32,
+    prefix: &str,
     cancelled: &AtomicBool,
 ) -> Result<ReleasePage, String> {
     if page == 0 {
@@ -351,6 +411,7 @@ pub fn fetch_releases(
     let data = release_data(
         core,
         &format!("releases?per_page=30&page={page}"),
+        prefix,
         cancelled,
     )?;
     parse_releases(core, &data)
@@ -472,6 +533,7 @@ pub fn prepare_version(
     core: Core,
     root: &Path,
     release: &CoreVersion,
+    prefix: &str,
     cancelled: &AtomicBool,
     mut progress: impl FnMut(UpdateProgress),
 ) -> Result<PreparedUpdate, String> {
@@ -484,11 +546,15 @@ pub fn prepare_version(
         .release_tag
         .as_deref()
         .ok_or("请先刷新官方版本列表")?;
-    if tag.strip_prefix('v').unwrap_or(tag) != release.version {
+    if tag.strip_prefix('v').unwrap_or(tag) != release.version
+        && !(core == Core::Mihomo
+            && tag == "Prerelease-Alpha"
+            && release.version.starts_with("alpha-"))
+    {
         return Err("官方版本标签与版本号不符，请刷新列表".into());
     }
     progress(UpdateProgress::Checking);
-    let data = release_data(core, &format!("releases/tags/{tag}"), cancelled)?;
+    let data = release_data(core, &format!("releases/tags/{tag}"), prefix, cancelled)?;
     let download = parse_release(core, &data)?;
     if download.version != release.version || download.tag != tag {
         return Err("官方发布响应与所选版本不符，请刷新列表".into());
@@ -497,7 +563,8 @@ pub fn prepare_version(
     prepared.channel = download.channel;
     prepared.release_tag = Some(download.tag.clone());
     let archive = prepared.directory.path().join("package.zip");
-    let request = ureq::get(&download.url).config().https_only(true).build();
+    let url = crate::github::url(prefix, &download.url)?;
+    let request = ureq::get(&url).config().https_only(true).build();
     download_archive(
         request,
         &download,
@@ -709,6 +776,24 @@ impl PreparedUpdate {
                 .map_err(|e| format!("保存暂存文件失败: {e}"))?;
         }
         let executable = executable_name(core);
+        if core == Core::Mihomo && !self.staged.join(executable).exists() {
+            let bundled: &[&str] = if cfg!(target_arch = "aarch64") {
+                &["mihomo-windows-arm64.exe"]
+            } else {
+                &[
+                    "mihomo-windows-amd64-v1.exe",
+                    "mihomo-windows-amd64-compatible.exe",
+                ]
+            };
+            if let Some(source) = bundled
+                .iter()
+                .map(|name| self.staged.join(name))
+                .find(|path| path.is_file())
+            {
+                fs::rename(source, self.staged.join(executable))
+                    .map_err(|error| format!("整理 mihomo 程序文件失败: {error}"))?;
+            }
+        }
         if !self.staged.join(executable).is_file() {
             let entries = fs::read_dir(&self.staged)
                 .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
@@ -787,8 +872,10 @@ fn parse_version(core: Core, output: &str) -> Option<String> {
     let prefix = match core {
         Core::SingBox => "sing-box version ",
         Core::Xray => "Xray ",
+        Core::Mihomo => "Mihomo Meta ",
     };
     let version = first.strip_prefix(prefix)?.split_whitespace().next()?;
+    let version = version.strip_prefix('v').unwrap_or(version);
     if version.len() > 64
         || !version
             .bytes()
@@ -808,7 +895,7 @@ fn read_version(core: Core, executable: &Path, timeout: Duration) -> Result<Stri
     validate_executable(executable)?;
     // 用临时文件接收输出，避免异常版本命令填满管道或后代持有管道导致等待不返回。
     let mut output = tempfile::tempfile().map_err(|e| format!("创建版本检测临时文件失败: {e}"))?;
-    let child = JobProcess::spawn_version(executable, &output)
+    let child = JobProcess::spawn_version(core, executable, &output)
         .map_err(|_| "无法运行核心版本命令，可重新安装官方核心".to_string())?;
     let deadline = Instant::now() + timeout;
     let result = loop {
@@ -889,6 +976,76 @@ mod tests {
 
     fn release(core: Core) -> serde_json::Value {
         release_version(core, "1.2.3", false)
+    }
+
+    #[test]
+    fn mihomo_releases_cover_compatible_assets_and_rolling_alpha() {
+        let mut stable = release(Core::Mihomo);
+        if cfg!(target_arch = "x86_64") {
+            let name = "mihomo-windows-amd64-compatible-v1.2.3.zip";
+            stable["assets"][0]["name"] = name.into();
+            stable["assets"][0]["browser_download_url"] =
+                format!("https://github.com/MetaCubeX/mihomo/releases/download/v1.2.3/{name}")
+                    .into();
+        }
+        assert_eq!(
+            parse_release(Core::Mihomo, &serde_json::to_vec(&stable).unwrap())
+                .unwrap()
+                .version,
+            "1.2.3"
+        );
+        let mut alpha = release(Core::Mihomo);
+        let name = asset_name(Core::Mihomo, "alpha-3c0d10a");
+        alpha["tag_name"] = "Prerelease-Alpha".into();
+        alpha["prerelease"] = true.into();
+        alpha["assets"][0]["name"] = name.clone().into();
+        alpha["assets"][0]["browser_download_url"] = format!(
+            "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/{name}"
+        )
+        .into();
+        let download = parse_release(Core::Mihomo, &serde_json::to_vec(&alpha).unwrap()).unwrap();
+        assert_eq!(download.version, "alpha-3c0d10a");
+        assert_eq!(download.channel, UpdateChannel::Preview);
+        assert_eq!(
+            parse_version(
+                Core::Mihomo,
+                "Mihomo Meta v1.19.34 windows amd64 with go1.26"
+            ),
+            Some("1.19.34".into())
+        );
+        assert_eq!(
+            parse_version(Core::Mihomo, "Mihomo Meta alpha-3c0d10a windows amd64"),
+            Some("alpha-3c0d10a".into())
+        );
+        let versions = parse_releases(
+            Core::Mihomo,
+            &serde_json::to_vec(&vec![alpha, stable]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(versions.versions.len(), 2);
+    }
+
+    #[test]
+    fn mihomo_archive_renames_official_executable_and_preserves_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let bundled = if cfg!(target_arch = "aarch64") {
+            "mihomo-windows-arm64.exe"
+        } else {
+            "mihomo-windows-amd64-v1.exe"
+        };
+        let archive = zip_file(
+            root.path(),
+            &[(bundled, b"fixture"), ("LICENSE", b"license")],
+        );
+        let mut prepared =
+            PreparedUpdate::new(Core::Mihomo, root.path(), "1.19.34".into()).unwrap();
+        prepared
+            .extract(Core::Mihomo, &archive, &AtomicBool::new(false))
+            .unwrap();
+        prepared.install().unwrap();
+        let installed = version_directory(Core::Mihomo, root.path(), "1.19.34").unwrap();
+        assert_eq!(fs::read(installed.join("mihomo.exe")).unwrap(), b"fixture");
+        assert_eq!(fs::read(installed.join("LICENSE")).unwrap(), b"license");
     }
 
     fn release_version(core: Core, version: &str, prerelease: bool) -> serde_json::Value {
@@ -1793,13 +1950,13 @@ fn main() {
         let root = tempfile::tempdir().unwrap();
         for core in Core::ALL {
             let cancelled = AtomicBool::new(false);
-            let release = fetch_releases(core, 1, &cancelled)
+            let release = fetch_releases(core, 1, "", &cancelled)
                 .unwrap()
                 .versions
                 .into_iter()
                 .find(|item| item.channel == channel)
                 .expect("official first page must contain requested release channel");
-            let mut prepared = prepare_version(core, root.path(), &release, &cancelled, |_| {})
+            let mut prepared = prepare_version(core, root.path(), &release, "", &cancelled, |_| {})
                 .unwrap_or_else(|error| panic!("{}: {error}", core.label()));
             let target = version_directory(core, root.path(), &release.version).unwrap();
             assert!(!target.exists());
@@ -1808,7 +1965,7 @@ fn main() {
                 read_version_for(core, &target.join(executable_name(core))).unwrap(),
                 release.version
             );
-            assert!(prepare_version(core, root.path(), &release, &cancelled, |_| {}).is_err());
+            assert!(prepare_version(core, root.path(), &release, "", &cancelled, |_| {}).is_err());
             let local = installed_versions(core, root.path()).unwrap();
             assert_eq!(local.len(), 1);
             assert_eq!(local[0].channel, channel);

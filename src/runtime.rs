@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dns::DnsLease;
 use crate::logging;
-use crate::managed_child::ManagedChild;
+use crate::managed_child::{JobProcess, ManagedChild};
 use crate::scheduler::{DesktopDns, desktop_dns};
 use crate::update::{self, CoreVersion, PreparedUpdate, UpdateProgress};
 use crate::{tun_cleanup, tun_config};
@@ -20,15 +21,17 @@ use crate::{tun_cleanup, tun_config};
 pub enum Core {
     SingBox,
     Xray,
+    Mihomo,
 }
 
 impl Core {
-    pub const ALL: [Core; 2] = [Core::SingBox, Core::Xray];
+    pub const ALL: [Core; 3] = [Core::SingBox, Core::Xray, Core::Mihomo];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::SingBox => "sing-box",
             Self::Xray => "xray",
+            Self::Mihomo => "mihomo",
         }
     }
 
@@ -63,7 +66,18 @@ pub struct Settings {
     pub minimize_to_tray: bool,
     pub auto_sing_box: bool,
     pub auto_xray: bool,
+    #[serde(default)]
+    pub auto_mihomo: bool,
     pub hijack_dns: bool,
+    #[serde(default)]
+    pub github_proxy: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigValidation {
+    Checking,
+    Valid,
+    Invalid(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +109,9 @@ pub struct CoreState {
     pub versions_error: Option<String>,
     pub local_versions_error: Option<String>,
     pub downloading_version: Option<String>,
+    pub validation: BTreeMap<String, ConfigValidation>,
+    validation_stamps: BTreeMap<String, (u64, Option<SystemTime>)>,
+    pub validation_busy: bool,
     versions_page: u32,
 }
 
@@ -103,6 +120,7 @@ pub struct Snapshot {
     pub settings: Settings,
     pub sing_box: CoreState,
     pub xray: CoreState,
+    pub mihomo: CoreState,
     pub settings_error: Option<String>,
     pub dns_recovery_error: Option<String>,
     pub dns_recovery_busy: bool,
@@ -114,6 +132,7 @@ impl Snapshot {
         match core {
             Core::SingBox => &self.sing_box,
             Core::Xray => &self.xray,
+            Core::Mihomo => &self.mihomo,
         }
     }
 
@@ -121,6 +140,7 @@ impl Snapshot {
         match core {
             Core::SingBox => &mut self.sing_box,
             Core::Xray => &mut self.xray,
+            Core::Mihomo => &mut self.mihomo,
         }
     }
 }
@@ -130,6 +150,7 @@ pub enum Setting {
     MinimizeToTray,
     AutoSingBox,
     AutoXray,
+    AutoMihomo,
     HijackDns,
 }
 
@@ -137,6 +158,9 @@ pub enum Setting {
 pub enum Action {
     Start(Core),
     Stop(Core),
+    Restart(Core),
+    ValidateConfig(Core, String),
+    ValidateAllConfigs(Core),
     SwitchConfig(Core, String),
     DeleteConfig(Core, String),
     Set(Setting, bool),
@@ -151,7 +175,9 @@ pub enum Action {
 enum Request {
     Action(Action),
     SetTheme(ThemePreference, async_channel::Sender<()>),
+    SetGithubProxy(String, async_channel::Sender<()>),
     Shutdown(mpsc::Sender<Result<Option<String>, String>>),
+    PrepareAppUpdate(mpsc::Sender<Result<(), String>>),
     Prepared(Core, PreparedUpdate),
     #[cfg(test)]
     Panic,
@@ -162,8 +188,10 @@ struct Saved {
     settings: Settings,
     sing_box: Option<String>,
     xray: Option<String>,
+    mihomo: Option<String>,
     sing_box_version: Option<String>,
     xray_version: Option<String>,
+    mihomo_version: Option<String>,
 }
 
 impl Saved {
@@ -196,6 +224,7 @@ impl Saved {
         match core {
             Core::SingBox => &self.sing_box,
             Core::Xray => &self.xray,
+            Core::Mihomo => &self.mihomo,
         }
     }
 
@@ -203,6 +232,7 @@ impl Saved {
         match core {
             Core::SingBox => &self.sing_box_version,
             Core::Xray => &self.xray_version,
+            Core::Mihomo => &self.mihomo_version,
         }
     }
 
@@ -210,6 +240,7 @@ impl Saved {
         match core {
             Core::SingBox => self.sing_box_version = Some(version),
             Core::Xray => self.xray_version = Some(version),
+            Core::Mihomo => self.mihomo_version = Some(version),
         }
     }
 
@@ -286,7 +317,7 @@ impl Runtime {
                 .map_err(|e| format!("创建 {} 配置目录失败: {e}", core.label()))?;
             cleanup_runtime_configs(&dir);
             let state = snapshot.core_mut(core);
-            state.configs = list_configs(&dir)?;
+            state.configs = list_configs(core, &dir)?;
             state.current = saved.current(core).clone();
             state.selected_version = saved.selected_version(core).clone();
             state.installed = saved.executable(core, &root).is_ok_and(|exe| exe.is_file());
@@ -300,6 +331,7 @@ impl Runtime {
             let auto = match core {
                 Core::SingBox => saved.settings.auto_sing_box,
                 Core::Xray => saved.settings.auto_xray,
+                Core::Mihomo => saved.settings.auto_mihomo,
             };
             state.operation = auto.then_some(CoreOperation::Starting);
         }
@@ -310,10 +342,10 @@ impl Runtime {
             root: root.clone(),
             state: state.clone(),
             saved,
-            children: [None, None],
+            children: Default::default(),
             dns,
             quitting: quitting.clone(),
-            version_files: [None, None],
+            version_files: Default::default(),
         };
         thread::Builder::new()
             .name("ladder-cores".into())
@@ -341,7 +373,14 @@ impl Runtime {
     }
 
     pub fn send(&self, action: Action) -> Result<(), String> {
+        if self.quitting.load(Ordering::Acquire) {
+            return Err("正在退出或准备更新，请稍候".into());
+        }
         match action {
+            Action::ValidateConfig(core, ref name) => {
+                return self.validate_configs(core, Some(name));
+            }
+            Action::ValidateAllConfigs(core) => return self.validate_configs(core, None),
             Action::RefreshVersions(core) => return self.load_versions(core, false),
             Action::LoadMoreVersions(core) => return self.load_versions(core, true),
             Action::DownloadVersion(core, ref version) => {
@@ -352,7 +391,7 @@ impl Runtime {
         let mut snapshot = self.state.lock().unwrap();
         let retry_dns = matches!(action, Action::RetryDns);
         let target = match &action {
-            Action::Start(core) => Some((*core, CoreOperation::Starting)),
+            Action::Start(core) | Action::Restart(core) => Some((*core, CoreOperation::Starting)),
             Action::Stop(core) => Some((*core, CoreOperation::Stopping)),
             Action::SwitchConfig(core, _) | Action::DeleteConfig(core, _) => {
                 Some((*core, CoreOperation::Switching))
@@ -372,6 +411,8 @@ impl Runtime {
                 None
             }
             Action::RefreshVersions(_)
+            | Action::ValidateConfig(..)
+            | Action::ValidateAllConfigs(_)
             | Action::LoadMoreVersions(_)
             | Action::DownloadVersion(_, _) => unreachable!(),
         };
@@ -406,6 +447,109 @@ impl Runtime {
         Ok(rx)
     }
 
+    pub fn set_github_proxy(&self, prefix: String) -> Result<async_channel::Receiver<()>, String> {
+        let prefix = crate::github::normalized_prefix(&prefix)?;
+        let (tx, rx) = async_channel::bounded(1);
+        self.tx
+            .send(Request::SetGithubProxy(prefix, tx))
+            .map_err(|_| "核心管理线程已关闭".to_string())?;
+        Ok(rx)
+    }
+
+    fn validate_configs(&self, core: Core, name: Option<&str>) -> Result<(), String> {
+        if self.quitting.load(Ordering::Acquire) {
+            return Err("正在退出，无法验证配置".into());
+        }
+        let mut snapshot = self.state.lock().unwrap();
+        let state = snapshot.core_mut(core);
+        if state.validation_busy {
+            return Err("正在验证配置，请稍候".into());
+        }
+        let version = state
+            .selected_version
+            .clone()
+            .ok_or("请先下载并选择核心版本")?;
+        let exe = update::version_directory(core, &self.root, &version)?
+            .join(format!("{}.exe", core.label()));
+        let exe_stamp = executable_stamp(&exe).ok_or("请先下载并选择核心版本")?;
+        let names = match name {
+            Some(name) => {
+                config_path(core, &self.root, name)?;
+                vec![name.to_owned()]
+            }
+            None => list_configs(core, &self.config_dir(core))?,
+        };
+        let jobs = names
+            .iter()
+            .map(|name| {
+                let path = readable_config(core, &self.root, name);
+                let stamp = executable_stamp(&core.config_dir(&self.root).join(name));
+                (name.clone(), path, stamp)
+            })
+            .collect::<Vec<_>>();
+        for (name, _, stamp) in &jobs {
+            state
+                .validation
+                .insert(name.clone(), ConfigValidation::Checking);
+            if let Some(stamp) = stamp {
+                state.validation_stamps.insert(name.clone(), *stamp);
+            }
+        }
+        state.validation_busy = true;
+        let runtime = self.clone();
+        thread::Builder::new()
+            .name(format!("{}-validate", core.label()))
+            .spawn(move || {
+                for (name, path, stamp) in jobs {
+                    if runtime.quitting.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let result = path.as_ref().map_err(Clone::clone).and_then(|path| {
+                        validate_config(core, &exe, &runtime.root, path, &runtime.quitting)
+                    });
+                    let mut snapshot = runtime.state.lock().unwrap();
+                    let state = snapshot.core_mut(core);
+                    if state.selected_version.as_deref() != Some(&version)
+                        || executable_stamp(&exe) != Some(exe_stamp)
+                        || path
+                            .as_ref()
+                            .is_ok_and(|path| executable_stamp(path) != stamp)
+                        || state.validation.get(&name) != Some(&ConfigValidation::Checking)
+                    {
+                        state.validation.remove(&name);
+                        continue;
+                    }
+                    let value = match result {
+                        Ok(()) => ConfigValidation::Valid,
+                        Err(error) => {
+                            for line in error.lines() {
+                                logging::record_core(core, format!("[ERROR] 配置验证：{line}"));
+                            }
+                            ConfigValidation::Invalid(error)
+                        }
+                    };
+                    state.validation.insert(name, value);
+                }
+                let mut snapshot = runtime.state.lock().unwrap();
+                let state = snapshot.core_mut(core);
+                state
+                    .validation
+                    .retain(|_, value| *value != ConfigValidation::Checking);
+                state
+                    .validation_stamps
+                    .retain(|name, _| state.validation.contains_key(name));
+                state.validation_busy = false;
+            })
+            .map_err(|error| {
+                for name in names {
+                    state.validation.remove(&name);
+                }
+                state.validation_busy = false;
+                format!("创建配置验证线程失败: {error}")
+            })?;
+        Ok(())
+    }
+
     /// 核心均已停止时返回可选的 DNS 恢复提示，失败的记录保留到下次启动。
     pub fn shutdown(&self) -> Result<Option<String>, String> {
         logging::info("runtime", "请求停止核心并退出");
@@ -414,8 +558,35 @@ impl Runtime {
         self.tx
             .send(Request::Shutdown(tx))
             .map_err(|_| "核心管理线程已关闭".to_string())?;
-        rx.recv()
-            .map_err(|_| "核心管理线程未返回退出结果".to_string())?
+        let result = rx
+            .recv()
+            .map_err(|_| "核心管理线程未返回退出结果".to_string())?;
+        if result.is_err() {
+            self.cancel_app_update();
+        }
+        result
+    }
+
+    pub fn prepare_app_update(&self) -> Result<(), String> {
+        self.quitting.store(true, Ordering::Release);
+        let (tx, rx) = mpsc::channel();
+        let result = self
+            .tx
+            .send(Request::PrepareAppUpdate(tx))
+            .map_err(|_| "核心管理线程已关闭".to_string())
+            .and_then(|()| {
+                rx.recv()
+                    .map_err(|_| "核心管理线程未返回更新准备结果".to_string())
+            })
+            .and_then(|result| result);
+        if result.is_err() {
+            self.cancel_app_update();
+        }
+        result
+    }
+
+    pub fn cancel_app_update(&self) {
+        self.quitting.store(false, Ordering::Release);
     }
 
     fn load_versions(&self, core: Core, more: bool) -> Result<(), String> {
@@ -423,6 +594,7 @@ impl Runtime {
             return Err("正在退出，无法获取版本列表".into());
         }
         let mut snapshot = self.state.lock().unwrap();
+        let prefix = snapshot.settings.github_proxy.clone();
         let state = snapshot.core_mut(core);
         if state.versions_loading {
             return Err("正在获取版本列表".into());
@@ -437,7 +609,7 @@ impl Runtime {
         thread::Builder::new()
             .name(format!("{}-releases", core.label()))
             .spawn(move || {
-                let result = update::fetch_releases(core, page, &runtime.quitting);
+                let result = update::fetch_releases(core, page, &prefix, &runtime.quitting);
                 let mut snapshot = runtime.state.lock().unwrap();
                 let state = snapshot.core_mut(core);
                 state.versions_loading = false;
@@ -537,10 +709,17 @@ impl Runtime {
     }
 
     fn prepare_download(&self, core: Core, release: &CoreVersion) -> Result<(), String> {
-        let prepared =
-            update::prepare_version(core, &self.root, release, &self.quitting, |progress| {
+        let prefix = self.snapshot().settings.github_proxy;
+        let prepared = update::prepare_version(
+            core,
+            &self.root,
+            release,
+            &prefix,
+            &self.quitting,
+            |progress| {
                 self.state.lock().unwrap().core_mut(core).update = Some(progress);
-            })?;
+            },
+        )?;
         self.queue_prepared(core, prepared)
     }
 
@@ -592,12 +771,12 @@ fn merge_versions(
     update::sort_versions(existing, selected);
 }
 
-fn list_configs(dir: &Path) -> Result<Vec<String>, String> {
+fn list_configs(core: Core, dir: &Path) -> Result<Vec<String>, String> {
     let mut items = Vec::new();
     for entry in fs::read_dir(dir).map_err(|e| format!("读取配置目录失败: {e}"))? {
         let entry = entry.map_err(|e| format!("读取配置文件信息失败: {e}"))?;
         let path = entry.path();
-        if is_json(&path)
+        if is_config(core, &path)
             && !is_runtime_config(&path)
             && path.is_file()
             && let Some(name) = entry.file_name().to_str()
@@ -615,8 +794,19 @@ fn is_json(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
-fn is_runtime_config(path: &Path) -> bool {
+fn is_config(core: Core, path: &Path) -> bool {
     is_json(path)
+        || (core == Core::Mihomo
+            && path
+                .extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("yml")
+                }))
+}
+
+fn is_runtime_config(path: &Path) -> bool {
+    is_config(Core::Mihomo, path)
         && path
             .file_name()
             .and_then(OsStr::to_str)
@@ -644,14 +834,96 @@ fn executable_stamp(path: &Path) -> Option<(u64, Option<SystemTime>)> {
         .map(|file| (file.len(), file.modified().ok()))
 }
 
+fn readable_config(core: Core, root: &Path, name: &str) -> Result<PathBuf, String> {
+    let config = config_path(core, root, name)?;
+    let metadata = fs::File::open(&config)
+        .and_then(|file| file.metadata())
+        .map_err(|error| format!("无法读取配置文件，请检查文件是否存在及访问权限: {error}"))?;
+    if !metadata.is_file() {
+        return Err("所选路径不是配置文件".into());
+    }
+    Ok(config)
+}
+
+fn config_path(core: Core, root: &Path, name: &str) -> Result<PathBuf, String> {
+    let name_path = Path::new(name);
+    if !matches!(name_path.components().next(), Some(Component::Normal(_)))
+        || name_path.file_name() != Some(OsStr::new(name))
+        || name.contains(':')
+        || !is_config(core, name_path)
+        || is_runtime_config(name_path)
+    {
+        return Err("配置文件名无效".into());
+    }
+    Ok(core.config_dir(root).join(name))
+}
+
+fn validate_config(
+    core: Core,
+    exe: &Path,
+    root: &Path,
+    config: &Path,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    const OUTPUT_LIMIT: u64 = 64 * 1024;
+    if cancelled.load(Ordering::Acquire) {
+        return Err("配置验证已取消".into());
+    }
+    let mut output =
+        tempfile::tempfile().map_err(|error| format!("创建验证输出文件失败: {error}"))?;
+    let child = JobProcess::spawn_validation(core, exe, root, config, &output)
+        .map_err(|error| format!("无法运行核心验证命令: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let result = loop {
+        if cancelled.load(Ordering::Acquire) {
+            break Err("配置验证已取消".to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status.success()),
+            Err(_) => break Err("无法读取核心验证状态".into()),
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            break Err("配置验证超时，请检查配置引用的资源是否可用".into());
+        }
+        if output
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() > OUTPUT_LIMIT)
+        {
+            break Err("核心验证输出过多，已停止验证".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    child
+        .terminate()
+        .map_err(|_| "验证进程尚未完全退出，请重试")?;
+    drop(child);
+    output
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| "无法读取验证输出")?;
+    let mut bytes = Vec::new();
+    output
+        .take(OUTPUT_LIMIT)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "无法读取验证输出")?;
+    let message = crate::core_output::sanitized_output(&bytes);
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) if message.trim().is_empty() => Err("配置验证失败，核心未提供错误详情".into()),
+        Ok(false) => Err(message),
+        Err(error) if message.trim().is_empty() => Err(error),
+        Err(error) => Err(format!("{error}\n{message}")),
+    }
+}
+
 struct Worker {
     root: PathBuf,
     state: Arc<Mutex<Snapshot>>,
     saved: Saved,
-    children: [Option<ManagedChild>; 2],
+    children: [Option<ManagedChild>; 3],
     dns: DesktopDns,
     quitting: Arc<AtomicBool>,
-    version_files: [Option<(u64, Option<SystemTime>)>; 2],
+    version_files: [Option<(u64, Option<SystemTime>)>; 3],
 }
 
 impl Worker {
@@ -690,6 +962,7 @@ impl Worker {
             let auto = match core {
                 Core::SingBox => self.saved.settings.auto_sing_box,
                 Core::Xray => self.saved.settings.auto_xray,
+                Core::Mihomo => self.saved.settings.auto_mihomo,
             };
             if auto {
                 logging::info("core", format_args!("{} 自动启动已启用", core.label()));
@@ -712,6 +985,10 @@ impl Worker {
                     self.update_settings(|settings| settings.theme = theme);
                     let _ = reply.try_send(());
                 }
+                Ok(Request::SetGithubProxy(prefix, reply)) => {
+                    self.update_settings(|settings| settings.github_proxy = prefix);
+                    let _ = reply.try_send(());
+                }
                 Ok(Request::Shutdown(reply)) => {
                     let result = self.stop_all();
                     let done = result.is_ok();
@@ -719,6 +996,12 @@ impl Worker {
                     if done {
                         break;
                     }
+                }
+                Ok(Request::PrepareAppUpdate(reply)) => {
+                    let result = self
+                        .stop_all()
+                        .and_then(|warning| warning.map_or(Ok(()), Err));
+                    let _ = reply.send(result);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     logging::warn("runtime", "核心管理请求通道已断开，停止托管核心");
@@ -745,6 +1028,7 @@ impl Worker {
         );
         let operation = match &action {
             Action::Start(core) => Some((*core, "启动")),
+            Action::Restart(core) => Some((*core, "重启")),
             Action::Stop(core) => Some((*core, "停止")),
             Action::SwitchConfig(core, _) => Some((*core, "切换配置")),
             Action::DeleteConfig(core, _) => Some((*core, "删除配置")),
@@ -766,10 +1050,24 @@ impl Worker {
                     Setting::MinimizeToTray => settings.minimize_to_tray = value,
                     Setting::AutoSingBox => settings.auto_sing_box = value,
                     Setting::AutoXray => settings.auto_xray = value,
+                    Setting::AutoMihomo => settings.auto_mihomo = value,
                     Setting::HijackDns => settings.hijack_dns = value,
                 });
             }
             Action::Stop(core) => (core, self.stop(core)),
+            Action::Restart(core) => {
+                let result = self
+                    .saved
+                    .current(core)
+                    .clone()
+                    .ok_or_else(|| "尚未选择配置，请在配置列表中点击“切换”".into())
+                    .and_then(|name| self.readable_config(core, &name))
+                    .and_then(|config| {
+                        self.stop(core)?;
+                        self.start(core, &config)
+                    });
+                (core, result)
+            }
             Action::Start(core) => {
                 let current = self.saved.current(core).clone();
                 let result = match current {
@@ -786,6 +1084,8 @@ impl Worker {
             Action::SwitchVersion(core, version) => (core, self.switch_version(core, &version)),
             Action::DeleteVersion(core, version) => (core, self.delete_version(core, &version)),
             Action::RefreshVersions(_)
+            | Action::ValidateConfig(..)
+            | Action::ValidateAllConfigs(_)
             | Action::LoadMoreVersions(_)
             | Action::DownloadVersion(_, _) => unreachable!(),
         };
@@ -867,6 +1167,7 @@ impl Worker {
         match core {
             Core::SingBox => next.sing_box = Some(name.into()),
             Core::Xray => next.xray = Some(name.into()),
+            Core::Mihomo => next.mihomo = Some(name.into()),
         }
         next.store(&self.root)
             .map_err(|e| format!("保存当前配置失败: {e}"))?;
@@ -895,12 +1196,20 @@ impl Worker {
 
     fn refresh(&mut self) {
         for core in Core::ALL {
-            let result = list_configs(&core.config_dir(&self.root));
+            let result = list_configs(core, &core.config_dir(&self.root));
             let exe = self.saved.executable(core, &self.root).ok();
             let installed = exe.as_ref().is_some_and(|path| path.is_file());
             let local_versions = update::installed_versions(core, &self.root);
             let mut snapshot = self.state.lock().unwrap();
             let state = snapshot.core_mut(core);
+            state.validation.retain(|name, _| {
+                state.selected_version == *self.saved.selected_version(core)
+                    && state.validation_stamps.get(name).copied()
+                        == executable_stamp(&core.config_dir(&self.root).join(name))
+            });
+            state
+                .validation_stamps
+                .retain(|name, _| state.validation.contains_key(name));
             state.installed = installed;
             state.selected_version = self.saved.selected_version(core).clone();
             match local_versions {
@@ -944,6 +1253,8 @@ impl Worker {
             }
             let stamp = exe.as_deref().and_then(executable_stamp);
             if self.version_files[core as usize] != stamp {
+                state.validation.clear();
+                state.validation_stamps.clear();
                 self.version_files[core as usize] = stamp;
                 state.version = None;
                 state.version_error = None;
@@ -992,23 +1303,7 @@ impl Worker {
     }
 
     fn readable_config(&self, core: Core, name: &str) -> Result<PathBuf, String> {
-        let name_path = Path::new(name);
-        if !matches!(name_path.components().next(), Some(Component::Normal(_)))
-            || name_path.file_name() != Some(OsStr::new(name))
-            || name.contains(':')
-            || !is_json(name_path)
-            || is_runtime_config(name_path)
-        {
-            return Err("配置文件名无效".into());
-        }
-        let config = core.config_dir(&self.root).join(name);
-        let metadata = fs::File::open(&config)
-            .and_then(|file| file.metadata())
-            .map_err(|error| format!("无法读取配置文件，请检查文件是否存在及访问权限: {error}"))?;
-        if !metadata.is_file() {
-            return Err("所选路径不是配置文件".into());
-        }
-        Ok(config)
+        readable_config(core, &self.root, name)
     }
 
     fn start(&mut self, core: Core, config: &Path) -> Result<(), String> {
@@ -1166,7 +1461,7 @@ impl Worker {
         let Some(child) = &mut self.children[core as usize] else {
             return;
         };
-        let status = match child.try_wait() {
+        match child.try_wait() {
             Ok(None) => return,
             Err(e) => {
                 let message = format!("检查核心状态失败: {e}");
@@ -1178,7 +1473,7 @@ impl Worker {
                 state.run_error = Some(message);
                 return;
             }
-            Ok(Some(code)) => code,
+            Ok(Some(_)) => {}
         };
         let result = self.stop_process(core);
         if result.is_ok() {
@@ -1187,10 +1482,10 @@ impl Worker {
         }
         let message = match result {
             Ok(reason) => format!(
-                "核心已退出 ({status}) 。{}",
+                "核心已退出。{}",
                 reason.unwrap_or("请检查配置内容及核心所需的资源文件")
             ),
-            Err(e) => format!("核心已退出 ({status}) 。{e}"),
+            Err(e) => format!("核心已退出。{e}"),
         };
         let mut snapshot = self.state.lock().unwrap();
         let state = snapshot.core_mut(core);
@@ -1206,6 +1501,165 @@ mod tests {
     use super::*;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::process::{Child, Command};
+
+    #[test]
+    fn mihomo_config_extensions_and_saved_selections_are_independent() {
+        let root = tempfile::tempdir().unwrap();
+        for core in Core::ALL {
+            fs::create_dir_all(core.config_dir(root.path())).unwrap();
+        }
+        for name in [
+            "one.yaml",
+            "two.YML",
+            "three.JSON",
+            "notes.txt",
+            ".ladder-tun-hidden.yaml",
+        ] {
+            fs::write(Core::Mihomo.config_dir(root.path()).join(name), "{}").unwrap();
+        }
+        assert_eq!(
+            list_configs(Core::Mihomo, &Core::Mihomo.config_dir(root.path())).unwrap(),
+            ["one.yaml", "three.JSON", "two.YML"]
+        );
+        assert!(readable_config(Core::Mihomo, root.path(), "one.yaml").is_ok());
+        for name in [
+            "../outside.yaml",
+            "one.yaml:stream",
+            ".ladder-tun-hidden.yaml",
+        ] {
+            assert!(readable_config(Core::Mihomo, root.path(), name).is_err());
+        }
+        assert!(!is_config(Core::Xray, Path::new("config.yaml")));
+        let mut saved = Saved {
+            mihomo: Some("one.yaml".into()),
+            ..Default::default()
+        };
+        saved.select_version(Core::Mihomo, "1.19.34".into());
+        saved.settings.auto_mihomo = true;
+        saved.store(root.path()).unwrap();
+        let restored = Saved::load(root.path()).unwrap();
+        assert_eq!(restored.current(Core::Mihomo).as_deref(), Some("one.yaml"));
+        assert!(restored.settings.auto_mihomo);
+        assert_eq!(restored.current(Core::SingBox), &None);
+        assert_eq!(
+            restored.selected_version(Core::Mihomo).as_deref(),
+            Some("1.19.34")
+        );
+    }
+
+    #[test]
+    fn validation_command_returns_details_with_credentials_redacted() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("validation-fixture.rs");
+        let exe = root.path().join("ladder-validation-fixture.exe");
+        fs::write(
+            &source,
+            r#"fn main() {
+            let args: Vec<_> = std::env::args().collect();
+            assert!(args.iter().any(|arg| matches!(arg.as_str(), "check" | "-test" | "-t")));
+            let content = std::fs::read_to_string(args.last().unwrap()).unwrap();
+            if content == "invalid" {
+                eprintln!("\x1b[31mERROR unknown field: broken\x1b[0m");
+                eprintln!("password=DO_NOT_EXPOSE");
+                std::process::exit(42);
+            }
+        }"#,
+        )
+        .unwrap();
+        let built = Command::new("rustc")
+            .arg(&source)
+            .arg("--crate-name")
+            .arg("ladder_validation_fixture")
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(built.status.success());
+        let config = root.path().join("config.json");
+        for core in Core::ALL {
+            fs::write(&config, "valid").unwrap();
+            assert!(
+                validate_config(core, &exe, root.path(), &config, &AtomicBool::new(false)).is_ok()
+            );
+            fs::write(&config, "invalid").unwrap();
+            let error = validate_config(core, &exe, root.path(), &config, &AtomicBool::new(false))
+                .unwrap_err();
+            assert!(error.contains("unknown field: broken"));
+            assert!(error.contains("已隐藏敏感日志"));
+            assert!(!error.contains("DO_NOT_EXPOSE"));
+            assert!(!error.contains("42"));
+            assert!(!error.contains('\x1b'));
+        }
+        assert_eq!(
+            validate_config(
+                Core::Mihomo,
+                &exe,
+                root.path(),
+                &config,
+                &AtomicBool::new(true)
+            )
+            .unwrap_err(),
+            "配置验证已取消"
+        );
+    }
+
+    #[test]
+    fn validation_failures_for_locked_configs_survive_refresh() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for core in Core::ALL {
+            fs::create_dir_all(core.config_dir(root.path())).unwrap();
+        }
+        let core = Core::Mihomo;
+        let exe = core.executable(root.path());
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"not executed").unwrap();
+        let config = core.config_dir(root.path()).join("locked.yaml");
+        fs::write(&config, "{}").unwrap();
+        let _locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&config)
+            .unwrap();
+        let mut saved = Saved::default();
+        saved.select_version(core, "1.0.0".into());
+        let mut snapshot = Snapshot::default();
+        snapshot.core_mut(core).selected_version = Some("1.0.0".into());
+        snapshot.core_mut(core).configs = vec!["locked.yaml".into()];
+        let state = Arc::new(Mutex::new(snapshot));
+        let (tx, _rx) = mpsc::channel();
+        let quitting = Arc::new(AtomicBool::new(false));
+        let runtime = Runtime {
+            root: root.path().into(),
+            state: state.clone(),
+            tx,
+            quitting: quitting.clone(),
+        };
+        runtime.validate_configs(core, None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while runtime.snapshot().core(core).validation_busy {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(
+            runtime.snapshot().core(core).validation.get("locked.yaml"),
+            Some(ConfigValidation::Invalid(_))
+        ));
+        let mut worker = Worker {
+            root: root.path().into(),
+            state,
+            saved,
+            children: Default::default(),
+            dns: DesktopDns::Portable(DnsLease::for_tests(root.path())),
+            quitting,
+            version_files: [None, None, executable_stamp(&exe)],
+        };
+        worker.refresh();
+        assert!(matches!(
+            runtime.snapshot().core(core).validation.get("locked.yaml"),
+            Some(ConfigValidation::Invalid(_))
+        ));
+    }
     use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
@@ -1287,7 +1741,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&build.stderr)
         );
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             let dir = core.executable(root).parent().unwrap().to_owned();
             fs::create_dir_all(&dir).unwrap();
             fs::copy(&exe, dir.join(format!("{}.exe", core.label()))).unwrap();
@@ -1295,6 +1749,7 @@ mod tests {
             let config = match core {
                 Core::SingBox => "{ /* comment */ \"log\": {}, }",
                 Core::Xray => "# comment\n{ \"log\": {} }",
+                Core::Mihomo => "{}",
             };
             fs::write(core.config_dir(root).join("日常.JSON"), config).unwrap();
             fs::write(
@@ -1304,7 +1759,7 @@ mod tests {
             .unwrap();
         }
         let mut saved = Saved::load(root).unwrap();
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             saved.select_version(core, "1.0.0".into());
         }
         saved.store(root).unwrap();
@@ -1332,7 +1787,7 @@ mod tests {
         );
         let runtime = Runtime::open(root.to_owned()).unwrap();
         let mut pids = [external.0.id(), 0];
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             assert_eq!(runtime.snapshot().core(core).configs.len(), 2);
             assert!(runtime.snapshot().core(core).installed);
             runtime
@@ -1347,7 +1802,7 @@ mod tests {
         let blocked_save = root.join("ladder-state.json.tmp");
         fs::create_dir(&blocked_save).unwrap();
         let saved_before_restart = fs::read(root.join("ladder-state.json")).unwrap();
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             stop_and_start(&runtime, core);
             let restarted = idle(&runtime, core);
             assert!(restarted.running, "{restarted:?}");
@@ -1357,7 +1812,7 @@ mod tests {
                 next_pid(&core.config_dir(root).join("日常.pid"), pids[core as usize]);
             let other = match core {
                 Core::SingBox => Core::Xray,
-                Core::Xray => Core::SingBox,
+                Core::Xray | Core::Mihomo => Core::SingBox,
             };
             assert!(runtime.snapshot().core(other).running);
             assert_eq!(
@@ -1394,7 +1849,7 @@ mod tests {
             Some("失败.json")
         );
         let error = stopped.run_error.unwrap();
-        assert!(error.contains("42"));
+        assert!(!error.contains("exit code"));
         assert!(error.contains("核心没有访问所需资源的权限"));
         assert!(!error.contains("PRIVATE_FIXTURE_VALUE"));
         let logs = logging::recent().join("\n");
@@ -1404,7 +1859,12 @@ mod tests {
         runtime.send(Action::Start(Core::SingBox)).unwrap();
         let retry = failed(&runtime, Core::SingBox);
         assert_eq!(retry.current.as_deref(), Some("失败.json"));
-        assert!(retry.run_error.unwrap().contains("42"));
+        assert!(
+            retry
+                .run_error
+                .unwrap()
+                .contains("核心没有访问所需资源的权限")
+        );
         runtime
             .send(Action::Set(Setting::AutoSingBox, true))
             .unwrap();
@@ -1435,7 +1895,7 @@ mod tests {
                     .xray
                     .run_error
                     .as_deref()
-                    .is_some_and(|e| e.contains("23"))
+                    .is_some_and(|e| e.contains("核心已退出"))
                 && snapshot.dns_recovery_error.is_some()
             {
                 break;
@@ -1454,7 +1914,12 @@ mod tests {
         let reopened = Runtime::open(root.to_owned()).unwrap();
         let restarted = failed(&reopened, Core::SingBox);
         assert_eq!(restarted.current.as_deref(), Some("失败.json"));
-        assert!(restarted.run_error.unwrap().contains("42"));
+        assert!(
+            restarted
+                .run_error
+                .unwrap()
+                .contains("核心没有访问所需资源的权限")
+        );
         assert!(!reopened.snapshot().xray.running);
         assert!(reopened.snapshot().settings.minimize_to_tray);
         reopened.shutdown().unwrap();
@@ -1480,7 +1945,7 @@ mod tests {
             r#"{"fixture_tun":true,"inbounds":[{"type":"tun","interface_name":"original"}]}"#,
             r#"{"fixture_tun":true,"Inbounds":[{"Protocol":"TUN","Settings":{"Name":"original"}}]}"#,
         ];
-        for (core, source) in Core::ALL.into_iter().zip(sources) {
+        for (core, source) in [Core::SingBox, Core::Xray].into_iter().zip(sources) {
             fs::write(core.config_dir(root).join(source_name), source).unwrap();
             fs::write(core.config_dir(root).join(".ladder-tun-stale.json"), "{}").unwrap();
         }
@@ -1502,7 +1967,7 @@ mod tests {
             }
         };
         let mut copies = Vec::new();
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             let state = runtime.snapshot().core(core).clone();
             assert!(
                 !core
@@ -1519,7 +1984,7 @@ mod tests {
             assert!(is_runtime_config(&copy));
             assert_eq!(copy.parent(), Some(core.config_dir(root).as_path()));
             assert!(
-                !list_configs(&core.config_dir(root))
+                !list_configs(core, &core.config_dir(root))
                     .unwrap()
                     .iter()
                     .any(|name| is_runtime_config(Path::new(name)))
@@ -1584,7 +2049,7 @@ mod tests {
             .is_err()
         );
         assert!(!failed_spawn_copy.exists());
-        for (core, source) in Core::ALL.into_iter().zip(sources) {
+        for (core, source) in [Core::SingBox, Core::Xray].into_iter().zip(sources) {
             assert_eq!(
                 fs::read_to_string(core.config_dir(root).join(source_name)).unwrap(),
                 source
@@ -1608,7 +2073,7 @@ mod tests {
         let root = folder.path();
         let _process_test = lock_and_install_fixture_cores(root);
         let config = "进程树.json";
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             fs::write(
                 core.config_dir(root).join(config),
                 r#"{"fixture_tree":true}"#,
@@ -1625,6 +2090,7 @@ mod tests {
             xray: Some(config.into()),
             sing_box_version: Some("1.0.0".into()),
             xray_version: Some("1.0.0".into()),
+            ..Default::default()
         };
         saved.store(root).unwrap();
         let tree = |core: Core| {
@@ -1708,7 +2174,7 @@ mod tests {
             let session = fs::File::create(root.join("dns-session.lock")).unwrap();
             session.lock().unwrap();
             let runtime = Runtime::open(root.clone()).unwrap();
-            for core in Core::ALL {
+            for core in [Core::SingBox, Core::Xray] {
                 assert!(idle(&runtime, core).running);
             }
             crate::emergency::prepare_test_helper(scenario == "spawn-failure");
@@ -1739,7 +2205,7 @@ mod tests {
                 .unwrap();
             let root = folder.path();
             let _process_test = lock_and_install_fixture_cores(root);
-            for core in Core::ALL {
+            for core in [Core::SingBox, Core::Xray] {
                 fs::write(
                     core.config_dir(root).join("进程树.json"),
                     r#"{"fixture_tree":true}"#,
@@ -1757,6 +2223,7 @@ mod tests {
                 xray: Some("进程树.json".into()),
                 sing_box_version: Some("1.0.0".into()),
                 xray_version: Some("1.0.0".into()),
+                ..Default::default()
             }
             .store(root)
             .unwrap();
@@ -1783,7 +2250,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(20));
             }
             let mut handles = Vec::new();
-            for core in Core::ALL {
+            for core in [Core::SingBox, Core::Xray] {
                 for extension in ["pid", "child"] {
                     let path = core
                         .config_dir(root)
@@ -1936,10 +2403,10 @@ mod tests {
                 ..Default::default()
             })),
             saved: Saved::default(),
-            children: [None, None],
+            children: Default::default(),
             dns: DesktopDns::Portable(DnsLease::for_tests(root)),
             quitting: Arc::new(AtomicBool::new(false)),
-            version_files: [None, None],
+            version_files: Default::default(),
         };
         // 前一个请求已成功重试并启动核心，排队的重试不应恢复新建的快照。
         worker.dns.lease().unwrap().apply().unwrap();
@@ -1961,10 +2428,10 @@ mod tests {
                 ..Default::default()
             })),
             saved: Saved::default(),
-            children: [None, None],
+            children: Default::default(),
             dns: DesktopDns::Unavailable("目录不可用".into()),
             quitting: Arc::new(AtomicBool::new(false)),
-            version_files: [None, None],
+            version_files: Default::default(),
         };
         let journal = root.join("dns-recovery.json");
         fs::write(&journal, b"invalid").unwrap();
@@ -1992,7 +2459,7 @@ mod tests {
         let runtime = Runtime::open(root.to_owned()).unwrap();
         let journal = root.join("dns-recovery.json");
         runtime.send(Action::Set(Setting::HijackDns, true)).unwrap();
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             runtime
                 .send(Action::SwitchConfig(core, "日常.JSON".into()))
                 .unwrap();
@@ -2021,7 +2488,7 @@ mod tests {
             failed(&runtime, Core::SingBox)
                 .run_error
                 .unwrap()
-                .contains("23")
+                .contains("核心已退出")
         );
         assert!(runtime.snapshot().xray.running);
         assert!(!journal.exists());
@@ -2086,10 +2553,10 @@ mod tests {
             root: runtime.root.clone(),
             state: runtime.state.clone(),
             saved: Saved::default(),
-            children: [None, None],
+            children: Default::default(),
             dns: DesktopDns::Portable(DnsLease::for_tests(folder.path())),
             quitting: Arc::new(AtomicBool::new(false)),
-            version_files: [None, None],
+            version_files: Default::default(),
         };
         let core = Core::SingBox;
         for (action, operation) in [
@@ -2336,7 +2803,7 @@ mod tests {
     fn config_selection_survives_start_failure_when_the_core_is_uninstalled() {
         let folder = tempfile::tempdir().unwrap();
         let runtime = Runtime::open(folder.path().to_owned()).unwrap();
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             fs::write(runtime.config_dir(core).join("选中的配置.json"), "{}").unwrap();
             assert!(!runtime.snapshot().core(core).installed);
             runtime
@@ -2363,7 +2830,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
         let runtime = Runtime::open(root.to_owned()).unwrap();
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             for name in ["当前.json", "其他.json"] {
                 fs::write(runtime.config_dir(core).join(name), "{}").unwrap();
             }
@@ -2393,7 +2860,7 @@ mod tests {
         let runtime = Runtime::open(root.to_owned()).unwrap();
         let outside = root.join("outside.json");
         fs::write(&outside, "outside").unwrap();
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             let dir = runtime.config_dir(core);
             fs::write(dir.join("current.json"), "current").unwrap();
             fs::write(dir.join("other.JSON"), "other").unwrap();
@@ -2456,7 +2923,7 @@ mod tests {
     fn recovering_config_directory_clears_only_the_scan_error() {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             fs::create_dir_all(core.config_dir(root)).unwrap();
         }
         let config_dir = Core::SingBox.config_dir(root);
@@ -2467,10 +2934,10 @@ mod tests {
             root: root.to_owned(),
             state: state.clone(),
             saved: Saved::default(),
-            children: [None, None],
+            children: Default::default(),
             dns: DesktopDns::Portable(DnsLease::for_tests(root)),
             quitting: Arc::new(AtomicBool::new(false)),
-            version_files: [None, None],
+            version_files: Default::default(),
         };
         worker.refresh();
         assert_eq!(state.lock().unwrap().sing_box.configs, vec!["配置.json"]);
@@ -2502,7 +2969,7 @@ mod tests {
         let root = folder.path();
         let _guard = lock_and_install_fixture_cores(root);
         let runtime = Runtime::open(root.to_owned()).unwrap();
-        for core in Core::ALL {
+        for core in [Core::SingBox, Core::Xray] {
             runtime
                 .send(Action::SwitchConfig(core, "日常.JSON".into()))
                 .unwrap();

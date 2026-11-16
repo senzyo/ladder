@@ -110,6 +110,41 @@ fn xray_environment(assets: &Path) -> Vec<u16> {
 
 struct AttributeList(Vec<usize>);
 
+fn config_command(
+    core: Core,
+    exe: &Path,
+    assets: &Path,
+    config: &Path,
+    validate: bool,
+) -> OsString {
+    let mut command = OsString::from("\"");
+    command.push(exe);
+    command.push(match (core, validate) {
+        (Core::SingBox, true) => "\" check -D \"",
+        (Core::SingBox, false) => "\" run -D \"",
+        (Core::Xray, true) => "\" run -test",
+        (Core::Xray, false) => "\" run",
+        (Core::Mihomo, true) => "\" -t -d \"",
+        (Core::Mihomo, false) => "\" -d \"",
+    });
+    if core != Core::Xray {
+        command.push(if core == Core::Mihomo {
+            config.parent().unwrap()
+        } else {
+            assets
+        });
+        command.push("\"");
+    }
+    command.push(if core == Core::Mihomo {
+        " -f \""
+    } else {
+        " -c \""
+    });
+    command.push(config);
+    command.push("\"");
+    command
+}
+
 impl Drop for AttributeList {
     fn drop(&mut self) {
         unsafe { DeleteProcThreadAttributeList(self.0.as_mut_ptr().cast()) };
@@ -132,18 +167,7 @@ impl ManagedChild {
             stdout_write.as_raw_handle(),
             stderr_write.as_raw_handle(),
         ];
-        // 三个路径都以实际文件或目录名结尾。Windows 文件名不能包含双引号。
-        let mut command = OsString::from("\"");
-        command.push(exe);
-        command.push("\" run");
-        if core == Core::SingBox {
-            command.push(" -D \"");
-            command.push(assets);
-            command.push("\"");
-        }
-        command.push(" -c \"");
-        command.push(config.path());
-        command.push("\"");
+        let command = config_command(core, exe, assets, config.path(), false);
         let env = (core == Core::Xray).then(|| xray_environment(assets));
         let process = JobProcess::spawn(exe, root, command, env.as_deref(), stdio)?;
         drop((stdin, stdout_write, stderr_write));
@@ -168,7 +192,7 @@ impl ManagedChild {
 }
 
 impl JobProcess {
-    pub(crate) fn spawn_version(exe: &Path, stdout: &File) -> io::Result<Self> {
+    pub(crate) fn spawn_version(core: Core, exe: &Path, stdout: &File) -> io::Result<Self> {
         let root = exe
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "无法定位核心目录"))?;
@@ -182,8 +206,40 @@ impl JobProcess {
         ];
         let mut command = OsString::from("\"");
         command.push(exe);
-        command.push("\" version");
+        command.push(if core == Core::Mihomo {
+            "\" -v"
+        } else {
+            "\" version"
+        });
         Self::spawn(exe, root, command, None, stdio)
+    }
+
+    pub(crate) fn spawn_validation(
+        core: Core,
+        exe: &Path,
+        root: &Path,
+        config: &Path,
+        output: &File,
+    ) -> io::Result<Self> {
+        let assets = exe
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "无法定位核心目录"))?;
+        let stdin = File::open("NUL")?;
+        let output = output.try_clone()?;
+        let stderr = output.try_clone()?;
+        let stdio = [
+            stdin.as_raw_handle(),
+            output.as_raw_handle(),
+            stderr.as_raw_handle(),
+        ];
+        let env = (core == Core::Xray).then(|| xray_environment(assets));
+        Self::spawn(
+            exe,
+            root,
+            config_command(core, exe, assets, config, true),
+            env.as_deref(),
+            stdio,
+        )
     }
 
     fn spawn(
@@ -313,5 +369,42 @@ impl JobProcess {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn validation_commands_use_official_flags_and_quote_paths() {
+        let exe = Path::new(r"C:\Program Files\core.exe");
+        let assets = Path::new(r"C:\Program Files\assets");
+        let config = Path::new(r"C:\配置\daily config.json");
+        for (core, command) in [
+            (
+                Core::SingBox,
+                r#""C:\Program Files\core.exe" check -D "C:\Program Files\assets" -c "C:\配置\daily config.json""#,
+            ),
+            (
+                Core::Xray,
+                r#""C:\Program Files\core.exe" run -test -c "C:\配置\daily config.json""#,
+            ),
+            (
+                Core::Mihomo,
+                r#""C:\Program Files\core.exe" -t -d "C:\配置" -f "C:\配置\daily config.json""#,
+            ),
+        ] {
+            assert_eq!(
+                config_command(core, exe, assets, config, true),
+                OsStr::new(command)
+            );
+        }
+        assert_eq!(
+            config_command(Core::Mihomo, exe, assets, config, false),
+            OsStr::new(
+                r#""C:\Program Files\core.exe" -d "C:\配置" -f "C:\配置\daily config.json""#
+            )
+        );
     }
 }

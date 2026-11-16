@@ -57,8 +57,9 @@ try {
     $fixture = Join-Path $TestRoot 'fixture.exe'
     & rustc --edition 2024 $fixtureSource -o $fixture
     if ($LASTEXITCODE) { throw 'Unable to compile harmless update fixture.' }
-    foreach ($success in @($true, $false)) {
-        $root = Join-Path $TestRoot $(if ($success) { 'successful update' } else { 'failed update' })
+    foreach ($scenario in @('success', 'rollback', 'cancel')) {
+        $success = $scenario -eq 'success'
+        $root = Join-Path $TestRoot "$scenario update"
         $stage = Join-Path $root '.ladder-app-update-test123'
         [IO.Directory]::CreateDirectory($stage) | Out-Null
         $target = Join-Path $root 'ladder-test.exe'
@@ -67,10 +68,11 @@ try {
         try { $oldFile.WriteByte(42) } finally { $oldFile.Dispose() }
         $oldHash = (Get-FileHash -LiteralPath $target).Hash
         $source = Join-Path $stage 'ladder.exe'
-        if ($success) { Copy-Item -LiteralPath $fixture -Destination $source } else { [IO.File]::WriteAllText($source, 'Invalid executable for rollback test') }
+        if ($scenario -ne 'rollback') { Copy-Item -LiteralPath $fixture -Destination $source } else { [IO.File]::WriteAllText($source, 'Invalid executable for rollback test') }
         [IO.File]::WriteAllText((Join-Path $root 'ladder-state.json'), 'preserve-this-state')
         $plan = @{ target = 'ladder-test.exe'; parent = 2147483647; sha256 = (Get-FileHash -LiteralPath $source).Hash.ToLowerInvariant() }
         $plan | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'update.json') -Encoding utf8
+        if ($scenario -ne 'cancel') { [IO.File]::WriteAllText((Join-Path $stage 'commit'), 'commit') }
         $result = Invoke-TestHelper $stage
         foreach ($fixtureProcess in @(Get-Process -Name 'ladder-test' -ErrorAction SilentlyContinue)) {
             if ($fixtureProcess.Path -eq $target -and -not $fixtureProcess.WaitForExit(5000)) { throw 'Harmless restart fixture did not finish.' }
@@ -80,11 +82,11 @@ try {
         Assert-True ((Get-Content -LiteralPath (Join-Path $root 'ladder-state.json') -Raw) -ceq 'preserve-this-state') 'Update modified user settings.'
         $expectedHash = if ($success) { (Get-FileHash -LiteralPath $fixture).Hash } else { $oldHash }
         Assert-True ((Get-FileHash -LiteralPath $target).Hash -ceq $expectedHash) 'Update or rollback left the wrong executable.'
-        Assert-True (Test-Path -LiteralPath (Join-Path $root 'launched.txt')) 'Updated or restored executable did not restart.'
+        Assert-True ((Test-Path -LiteralPath (Join-Path $root 'launched.txt')) -eq ($scenario -ne 'cancel')) 'Unexpected restart behavior.'
         if ($success) { Assert-True (-not (Test-Path -LiteralPath $stage)) 'Successful update left its staging directory.' }
         else { Assert-True (Test-Path -LiteralPath (Join-Path $root 'update-error.log')) 'Failed update did not leave a diagnostic.' }
     }
-    Write-Host 'PASS: package allowlist, deterministic ZIP, SHA-256, Windows PowerShell 5.1 update/restart/rollback, settings preservation.'
+    Write-Host 'PASS: package allowlist, deterministic ZIP, SHA-256, Windows PowerShell 5.1 update/restart/rollback/cancellation, settings preservation.'
 } finally {
     $resolved = [IO.Path]::GetFullPath($TestRoot)
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'

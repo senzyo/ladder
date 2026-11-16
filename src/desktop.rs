@@ -74,11 +74,12 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
     if !metadata.is_file() {
         return Err("所选路径不是配置文件".into());
     }
-    if !path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-    {
-        return Err("只能编辑 JSON 配置文件".into());
+    if !path.extension().is_some_and(|extension| {
+        ["json", "yaml", "yml"]
+            .iter()
+            .any(|kind| extension.eq_ignore_ascii_case(kind))
+    }) {
+        return Err("只能编辑 JSON 或 YAML 配置文件".into());
     }
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     // 部分编辑器仅注册 open；让 Shell 解析用户关联，不自行拼接注册表命令。
@@ -164,6 +165,9 @@ mod tests {
             edit_config(directory.path()).unwrap_err(),
             "所选路径不是配置文件"
         );
-        assert_eq!(edit_config(&file).unwrap_err(), "只能编辑 JSON 配置文件");
+        assert_eq!(
+            edit_config(&file).unwrap_err(),
+            "只能编辑 JSON 或 YAML 配置文件"
+        );
     }
 }

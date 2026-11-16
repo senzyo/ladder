@@ -33,6 +33,9 @@ impl PreparedConfig {
 
 pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, String> {
     let text = fs::read(source).map_err(|e| format!("读取核心配置失败: {e}"))?;
+    if core == Core::Mihomo {
+        return prepare_mihomo(source, &text);
+    }
     let text = if core == Core::Xray {
         mask_hash_comments(text)
     } else {
@@ -51,6 +54,7 @@ pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, Strin
         let kind = match core {
             Core::SingBox => "type",
             Core::Xray => "protocol",
+            Core::Mihomo => unreachable!(),
         };
         for inbound in inbounds {
             let kind_key = config_key(core, inbound, kind);
@@ -60,6 +64,7 @@ pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, Strin
                 .is_some_and(|kind| match core {
                     Core::SingBox => kind == "tun",
                     Core::Xray => kind.eq_ignore_ascii_case("tun"),
+                    Core::Mihomo => unreachable!(),
                 });
             if !is_tun {
                 continue;
@@ -80,6 +85,7 @@ pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, Strin
                         .ok_or("Xray 的 TUN settings 必须是对象")?;
                     (settings, name_key)
                 }
+                Core::Mihomo => unreachable!(),
             };
             if settings.get(&key).is_some_and(|value| !value.is_string()) {
                 return Err(format!("TUN 的 {key} 必须是字符串"));
@@ -106,6 +112,56 @@ pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, Strin
     };
     Ok(PreparedConfig {
         source: source.to_owned(),
+        temporary,
+        names,
+    })
+}
+
+fn prepare_mihomo(source: &Path, text: &[u8]) -> Result<PreparedConfig, String> {
+    let mut config: serde_yaml_ng::Value = serde_yaml_ng::from_slice(text).map_err(|error| {
+        error.location().map_or_else(
+            || "核心配置 YAML 格式无效".into(),
+            |at| {
+                format!(
+                    "核心配置 YAML 格式无效 (第 {} 行, 第 {} 列)",
+                    at.line(),
+                    at.column()
+                )
+            },
+        )
+    })?;
+    config
+        .apply_merge()
+        .map_err(|_| "核心配置 YAML 合并字段无效")?;
+    let mut names = Vec::new();
+    if let Some(tun) = config
+        .get_mut("tun")
+        .and_then(serde_yaml_ng::Value::as_mapping_mut)
+        && tun.get("enable").and_then(serde_yaml_ng::Value::as_bool) == Some(true)
+    {
+        if tun.get("device").is_some_and(|value| !value.is_string()) {
+            return Err("TUN 的 device 必须是字符串".into());
+        }
+        let name = random_name();
+        tun.insert("device".into(), name.clone().into());
+        names.push(name);
+    }
+    let temporary = if names.is_empty() {
+        None
+    } else {
+        let mut file = tempfile::Builder::new()
+            .prefix(RUNTIME_PREFIX)
+            .suffix(".yaml")
+            .tempfile_in(source.parent().ok_or("无法定位核心配置目录")?)
+            .map_err(|error| format!("创建 TUN 运行配置失败: {error}"))?;
+        serde_yaml_ng::to_writer(file.as_file_mut(), &config)
+            .map_err(|_| "写入 TUN 运行配置失败")?;
+        file.flush()
+            .map_err(|error| format!("写入 TUN 运行配置失败: {error}"))?;
+        Some(file)
+    };
+    Ok(PreparedConfig {
+        source: source.into(),
         temporary,
         names,
     })
@@ -185,6 +241,30 @@ fn mask_hash_comments(mut text: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mihomo_yaml_tun_copy_preserves_source_and_resolves_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("配置.yaml");
+        let original = "# source comment\nbase: &base\n  enable: true\n  device: old\ntun:\n  <<: *base\n  mtu: 1500\nproxies: []\n";
+        fs::write(&source, original).unwrap();
+        let prepared = prepare(Core::Mihomo, &source).unwrap();
+        assert_eq!(fs::read_to_string(&source).unwrap(), original);
+        assert_eq!(prepared.names().len(), 1);
+        let copy: serde_yaml_ng::Value =
+            serde_yaml_ng::from_slice(&fs::read(prepared.path()).unwrap()).unwrap();
+        assert_eq!(
+            copy["tun"]["device"].as_str(),
+            Some(prepared.names()[0].as_str())
+        );
+        assert_eq!(copy["tun"]["mtu"].as_u64(), Some(1500));
+        assert_eq!(copy["base"]["device"].as_str(), Some("old"));
+        let temporary = prepared.path().to_owned();
+        drop(prepared);
+        assert!(!temporary.exists());
+        fs::write(&source, "tun: { enable: false, device: original }\n").unwrap();
+        assert_eq!(prepare(Core::Mihomo, &source).unwrap().path(), source);
+    }
 
     fn read(path: &Path) -> Value {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()

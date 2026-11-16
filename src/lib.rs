@@ -1,7 +1,10 @@
+mod app_update;
+mod app_updater;
 mod core_output;
 mod desktop;
 mod dns;
 mod emergency;
+mod github;
 mod logging;
 mod managed_child;
 mod panic_helper;
@@ -12,18 +15,18 @@ mod tun_config;
 mod ui;
 mod update;
 
-use std::{cell::Cell, process::ExitCode, ptr, rc::Rc};
+use std::{cell::Cell, process::ExitCode, ptr, rc::Rc, time::Duration};
 
 use anyhow::{Context as _, Result};
 use async_channel::{Receiver, Sender};
 use gpui::{
-    App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowHandle,
+    App, AppContext, Application, Bounds, Timer, TitlebarOptions, WindowBounds, WindowHandle,
     WindowOptions, px, size,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tray_icon::{
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
-    menu::{Menu, MenuEvent, MenuItem},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND},
@@ -35,24 +38,103 @@ use windows_sys::Win32::{
 };
 use windows_sys::w;
 
-use runtime::Runtime;
+use app_updater::AppUpdater;
+use runtime::{Action, Core, Runtime, Snapshot};
 use ui::MainWindow;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum TrayAction {
     Open,
     Hide,
     Exit,
+    Refresh,
+    OpenDirectory,
+    Core(Action),
+    InstallUpdate,
 }
 
-fn install_tray(events: &Sender<TrayAction>) -> Result<TrayIcon> {
+fn tray_menu(snapshot: &Snapshot) -> Result<Menu> {
     let menu = Menu::new();
-    let exit = MenuItem::with_id("exit", "退出并终止", true, None);
-    menu.append(&exit)?;
+    menu.append(&MenuItem::with_id("open", "打开 Ladder", true, None))?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    for (index, core) in Core::ALL.into_iter().enumerate() {
+        let state = snapshot.core(core);
+        let submenu = Submenu::new(core.label(), true);
+        let idle = state.operation.is_none();
+        submenu.append(&MenuItem::with_id(
+            format!("restart:{index}"),
+            "重启核心",
+            idle && state.installed && state.current.is_some(),
+            None,
+        ))?;
+        submenu.append(&MenuItem::with_id(
+            format!("stop:{index}"),
+            "停止核心",
+            idle && state.running,
+            None,
+        ))?;
+        let configs = Submenu::new("切换配置", idle && !state.configs.is_empty());
+        for name in &state.configs {
+            let current = state.current.as_ref() == Some(name);
+            // 原生菜单把 & 解释为快捷键标记；显示原始文件名时须转义。
+            let label = name.replace('&', "&&");
+            configs.append(&MenuItem::with_id(
+                format!("config:{index}:{name}"),
+                if current {
+                    format!("{label}（当前使用）")
+                } else {
+                    label
+                },
+                idle && !current,
+                None,
+            ))?;
+        }
+        submenu.append(&configs)?;
+        menu.append(&submenu)?;
+    }
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&MenuItem::with_id("directory", "打开程序目录", true, None))?;
+    menu.append(&MenuItem::with_id("exit", "退出并终止", true, None))?;
+    Ok(menu)
+}
+
+fn tray_action(id: &str) -> Option<TrayAction> {
+    match id {
+        "open" => Some(TrayAction::Open),
+        "exit" => Some(TrayAction::Exit),
+        "directory" => Some(TrayAction::OpenDirectory),
+        _ => {
+            let mut parts = id.splitn(3, ':');
+            let command = parts.next()?;
+            let core = *Core::ALL.get(parts.next()?.parse::<usize>().ok()?)?;
+            let action = match command {
+                "restart" => Action::Restart(core),
+                "stop" => Action::Stop(core),
+                "config" => Action::SwitchConfig(core, parts.next()?.to_owned()),
+                _ => return None,
+            };
+            Some(TrayAction::Core(action))
+        }
+    }
+}
+
+fn tray_changed(previous: &Snapshot, current: &Snapshot) -> bool {
+    Core::ALL.into_iter().any(|core| {
+        let previous = previous.core(core);
+        let current = current.core(core);
+        previous.configs != current.configs
+            || previous.current != current.current
+            || previous.installed != current.installed
+            || previous.running != current.running
+            || previous.operation != current.operation
+    })
+}
+
+fn install_tray(events: &Sender<TrayAction>, snapshot: &Snapshot) -> Result<TrayIcon> {
     let tray = TrayIconBuilder::new()
         .with_icon(Icon::from_resource(1, Some((32, 32)))?)
         .with_tooltip("Ladder")
-        .with_menu(Box::new(menu))
+        .with_menu(Box::new(tray_menu(snapshot)?))
         .with_menu_on_left_click(false)
         .build()?;
     let clicks = events.clone();
@@ -70,8 +152,8 @@ fn install_tray(events: &Sender<TrayAction>) -> Result<TrayIcon> {
     }));
     let commands = events.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        if event.id == "exit" {
-            let _ = commands.try_send(TrayAction::Exit);
+        if let Some(action) = tray_action(event.id.as_ref()) {
+            let _ = commands.try_send(action);
         }
     }));
     Ok(tray)
@@ -80,6 +162,7 @@ fn install_tray(events: &Sender<TrayAction>) -> Result<TrayIcon> {
 fn open_main(
     cx: &mut App,
     runtime: &Runtime,
+    updater: &AppUpdater,
     events: &Sender<TrayAction>,
 ) -> Result<WindowHandle<MainWindow>> {
     let window_size = size(px(900.), px(600.));
@@ -100,7 +183,9 @@ fn open_main(
                 let _ = close.try_send(TrayAction::Hide);
                 false
             });
-            cx.new(|cx| MainWindow::new(runtime.clone(), window, cx))
+            cx.new(|cx| {
+                MainWindow::new(runtime.clone(), updater.clone(), events.clone(), window, cx)
+            })
         },
     )
 }
@@ -137,20 +222,113 @@ fn show_main(cx: &mut App, handle: WindowHandle<MainWindow>, show: bool) -> Resu
 
 fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Result<()> {
     let (events, incoming): (_, Receiver<TrayAction>) = async_channel::unbounded();
-    let tray = install_tray(&events)?;
     let mut window = None;
     let startup = runtime.snapshot();
+    let updater = AppUpdater::default();
+    let tray = install_tray(&events, &startup)?;
     if !startup.settings.minimize_to_tray
         || startup.settings_error.is_some()
         || startup.dns_recovery_error.is_some()
         || startup.dns_task_warning.is_some()
     {
-        window = Some(open_main(cx, &runtime, &events)?);
+        window = Some(open_main(cx, &runtime, &updater, &events)?);
     }
+    let refresh = events.clone();
+    cx.spawn(async move |_| {
+        loop {
+            Timer::after(Duration::from_millis(500)).await;
+            if refresh.try_send(TrayAction::Refresh).is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
     cx.spawn(async move |cx| {
-        let _tray = tray;
+        let mut tray_snapshot = startup;
         while let Ok(action) = incoming.recv().await {
             match action {
+                TrayAction::InstallUpdate => {
+                    let prepared = match updater.take_prepared() {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            updater.fail(error);
+                            continue;
+                        }
+                    };
+                    let worker = runtime.clone();
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { worker.prepare_app_update() })
+                        .await;
+                    if let Err(error) = result {
+                        updater.fail(error);
+                        continue;
+                    }
+                    let helper = match cx
+                        .background_executor()
+                        .spawn(async move { prepared.launch() })
+                        .await
+                    {
+                        Ok(helper) => helper,
+                        Err(error) => {
+                            runtime.cancel_app_update();
+                            updater.fail(error);
+                            continue;
+                        }
+                    };
+                    let worker = runtime.clone();
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { worker.shutdown() })
+                        .await;
+                    match result {
+                        Ok(warning) => {
+                            cleaned.set(true);
+                            if let Some(message) = warning {
+                                drop(helper);
+                                report_dns_on_exit(&message);
+                            } else if let Err(error) = helper.commit() {
+                                report(&format!("{error}。更新已取消，请重新打开 Ladder 后重试。"));
+                            }
+                            let _ = cx.update(|cx| cx.quit());
+                            break;
+                        }
+                        Err(error) => {
+                            drop(helper);
+                            runtime.cancel_app_update();
+                            updater.fail(error);
+                        }
+                    }
+                }
+                TrayAction::Refresh => {
+                    let snapshot = runtime.snapshot();
+                    if tray_changed(&tray_snapshot, &snapshot) {
+                        match tray_menu(&snapshot) {
+                            Ok(menu) => {
+                                tray.set_menu(Some(Box::new(menu)));
+                                tray_snapshot = snapshot;
+                            }
+                            Err(error) => {
+                                logging::error("tray", format_args!("更新托盘菜单失败：{error}"))
+                            }
+                        }
+                    }
+                }
+                TrayAction::OpenDirectory => {
+                    let result = std::env::current_exe()
+                        .map_err(|error| format!("读取程序目录失败：{error}"))
+                        .and_then(|exe| {
+                            desktop::open_folder(exe.parent().ok_or("无法定位程序目录")?)
+                        });
+                    if let Err(error) = result {
+                        report(&error);
+                    }
+                }
+                TrayAction::Core(action) => {
+                    if let Err(error) = runtime.send(action) {
+                        report(&error);
+                    }
+                }
                 TrayAction::Exit => {
                     logging::info("app", "正在退出 Ladder");
                     let worker = runtime.clone();
@@ -177,7 +355,7 @@ fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Res
                                 show_main(cx, handle, matches!(action, TrayAction::Open))
                             }
                             None if matches!(action, TrayAction::Open) => {
-                                window = Some(open_main(cx, &runtime, &events)?);
+                                window = Some(open_main(cx, &runtime, &updater, &events)?);
                                 Ok(())
                             }
                             None => Ok(()),

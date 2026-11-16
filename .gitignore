@@ -8,6 +8,9 @@
 /configs/
 /sing-box_core/
 /xray_core/
+/mihomo_core/
 /.ladder-update-*/
+/.ladder-app-update-*/
+/update-error.log
 /app.log
 

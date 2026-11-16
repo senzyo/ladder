@@ -1,14 +1,18 @@
+use crate::app_updater::{AppUpdateState, AppUpdater};
 use crate::desktop;
-use crate::runtime::{Action, Core, CoreOperation, Runtime, Setting, Snapshot, ThemePreference};
+use crate::runtime::{
+    Action, ConfigValidation, Core, CoreOperation, Runtime, Setting, Snapshot, ThemePreference,
+};
 use crate::update::{UpdateChannel, UpdateProgress};
 use gpui::{
-    Animation, AnimationExt, App, Context, Div, ElementId, FocusHandle, FontWeight, PathBuilder,
-    Rgba, ScrollHandle, SharedString, Stateful, Task, Timer, Window, WindowAppearance, canvas, div,
-    point, prelude::*, px, rgb, rgba,
+    Animation, AnimationExt, App, Context, Div, ElementId, FocusHandle, FontWeight, Image,
+    ImageFormat, PathBuilder, Rgba, ScrollHandle, SharedString, Stateful, Task, Timer, Window,
+    WindowAppearance, canvas, div, img, point, prelude::*, px, rgb, rgba,
 };
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -19,6 +23,10 @@ use log_view::LogView;
 #[path = "scrollbar.rs"]
 mod scrollbar;
 use scrollbar::scrollbar;
+
+#[path = "proxy_input.rs"]
+mod proxy_input;
+use proxy_input::ProxyInput;
 
 const TEXT_PRIMARY: f32 = 14.;
 const TEXT_SECONDARY: f32 = 12.;
@@ -53,32 +61,47 @@ enum UiAction {
     ShowVersions(Core, bool),
     SetDownloadedOnly(Core, bool),
     ConfirmDelete(DeleteTarget),
+    CheckAppUpdate,
+    DownloadAppUpdate,
+    InstallAppUpdate,
 }
 
 pub(crate) struct MainWindow {
     runtime: Runtime,
     snapshot: Snapshot,
     page: Page,
-    config_focus: [HashMap<String, [FocusHandle; 3]>; 2],
-    config_scroll: [ScrollHandle; 2],
-    core_page_scroll: [ScrollHandle; 2],
+    config_focus: [HashMap<String, [FocusHandle; 4]>; 3],
+    config_scroll: [ScrollHandle; 3],
+    core_page_scroll: [ScrollHandle; 3],
     pending_theme: Option<(ThemePreference, Task<()>)>,
-    show_versions: [bool; 2],
-    versions_auto_requested: [bool; 2],
-    downloaded_only: [bool; 2],
-    version_focus: [HashMap<String, [FocusHandle; 2]>; 2],
-    version_scroll: [ScrollHandle; 2],
-    version_page_scroll: [ScrollHandle; 2],
+    show_versions: [bool; 3],
+    versions_auto_requested: [bool; 3],
+    downloaded_only: [bool; 3],
+    version_focus: [HashMap<String, [FocusHandle; 2]>; 3],
+    version_scroll: [ScrollHandle; 3],
+    version_page_scroll: [ScrollHandle; 3],
     settings_scroll: ScrollHandle,
     confirm_delete: Option<DeleteTarget>,
     titlebar_dark: Option<bool>,
     command_errors: Vec<(FeedbackScope, String)>,
     focus: FocusHandle,
     logs: LogView,
+    icon: Arc<Image>,
+    github_proxy: ProxyInput,
+    pending_github_proxy: Option<Task<()>>,
+    updater: AppUpdater,
+    app_update: AppUpdateState,
+    events: async_channel::Sender<crate::TrayAction>,
 }
 
 impl MainWindow {
-    pub(crate) fn new(runtime: Runtime, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        runtime: Runtime,
+        updater: AppUpdater,
+        events: async_channel::Sender<crate::TrayAction>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus);
         cx.observe_window_appearance(window, |view, _, cx| {
@@ -96,6 +119,7 @@ impl MainWindow {
             }
         })
         .detach();
+        let github_proxy = ProxyInput::new(runtime.snapshot().settings.github_proxy, cx);
         let mut view = Self {
             runtime,
             snapshot: Snapshot::default(),
@@ -104,9 +128,9 @@ impl MainWindow {
             config_scroll: Default::default(),
             core_page_scroll: Default::default(),
             pending_theme: None,
-            show_versions: [false; 2],
-            versions_auto_requested: [false; 2],
-            downloaded_only: [false; 2],
+            show_versions: [false; 3],
+            versions_auto_requested: [false; 3],
+            downloaded_only: [false; 3],
             version_focus: Default::default(),
             version_scroll: Default::default(),
             version_page_scroll: Default::default(),
@@ -116,6 +140,15 @@ impl MainWindow {
             command_errors: Vec::new(),
             focus,
             logs: LogView::new(),
+            icon: Arc::new(Image::from_bytes(
+                ImageFormat::Png,
+                include_bytes!("../assets/ladder.png").to_vec(),
+            )),
+            github_proxy,
+            pending_github_proxy: None,
+            updater,
+            app_update: AppUpdateState::Idle,
+            events,
         };
         view.refresh(cx);
         if view.snapshot.settings_error.is_some()
@@ -128,6 +161,11 @@ impl MainWindow {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        let app_update = self.updater.snapshot();
+        if app_update != self.app_update {
+            self.app_update = app_update;
+            cx.notify();
+        }
         if self.page == Page::Logs && self.logs.refresh() {
             cx.notify();
         }
@@ -172,7 +210,10 @@ impl MainWindow {
             UiAction::Run(
                 Action::Start(core)
                 | Action::Stop(core)
+                | Action::Restart(core)
                 | Action::SwitchConfig(core, _)
+                | Action::ValidateConfig(core, _)
+                | Action::ValidateAllConfigs(core)
                 | Action::DeleteConfig(core, _),
             )
             | UiAction::OpenFolder(core)
@@ -195,8 +236,21 @@ impl MainWindow {
             }
             UiAction::Run(Action::Set(..)) => FeedbackScope::Settings,
             UiAction::Run(Action::RetryDns) => FeedbackScope::Settings,
+            UiAction::CheckAppUpdate | UiAction::DownloadAppUpdate | UiAction::InstallAppUpdate => {
+                FeedbackScope::Settings
+            }
         };
         let result = match action {
+            UiAction::CheckAppUpdate => self
+                .updater
+                .check(self.snapshot.settings.github_proxy.clone()),
+            UiAction::DownloadAppUpdate => self
+                .updater
+                .download(self.snapshot.settings.github_proxy.clone()),
+            UiAction::InstallAppUpdate => self
+                .events
+                .try_send(crate::TrayAction::InstallUpdate)
+                .map_err(|_| "无法开始软件更新，托盘管理线程已关闭。".into()),
             UiAction::ShowVersions(core, show) => {
                 let index = core_index(core);
                 self.show_versions[index] = show;
@@ -332,6 +386,41 @@ impl MainWindow {
         cx.notify();
     }
 
+    fn save_github_proxy(&mut self, core: Core, cx: &mut Context<Self>) {
+        if self.pending_github_proxy.is_some() {
+            return;
+        }
+        let scope = FeedbackScope::Versions(core);
+        let requested = self.github_proxy.value().to_owned();
+        match self.runtime.set_github_proxy(requested.clone()) {
+            Ok(saved) => {
+                self.set_command_result(scope, Ok(()));
+                self.pending_github_proxy = Some(cx.spawn(async move |view, cx| {
+                    let result = saved.recv().await;
+                    let _ = view.update(cx, |view, cx| {
+                        view.pending_github_proxy = None;
+                        if result.is_err() {
+                            view.set_command_result(
+                                scope,
+                                Err("GitHub 加速前缀未保存，管理线程已关闭。".into()),
+                            );
+                        }
+                        view.refresh(cx);
+                        if view.snapshot.settings_error.is_none()
+                            && view.github_proxy.value() == requested
+                        {
+                            view.github_proxy
+                                .set_value(view.snapshot.settings.github_proxy.clone());
+                        }
+                        cx.notify();
+                    });
+                }));
+            }
+            Err(message) => self.set_command_result(scope, Err(message)),
+        }
+        cx.notify();
+    }
+
     fn navigation(&self, colors: Colors, cx: &Context<Self>) -> Div {
         let item = |page, label: &'static str, index| {
             let selected = self.page == page;
@@ -391,17 +480,22 @@ impl MainWindow {
             .gap(px(4.))
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
                     .px(px(12.))
                     .mb(px(20.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_size(px(TEXT_PRIMARY))
+                    .text_size(px(18.))
+                    .child(img(self.icon.clone()).size(px(24.)).flex_shrink_0())
                     .child("Ladder"),
             )
             .child(item(Page::Core(Core::SingBox), "sing-box", 1))
             .child(item(Page::Core(Core::Xray), "Xray", 2))
+            .child(item(Page::Core(Core::Mihomo), "mihomo", 3))
             .child(div().flex_1())
-            .child(item(Page::Logs, "日志", 3))
-            .child(item(Page::Settings, "软件设置", 4))
+            .child(item(Page::Logs, "日志", 4))
+            .child(item(Page::Settings, "设置", 5))
     }
 
     fn core_page(&self, core: Core, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
@@ -449,72 +543,104 @@ impl MainWindow {
             let target = DeleteTarget::Config(core, name.clone());
             let confirming = self.confirm_delete.as_ref() == Some(&target);
             let mut buttons = div().flex().items_center().flex_shrink_0().gap(px(8.));
+            let validation = state.validation.get(name);
+            let checking = matches!(validation, Some(ConfigValidation::Checking));
+            if matches!(validation, Some(ConfigValidation::Valid)) {
+                buttons = buttons.child(badge("配置合法", colors.version_stable, colors));
+            }
+            let validate = (
+                if checking { "验证中" } else { "验证" },
+                (!state.validation_busy && state.installed && state.scan_error.is_none())
+                    .then(|| UiAction::Run(Action::ValidateConfig(core, name.clone()))),
+            );
+            let actions;
             if current {
                 buttons = buttons.child(div().child("当前使用"));
+                actions = vec![(1, validate)];
             } else {
-                let actions = [
+                actions = vec![
                     (
-                        "切换",
-                        can_use_config
-                            .then(|| UiAction::Run(Action::SwitchConfig(core, name.clone()))),
+                        0,
+                        (
+                            "切换",
+                            can_use_config
+                                .then(|| UiAction::Run(Action::SwitchConfig(core, name.clone()))),
+                        ),
                     ),
-                    ("编辑", Some(UiAction::Edit(core, name.clone()))),
+                    (1, validate),
+                    (2, ("编辑", Some(UiAction::Edit(core, name.clone())))),
                     (
-                        if confirming { "确认删除" } else { "删除" },
-                        can_use_config.then(|| {
-                            if confirming {
-                                UiAction::Run(Action::DeleteConfig(core, name.clone()))
-                            } else {
-                                UiAction::ConfirmDelete(target.clone())
-                            }
-                        }),
+                        3,
+                        (
+                            if confirming { "确认删除" } else { "删除" },
+                            can_use_config.then(|| {
+                                if confirming {
+                                    UiAction::Run(Action::DeleteConfig(core, name.clone()))
+                                } else {
+                                    UiAction::ConfirmDelete(target.clone())
+                                }
+                            }),
+                        ),
                     ),
                 ];
-                for (slot, (label, action)) in actions.into_iter().enumerate() {
-                    let enabled = action.is_some();
-                    let tab_index = 8 + (index * 3 + slot) as isize;
-                    let focus = self.config_focus[core_index(core)][name][slot]
-                        .clone()
-                        .tab_stop(action.is_some())
-                        .tab_index(tab_index);
-                    buttons = buttons.child(
-                        action_button(label, tab_index, action, false, colors, cx)
-                            .id(SharedString::from(format!(
-                                "config-{}-{name}-{slot}",
-                                core.label()
-                            )))
-                            .track_focus(&focus)
-                            .when(enabled, |el| {
-                                el.text_color(match slot {
-                                    1 => colors.version_preview,
-                                    2 => colors.error,
-                                    _ => colors.accent,
-                                })
+            }
+            for (slot, (label, action)) in actions {
+                let enabled = action.is_some();
+                let tab_index = 10 + (index * 4 + slot) as isize;
+                let focus = self.config_focus[core_index(core)][name][slot]
+                    .clone()
+                    .tab_stop(action.is_some())
+                    .tab_index(tab_index);
+                buttons = buttons.child(
+                    action_button(label, tab_index, action, false, colors, cx)
+                        .id(SharedString::from(format!(
+                            "config-{}-{name}-{slot}",
+                            core.label()
+                        )))
+                        .track_focus(&focus)
+                        .when(enabled, |el| {
+                            el.text_color(match slot {
+                                1 => colors.text,
+                                2 => colors.version_preview,
+                                3 => colors.error,
+                                _ => colors.accent,
                             })
-                            .when(confirming && slot == 2, |el| {
-                                el.on_mouse_down_out(cx.listener(|view, _, _, cx| {
-                                    view.confirm_delete = None;
-                                    cx.notify();
-                                }))
-                            }),
-                    );
-                }
+                        })
+                        .when(confirming && slot == 3, |el| {
+                            el.on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                                view.confirm_delete = None;
+                                cx.notify();
+                            }))
+                        }),
+                );
             }
             files = files.child(
                 div()
                     .flex_shrink_0()
                     .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(12.))
+                    .flex_col()
+                    .gap(px(8.))
                     .pl(px(12.))
                     .pr(px(28.))
                     .py(px(12.))
                     .when(index > 0, |el| el.border_t_1().border_color(colors.line))
                     .when(current, |el| el.bg(colors.selection))
-                    .child(div().flex_1().min_w(px(100.)).child(name.clone()))
-                    .child(buttons),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.))
+                            .child(div().flex_1().min_w(px(100.)).child(name.clone()))
+                            .child(buttons),
+                    )
+                    .when_some(validation, |el, result| match result {
+                        ConfigValidation::Invalid(message) => {
+                            el.child(error_message(message.clone(), colors))
+                        }
+                        _ => el,
+                    }),
             );
         }
         let config_list = panel(colors)
@@ -571,7 +697,7 @@ impl MainWindow {
                     })
                     .when(state.installed, |el| {
                         el.child(
-                            action_button("", 5, connection_action, true, connection_colors, cx)
+                            action_button("", 6, connection_action, true, connection_colors, cx)
                                 .id("core-power")
                                 .gap(px(6.))
                                 .bg(connection_colors.accent_fill)
@@ -584,7 +710,7 @@ impl MainWindow {
                     })
                     .child(action_button(
                         "管理版本",
-                        6,
+                        7,
                         Some(UiAction::ShowVersions(core, true)),
                         true,
                         colors,
@@ -621,14 +747,32 @@ impl MainWindow {
                             .child(div().font_weight(FontWeight::SEMIBOLD).child("配置文件"))
                             .child(caption(format!("{} 个", state.configs.len()), colors)),
                     )
-                    .child(action_button(
-                        "打开配置目录",
-                        7,
-                        Some(UiAction::OpenFolder(core)),
-                        false,
-                        colors,
-                        cx,
-                    )),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(action_button(
+                                "验证全部",
+                                8,
+                                (state.installed
+                                    && !state.configs.is_empty()
+                                    && state.scan_error.is_none()
+                                    && !state.validation_busy)
+                                    .then_some(UiAction::Run(Action::ValidateAllConfigs(core))),
+                                false,
+                                colors,
+                                cx,
+                            ))
+                            .child(action_button(
+                                "打开配置目录",
+                                9,
+                                Some(UiAction::OpenFolder(core)),
+                                false,
+                                colors,
+                                cx,
+                            )),
+                    ),
             )
             .when_some(state.scan_error.clone(), |el, message| {
                 el.child(error_message(message, colors))
@@ -713,7 +857,7 @@ impl MainWindow {
                 buttons = buttons.child(div().child("当前使用"));
             }
             for (slot, (label, action)) in actions.into_iter().enumerate() {
-                let tab_index = 10 + (index * 2 + slot) as isize;
+                let tab_index = 14 + (index * 2 + slot) as isize;
                 let enabled = action.is_some();
                 let focus = self.version_focus[core_index(core)][&version.version][slot]
                     .clone()
@@ -766,7 +910,11 @@ impl MainWindow {
                                 div()
                                     .flex_shrink_0()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(format!("v{}", version.version)),
+                                    .child(if version.version.starts_with("alpha-") {
+                                        version.version.clone()
+                                    } else {
+                                        format!("v{}", version.version)
+                                    }),
                             )
                             .child(badge(label, color, colors).bg(colors.version_badge))
                             .when_some(progress, |el, progress| {
@@ -781,11 +929,11 @@ impl MainWindow {
                     .child(buttons),
             );
         }
-        let footer_index = 10 + (versions.len() * 2) as isize;
+        let footer_index = 14 + (versions.len() * 2) as isize;
         let loading = state.versions_loading;
         let refresh = action_button(
             "",
-            5,
+            6,
             (!loading).then_some(UiAction::Run(Action::RefreshVersions(core))),
             true,
             colors,
@@ -819,7 +967,7 @@ impl MainWindow {
             [("已下载", true), ("全部", false)].into_iter().enumerate()
         {
             filter = filter.child(
-                control(label, 6 + index as isize, colors, false)
+                control(label, 7 + index as isize, colors, false)
                     .h(px(26.))
                     .min_w(px(60.))
                     .px(px(8.))
@@ -846,10 +994,10 @@ impl MainWindow {
                     .flex_shrink_0()
                     .items_center()
                     .gap(px(12.))
-                    .child(page_title(if core == Core::Xray {
-                        "Xray 版本"
-                    } else {
-                        "sing-box 版本"
+                    .child(page_title(match core {
+                        Core::SingBox => "sing-box 版本",
+                        Core::Xray => "Xray 版本",
+                        Core::Mihomo => "mihomo 版本",
                     }))
                     .child(refresh),
             )
@@ -870,7 +1018,7 @@ impl MainWindow {
                             .gap(px(8.))
                             .child(action_button(
                                 "打开核心目录",
-                                8,
+                                9,
                                 Some(UiAction::OpenCoreFolder(core)),
                                 false,
                                 colors,
@@ -879,7 +1027,7 @@ impl MainWindow {
                             .child(
                                 action_button(
                                     "返回配置页面",
-                                    9,
+                                    10,
                                     Some(UiAction::ShowVersions(core, false)),
                                     true,
                                     colors,
@@ -890,6 +1038,43 @@ impl MainWindow {
                             ),
                     ),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().child("GitHub 加速前缀"))
+                    .child(self.github_proxy.render(core, colors, cx))
+                    .child(
+                        control("proxy-default", 12, colors, false)
+                            .h(px(30.))
+                            .px(px(8.))
+                            .child("使用 gh-proxy")
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.github_proxy.set_value("https://gh-proxy.org/".into());
+                                view.save_github_proxy(core, cx);
+                            })),
+                    )
+                    .child(action_button("保存", 13, None, false, colors, cx).when(
+                        self.pending_github_proxy.is_none(),
+                        |el| {
+                            el.tab_index(13)
+                                .cursor_pointer()
+                                .text_color(colors.text)
+                                .bg(colors.panel)
+                                .hover(|el| el.bg(colors.hover))
+                                .focus(|el| el.border_color(colors.accent))
+                                .active(|el| el.bg(colors.selection))
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.save_github_proxy(core, cx)
+                                }))
+                        },
+                    )),
+            )
+            .when_some(self.snapshot.settings_error.clone(), |el, message| {
+                el.child(error_message(message, colors))
+            })
             .when_some(state.update_error.clone(), |el, message| {
                 el.child(error_message(message, colors))
             })
@@ -980,7 +1165,7 @@ impl MainWindow {
         {
             let selected = self.selected_theme() == theme;
             choices = choices.child(
-                control(label, 5 + index as isize, colors, false)
+                control(label, 6 + index as isize, colors, false)
                     .h(px(28.))
                     .px(px(8.))
                     .when(selected, |el| {
@@ -990,17 +1175,22 @@ impl MainWindow {
                     .on_click(cx.listener(move |view, _, _, cx| view.set_theme(theme, cx))),
             );
         }
-        let mut rows = panel(colors).flex().flex_col().p(px(4.)).child(
-            div()
-                .flex()
-                .min_h(px(52.))
-                .px(px(12.))
-                .gap(px(12.))
-                .items_center()
-                .justify_between()
-                .child("主题")
-                .child(choices),
-        );
+        let mut rows = panel(colors)
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .p(px(4.))
+            .child(
+                div()
+                    .flex()
+                    .min_h(px(52.))
+                    .px(px(12.))
+                    .gap(px(12.))
+                    .items_center()
+                    .justify_between()
+                    .child("主题")
+                    .child(choices),
+            );
         for (index, (label, description, key, value)) in [
             (
                 "启动时隐藏主窗口",
@@ -1021,8 +1211,14 @@ impl MainWindow {
                 settings.auto_xray,
             ),
             (
+                "随 Ladder 启动 mihomo",
+                "使用上次选择的 mihomo 配置",
+                Setting::AutoMihomo,
+                settings.auto_mihomo,
+            ),
+            (
                 "劫持DNS到本地回环",
-                "下次启动任一核心时，将物理网卡 DNS 设为 127.0.0.1 和 ::1",
+                "下次启动任一核心时，将物理网卡 DNS 设为 127.0.0.1 和 ::1。不要和 mihomo 的 strict-route、sing-box 的 strict_route、Xray 的 autoSystemWfpBlockLeak 同时开启。",
                 Setting::HijackDns,
                 settings.hijack_dns,
             ),
@@ -1051,7 +1247,8 @@ impl MainWindow {
                         .bg(colors.on_accent),
                 );
             rows = rows.child(
-                control(label, 8 + index as isize, colors, false)
+                control(label, 9 + index as isize, colors, false)
+                    .flex_shrink_0()
                     .min_h(px(68.))
                     .px(px(12.))
                     .py(px(10.))
@@ -1060,11 +1257,13 @@ impl MainWindow {
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.))
                             .flex()
                             .flex_col()
+                            .whitespace_normal()
                             .gap(px(4.))
                             .child(label)
-                            .child(caption(description, colors)),
+                            .child(caption(description, colors).w_full().whitespace_normal()),
                     )
                     .child(
                         div()
@@ -1080,14 +1279,30 @@ impl MainWindow {
                     })),
             );
         }
+        let update_busy = matches!(
+            self.app_update,
+            AppUpdateState::Checking | AppUpdateState::Downloading(_) | AppUpdateState::Installing
+        );
+        let update_status = match &self.app_update {
+            AppUpdateState::Idle | AppUpdateState::Failed(_) => None,
+            AppUpdateState::Checking => Some("正在检查更新…".into()),
+            AppUpdateState::Latest => Some("已是最新版本".into()),
+            AppUpdateState::Available(version) => Some(format!("新版本 {version}")),
+            AppUpdateState::Downloading(progress) => Some(update_progress_text(progress)),
+            AppUpdateState::Ready(version) => Some(format!("{version} 已准备好")),
+            AppUpdateState::Installing => Some("正在退出并更新…".into()),
+        };
+        let update_action = match self.app_update {
+            AppUpdateState::Available(_) => Some(("下载更新", UiAction::DownloadAppUpdate)),
+            AppUpdateState::Ready(_) => Some(("退出并更新", UiAction::InstallAppUpdate)),
+            _ => None,
+        };
         let content = div()
             .id("settings-content")
             .size_full()
             .flex()
             .flex_col()
             .gap(px(16.))
-            .child(page_title("软件设置"))
-            .child(caption("设置更改后自动保存", colors))
             .when_some(
                 self.command_error(FeedbackScope::Settings)
                     .or(self.snapshot.settings_error.as_ref())
@@ -1114,7 +1329,7 @@ impl MainWindow {
                             } else {
                                 "重试恢复 DNS"
                             },
-                            12,
+                            14,
                             (!busy).then_some(UiAction::Run(Action::RetryDns)),
                             false,
                             colors,
@@ -1126,7 +1341,74 @@ impl MainWindow {
                 el.child(error_message(message, colors))
             })
             .child(rows)
-            .child(caption("关闭窗口后，Ladder 将继续在系统托盘运行。", colors));
+            .child(
+                panel(colors)
+                    .flex_shrink_0()
+                    .p(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(page_title("关于"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(img(self.icon.clone()).size(px(32.)).flex_shrink_0())
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .whitespace_normal()
+                                    .gap(px(4.))
+                                    .child(format!("Ladder {}", env!("CARGO_PKG_VERSION")))
+                                    .child(caption("sing-box · Xray · mihomo", colors)),
+                            ),
+                    )
+                    .child(caption("MIT License", colors))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(action_button(
+                                "检查更新",
+                                15,
+                                (!update_busy).then_some(UiAction::CheckAppUpdate),
+                                false,
+                                colors,
+                                cx,
+                            ))
+                            .when_some(update_action, |el, (label, action)| {
+                                el.child(action_button(label, 16, Some(action), true, colors, cx))
+                            })
+                            .when_some(update_status, |el, status| {
+                                el.child(
+                                    caption(status, colors)
+                                        .min_w(px(0.))
+                                        .max_w_full()
+                                        .whitespace_normal(),
+                                )
+                            }),
+                    )
+                    .when(matches!(self.app_update, AppUpdateState::Ready(_)), |el| {
+                        el.child(
+                            caption("更新时将停止所有核心，完成后重新打开 Ladder。", colors)
+                                .w_full()
+                                .whitespace_normal(),
+                        )
+                    })
+                    .when_some(
+                        match &self.app_update {
+                            AppUpdateState::Failed(message) => Some(message.clone()),
+                            _ => None,
+                        },
+                        |el, message| el.child(error_message(message, colors)),
+                    ),
+            );
         scroll_area("settings-scroll", content, &self.settings_scroll, colors).size_full()
     }
 }
@@ -1225,6 +1507,7 @@ fn core_index(core: Core) -> usize {
     match core {
         Core::SingBox => 0,
         Core::Xray => 1,
+        Core::Mihomo => 2,
     }
 }
 

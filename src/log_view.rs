@@ -7,9 +7,9 @@ use gpui::{
 
 pub(super) struct LogView {
     source: LogSource,
-    lines: [Vec<String>; 3],
+    lines: [Vec<String>; 4],
     paused: bool,
-    scroll: [ScrollHandle; 3],
+    scroll: [ScrollHandle; 4],
 }
 
 impl LogView {
@@ -127,6 +127,17 @@ enum LogLevel {
 }
 
 fn log_level(line: &str) -> Option<LogLevel> {
+    // mihomo 的 logrus 文本格式以 time= 开头，级别是独立的 level= 字段。
+    if line.starts_with("time=") {
+        let level = line
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("level="))?;
+        return match level {
+            "error" | "fatal" | "panic" => Some(LogLevel::Error),
+            "warning" | "warn" => Some(LogLevel::Warning),
+            _ => None,
+        };
+    }
     let header = line.split_whitespace().find(|word| {
         !word.bytes().all(|byte| {
             byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'/' | b':' | b'.' | b'T' | b'Z')
@@ -161,7 +172,7 @@ impl MainWindow {
             sources = sources.child(
                 control(
                     ("log-source", item.index()),
-                    5 + item.index() as isize,
+                    6 + item.index() as isize,
                     colors,
                     false,
                 )
@@ -203,7 +214,7 @@ impl MainWindow {
                     .gap(px(8.))
                     .child(sources)
                     .child(
-                        control("pause-logs", 8, playback_colors, true)
+                        control("pause-logs", 10, playback_colors, true)
                             .size(px(30.))
                             .flex_shrink_0()
                             .justify_center()
@@ -216,7 +227,7 @@ impl MainWindow {
                             })),
                     )
                     .child(
-                        button("复制日志", "copy-logs", 9, colors).on_click(cx.listener(
+                        button("复制日志", "copy-logs", 11, colors).on_click(cx.listener(
                             |view, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(
                                     view.logs.lines[view.logs.source.index()].join("\n"),
@@ -226,7 +237,7 @@ impl MainWindow {
                     )
                     .child(div().flex_1())
                     .child(
-                        button("打开日志目录", "open-log-folder", 10, colors).on_click(
+                        button("打开日志目录", "open-log-folder", 12, colors).on_click(
                             cx.listener(|view, _, _, cx| {
                                 if let Some(path) = logging::path()
                                     .and_then(|path| path.parent().map(std::path::Path::to_owned))
@@ -306,6 +317,14 @@ mod tests {
             ),
             ("WARN[0000] deprecated", Some(LogLevel::Warning)),
             ("[Error] failed", Some(LogLevel::Error)),
+            (
+                "time=\"2026-11-17T10:20:30Z\" level=error msg=\"failed\"",
+                Some(LogLevel::Error),
+            ),
+            (
+                "time=\"2026-11-17T10:20:30Z\" level=warning msg=\"warning\"",
+                Some(LogLevel::Warning),
+            ),
             (
                 "2026-11-17T10:20:30Z [WARN] warning",
                 Some(LogLevel::Warning),
