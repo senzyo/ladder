@@ -1,0 +1,100 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  check:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install Rust components
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Check and test on isolated runner
+        run: |
+          cargo fmt --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo clippy --locked --all-targets -- -D warnings
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --lib
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+  package:
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $version = ($metadata.packages | Where-Object name -eq 'ladder').version
+          if ($env:RELEASE_TAG -cne "v$version") { throw 'Tag does not match Cargo.toml version.' }
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Package
+        run: ./scripts/release.ps1 -Architecture '${{ matrix.architecture }}'
+      - name: Verify package and update helper
+        if: matrix.architecture == 'amd64'
+        run: ./scripts/test-release.ps1 -Executable ./target/x86_64-pc-windows-msvc/release/ladder.exe
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ladder-${{ matrix.architecture }}
+          if-no-files-found: error
+          compression-level: 0
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+
+  release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: ladder-*
+          merge-multiple: true
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $files = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object FullName)
+          if ($files.Count -ne 4) { throw 'Both architectures and checksums are required.' }
+          $arguments = @('release', 'create', $env:RELEASE_TAG, '--verify-tag', '--title', $env:RELEASE_TAG, '--generate-notes')
+          if ($env:RELEASE_TAG.Contains('-')) { $arguments += '--prerelease' }
+          gh @arguments @files
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
