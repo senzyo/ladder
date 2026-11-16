@@ -151,6 +151,8 @@ enum Request {
     SetUpdateChannel(Core, UpdateChannel, async_channel::Sender<()>),
     Shutdown(mpsc::Sender<Result<Option<String>, String>>),
     Prepared(Core, PreparedUpdate),
+    #[cfg(test)]
+    Panic,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -214,6 +216,7 @@ impl Runtime {
         dns: DesktopDns,
         task_warning: Option<String>,
     ) -> Result<Self, String> {
+        crate::emergency::prepare(&dns);
         logging::info("dns", "检查启动时待恢复的 DNS 记录");
         let recovery_error = dns.lease().and_then(DnsLease::restore_if_pending).err();
         match &recovery_error {
@@ -641,6 +644,11 @@ impl Worker {
         let mut last_scan = Instant::now();
         loop {
             match rx.recv_timeout(Duration::from_millis(200)) {
+                #[cfg(test)]
+                Ok(Request::Panic) => {
+                    let _guard = self.state.lock().unwrap();
+                    logging::with_locked_log(|| panic!("PRIVATE_WORKER_PANIC"));
+                }
                 Ok(Request::Action(action)) => self.action(action),
                 Ok(Request::Prepared(core, prepared)) => self.apply_update(core, prepared),
                 Ok(Request::SetTheme(theme, reply)) => {
@@ -993,6 +1001,7 @@ impl Worker {
             if matches!(self.dns, DesktopDns::Unavailable(_)) {
                 let (dns, warning) = reopen(&self.root);
                 self.dns = dns;
+                crate::emergency::prepare(&self.dns);
                 if let Some(warning) = &warning {
                     logging::warn("dns", warning);
                 }
@@ -1582,6 +1591,147 @@ mod tests {
         exited(&sing);
         exited(&xray);
         assert!(external.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn fatal_panic_stops_owned_trees_and_restores_dns_without_application_locks() {
+        const ROOT: &str = "LADDER_TEST_PANIC_ROOT";
+        const SCENARIO: &str = "LADDER_TEST_PANIC_SCENARIO";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let scenario = std::env::var(SCENARIO).unwrap();
+            logging::init(&root.join("app.log")).unwrap();
+            logging::install_panic_hook();
+            crate::emergency::install_panic_hook();
+            // 模拟生产 Portable 会话，直到强制结束进程才交还锁。
+            let session = fs::File::create(root.join("dns-session.lock")).unwrap();
+            session.lock().unwrap();
+            let runtime = Runtime::open(root.clone()).unwrap();
+            for core in Core::ALL {
+                assert!(idle(&runtime, core).running);
+            }
+            crate::emergency::prepare_test_helper(scenario == "spawn-failure");
+            if scenario == "restore-failure" {
+                fs::write(root.join("dns-recovery.json"), b"broken journal").unwrap();
+            }
+            fs::write(root.join("ready"), []).unwrap();
+            while !root.join("panic-now").exists() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if scenario == "worker" {
+                runtime.tx.send(Request::Panic).unwrap();
+                thread::sleep(Duration::from_secs(30));
+                panic!("核心管理线程未终止进程");
+            }
+            extern "system" fn ui_callback() {
+                panic!("PRIVATE_UI_PANIC");
+            }
+            let _guard = runtime.state.lock().unwrap();
+            logging::with_locked_log(|| ui_callback());
+            unreachable!();
+        }
+
+        for scenario in ["ui", "worker", "spawn-failure", "restore-failure"] {
+            let folder = tempfile::Builder::new()
+                .prefix("panic 恢复 ")
+                .tempdir()
+                .unwrap();
+            let root = folder.path();
+            let _process_test = lock_and_install_fixture_cores(root);
+            for core in Core::ALL {
+                fs::write(
+                    core.config_dir(root).join("进程树.json"),
+                    r#"{"fixture_tree":true}"#,
+                )
+                .unwrap();
+            }
+            Saved {
+                settings: Settings {
+                    auto_sing_box: true,
+                    auto_xray: true,
+                    hijack_dns: true,
+                    ..Default::default()
+                },
+                sing_box: Some("进程树.json".into()),
+                xray: Some("进程树.json".into()),
+            }
+            .store(root)
+            .unwrap();
+            let mut external = FixtureChild(
+                Command::new(Core::Xray.executable(root))
+                    .arg(Core::Xray.config_dir(root).join("日常.JSON"))
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut host = FixtureChild(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "runtime::tests::fatal_panic_stops_owned_trees_and_restores_dns_without_application_locks", "--nocapture"])
+                    .env(ROOT, root).env(SCENARIO, scenario)
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                    .spawn().unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !root.join("ready").exists() {
+                assert!(
+                    host.0.try_wait().unwrap().is_none(),
+                    "{scenario}: 宿主提前退出"
+                );
+                assert!(Instant::now() < deadline, "{scenario}: 宿主启动超时");
+                thread::sleep(Duration::from_millis(20));
+            }
+            let mut handles = Vec::new();
+            for core in Core::ALL {
+                for extension in ["pid", "child"] {
+                    let path = core
+                        .config_dir(root)
+                        .join("进程树.json")
+                        .with_extension(extension);
+                    let pid = next_pid(&path, 0);
+                    let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+                    assert!(!raw.is_null());
+                    handles.push(unsafe { OwnedHandle::from_raw_handle(raw) });
+                }
+            }
+            fs::write(root.join("panic-now"), []).unwrap();
+            while host.0.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "{scenario}: panic 清理死锁");
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(host.0.wait().unwrap().code(), Some(1), "{scenario}");
+            for handle in handles {
+                assert_eq!(
+                    unsafe { WaitForSingleObject(handle.as_raw_handle(), 5000) },
+                    WAIT_OBJECT_0
+                );
+            }
+            assert!(
+                external.0.try_wait().unwrap().is_none(),
+                "不得停止其他软件的同名核心"
+            );
+            let journal = root.join("dns-recovery.json");
+            if scenario == "spawn-failure" {
+                assert!(journal.is_file(), "助手创建失败时必须保留恢复记录");
+                assert!(!root.join("recovery-result").exists());
+            } else {
+                let result = root.join("recovery-result");
+                while !result.exists() {
+                    assert!(Instant::now() < deadline, "{scenario}: 助手未完成恢复");
+                    thread::sleep(Duration::from_millis(20));
+                }
+                if scenario == "restore-failure" {
+                    assert_eq!(fs::read_to_string(result).unwrap(), "failed");
+                    assert_eq!(fs::read(journal).unwrap(), b"broken journal");
+                } else {
+                    assert_eq!(fs::read_to_string(result).unwrap(), "ok");
+                    assert!(!journal.exists(), "{scenario}: DNS 快照未交还");
+                }
+            }
+            assert!(
+                !fs::read_to_string(root.join("app.log"))
+                    .unwrap()
+                    .contains("PRIVATE_")
+            );
+        }
     }
 
     #[test]

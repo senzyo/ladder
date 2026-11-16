@@ -1,7 +1,7 @@
 //! 按物理网卡和地址族保存静态/自动 DNS，再接管到本地回环。
 
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use windows_registry::LOCAL_MACHINE;
@@ -112,9 +112,14 @@ impl Journal {
         save().map_err(|e| format!("无法保存 DNS 恢复记录 {}: {e}", path.display()))
     }
 
-    fn import_legacy(&mut self, source: &Path, machine: &Path) -> Result<bool, String> {
+    fn import_legacy(
+        &mut self,
+        source: &Path,
+        machine: &Path,
+        old: Result<Option<Self>, String>,
+    ) -> Result<bool, String> {
         let prior = self.imports.iter().position(|entry| entry.source == source);
-        let old = match Self::load(source) {
+        let old = match old {
             Ok(None) => {
                 if let Some(index) = prior {
                     self.imports.remove(index);
@@ -223,6 +228,7 @@ impl Journal {
 pub struct DnsLease {
     journal: PathBuf,
     legacy: Option<PathBuf>,
+    _session: Option<File>,
     #[cfg(test)]
     simulated: Option<std::cell::RefCell<std::collections::HashMap<Target, String>>>,
 }
@@ -232,6 +238,7 @@ impl DnsLease {
         Self {
             journal: base.join("dns-recovery.json"),
             legacy: None,
+            _session: None,
             #[cfg(test)]
             simulated: None,
         }
@@ -243,6 +250,18 @@ impl DnsLease {
             lease.legacy = Some(portable_dir.join("dns-recovery.json"));
         }
         lease
+    }
+
+    pub(crate) fn with_session(mut self, session: File) -> Self {
+        self._session = Some(session);
+        self
+    }
+
+    pub(crate) fn recovery_paths(&self) -> (&Path, Option<&Path>) {
+        (
+            self.journal.parent().unwrap(),
+            self.legacy.as_deref().and_then(Path::parent),
+        )
     }
 
     #[cfg(test)]
@@ -264,6 +283,17 @@ impl DnsLease {
                 String::new(),
             ),
         ])));
+        lease
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_legacy(base: &Path, legacy: Option<&Path>) -> Self {
+        let mut lease = Self::for_tests(base);
+        if let Some(portable) = legacy
+            && portable != base
+        {
+            lease.legacy = Some(portable.join("dns-recovery.json"));
+        }
         lease
     }
 
@@ -367,13 +397,28 @@ impl DnsLease {
             errors.push(e);
             None
         });
+        // 便携助手可能仍在交还旧快照；无法独占时保留两份记录，避免并发恢复同一网卡。
+        let _legacy_session = legacy
+            .as_deref()
+            .map(lock_legacy_journal)
+            .transpose()?
+            .flatten();
+        let legacy = legacy.map(|source| {
+            let old = if _legacy_session.is_some() {
+                Journal::load(&source)
+            } else {
+                // 没有旧记录时不创建锁文件，也不在检查后重新读取可能刚出现的记录。
+                Ok(None)
+            };
+            (source, old)
+        });
         match Journal::load(&self.journal) {
             Ok(machine) => {
                 let exists = machine.is_some();
                 let mut journal = machine.unwrap_or_default();
                 let mut imported = false;
-                if let Some(source) = legacy {
-                    match journal.import_legacy(&source, &self.journal) {
+                if let Some((source, old)) = legacy {
+                    match journal.import_legacy(&source, &self.journal, old) {
                         Ok(changed) => imported = changed,
                         Err(e) => errors.push(e),
                     }
@@ -388,8 +433,8 @@ impl DnsLease {
             Err(e) => {
                 errors.push(e);
                 // 保留损坏的机器记录，同时尽量就地恢复可读的便携记录。
-                if let Some(source) = legacy {
-                    match Journal::load(&source) {
+                if let Some((source, old)) = legacy {
+                    match old {
                         Ok(Some(old)) => {
                             pending = !old.changes.is_empty();
                             if let Err(e) = old.restore(&source, &write) {
@@ -408,6 +453,30 @@ impl DnsLease {
             Err(errors.join("；"))
         }
     }
+}
+
+fn lock_legacy_journal(source: &Path) -> Result<Option<File>, String> {
+    match fs::symlink_metadata(source) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "无法检查旧 DNS 恢复记录 {}: {error}",
+                source.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    let session = File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(source.with_file_name("dns-session.lock"))
+        .map_err(|error| format!("无法打开旧 DNS 恢复锁 {}: {error}", source.display()))?;
+    session
+        .try_lock()
+        .map_err(|error| format!("无法取得旧 DNS 恢复锁 {}: {error}", source.display()))?;
+    Ok(Some(session))
 }
 
 fn physical_targets() -> Result<Vec<Target>, String> {
@@ -832,6 +901,8 @@ mod tests {
         fs::create_dir(&child).unwrap();
         let alias = child.join("..");
         let lease = DnsLease::with_legacy(dir.path(), &alias);
+        let session = File::create(dir.path().join("dns-session.lock")).unwrap();
+        session.try_lock().unwrap();
         lease
             .install(vec![V4], |_| Ok("192.0.2.1".into()), |_, _| Ok(()))
             .unwrap();
@@ -844,6 +915,92 @@ mod tests {
         lease
             .restore_with(|target, value| {
                 assert_eq!((target, value), (V4, "192.0.2.1"));
+                Ok(())
+            })
+            .unwrap();
+        assert!(!lease.journal.exists());
+    }
+
+    #[test]
+    fn portable_session_blocks_migration_until_all_restoration_finishes() {
+        let portable = tempfile::tempdir().unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        let lease = DnsLease::with_legacy(machine.path(), portable.path());
+        let old = lease.legacy.as_ref().unwrap();
+        for (path, previous) in [(old, "192.0.2.1"), (&lease.journal, "192.0.2.2")] {
+            save_changes(
+                path,
+                &[SavedDns {
+                    target: V4,
+                    previous: previous.into(),
+                }],
+            )
+            .unwrap();
+        }
+        let old_bytes = fs::read(old).unwrap();
+        let machine_bytes = fs::read(&lease.journal).unwrap();
+        let lock_path = portable.path().join("dns-session.lock");
+        let active = File::create(&lock_path).unwrap();
+        active.try_lock().unwrap();
+        assert!(
+            lease
+                .restore_with(|_, _| panic!("不能与便携恢复同时写入网卡"))
+                .unwrap_err()
+                .contains("旧 DNS 恢复锁")
+        );
+        assert_eq!(fs::read(old).unwrap(), old_bytes);
+        assert_eq!(fs::read(&lease.journal).unwrap(), machine_bytes);
+        drop(active);
+
+        lease
+            .restore_with(|target, previous| {
+                assert_eq!((target, previous), (V4, "192.0.2.2"));
+                let other = File::options()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .unwrap();
+                assert!(matches!(
+                    other.try_lock(),
+                    Err(fs::TryLockError::WouldBlock)
+                ));
+                Ok(())
+            })
+            .unwrap();
+        assert!(!old.exists());
+        assert!(!lease.journal.exists());
+        File::options()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap()
+            .try_lock()
+            .unwrap();
+    }
+
+    #[test]
+    fn missing_portable_journal_requires_no_writable_lock_file() {
+        let portable = tempfile::tempdir().unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        let lease = DnsLease::with_legacy(machine.path(), portable.path());
+        let source = lease.legacy_source().unwrap().unwrap();
+        // 禁止按文件打开该位置，模拟旧目录不允许创建锁；没有旧记录就无需访问它。
+        fs::create_dir(portable.path().join("dns-session.lock")).unwrap();
+        Journal {
+            changes: vec![SavedDns {
+                target: V4,
+                previous: "192.0.2.1".into(),
+            }],
+            imports: vec![LegacyImport {
+                source,
+                state: ImportState::Imported(Vec::new()),
+            }],
+        }
+        .save(&lease.journal)
+        .unwrap();
+        lease
+            .restore_with(|target, previous| {
+                assert_eq!((target, previous), (V4, "192.0.2.1"));
                 Ok(())
             })
             .unwrap();

@@ -1,8 +1,10 @@
 mod core_output;
 mod desktop;
 mod dns;
+mod emergency;
 mod logging;
 mod managed_child;
+mod panic_helper;
 mod runtime;
 mod scheduler;
 mod tun_cleanup;
@@ -272,12 +274,19 @@ fn message_box(message: &str, icon: u32) {
 
 pub fn launch() -> ExitCode {
     logging::install_panic_hook();
+    if std::env::args_os().nth(1).as_deref() == Some(emergency::ARGUMENT.as_ref()) {
+        return match emergency::restore_after_panic() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     if std::env::args_os().nth(1).as_deref() == Some(scheduler::BOOT_ARGUMENT.as_ref()) {
         return match scheduler::restore_on_boot() {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,
         };
     }
+    emergency::install_panic_hook();
     if let Err(error) = run() {
         report(&format!("{error:#}"));
         return ExitCode::FAILURE;

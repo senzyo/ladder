@@ -4,6 +4,7 @@
 /ladder-state.json.tmp
 /dns-recovery.json
 /dns-recovery.tmp
+/dns-session.lock
 /configs/
 /sing-box_core/
 /xray_core/

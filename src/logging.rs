@@ -160,6 +160,12 @@ pub(crate) fn install_panic_hook() {
     }));
 }
 
+#[cfg(test)]
+pub(crate) fn with_locked_log(f: impl FnOnce()) {
+    let _guard = state().lock().unwrap();
+    f();
+}
+
 // Display 分段写入有界缓冲区，避免超长错误先分配完整字符串。
 struct Line {
     text: String,

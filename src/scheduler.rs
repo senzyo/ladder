@@ -102,6 +102,12 @@ fn lock_desktop_session(session: &File) -> Result<()> {
     }
 }
 
+fn portable_dns(directory: &Path) -> Result<DnsLease> {
+    let session = session_file(directory).context("无法打开便携 DNS 恢复锁")?;
+    lock_desktop_session(&session)?;
+    Ok(DnsLease::new(directory).with_session(session))
+}
+
 pub(crate) enum DesktopDns {
     Machine { lease: DnsLease, _session: File },
     Portable(DnsLease),
@@ -145,9 +151,13 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
     };
     if let Err(error) = prepare_directory(&directory) {
         return if can_use_portable(&directory, portable) {
+            let lease = match portable_dns(portable) {
+                Ok(lease) => lease,
+                Err(error) => return unavailable(error),
+            };
             logging::warn("dns", format_args!("使用便携 DNS 恢复记录：{error:#}"));
             (
-                DesktopDns::Portable(DnsLease::new(portable)),
+                DesktopDns::Portable(lease),
                 Some(format!(
                     "本次使用便携 DNS 恢复记录，只能由 Ladder 恢复。{error:#}"
                 )),
@@ -198,6 +208,25 @@ pub(crate) fn restore_on_boot() -> Result<()> {
             result.map_err(anyhow::Error::msg)
         }
         // 已经打开的 Ladder 会在启动时恢复，之后由它独占正在运行的核心快照。
+        Err(TryLockError::WouldBlock) => Ok(()),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+pub(crate) fn restore_after_panic(directory: &Path, legacy: Option<&Path>) -> Result<()> {
+    let session = session_file(directory)?;
+    match session.try_lock() {
+        Ok(()) => {
+            #[cfg(not(test))]
+            let lease = match legacy {
+                Some(portable) => DnsLease::with_legacy(directory, portable),
+                None => DnsLease::new(directory),
+            };
+            #[cfg(test)]
+            let lease = DnsLease::for_tests_with_legacy(directory, legacy);
+            lease.restore_if_pending().map_err(anyhow::Error::msg)
+        }
+        // 新桌面会话先取得锁时由它接管恢复，不能重放其后产生的记录。
         Err(TryLockError::WouldBlock) => Ok(()),
         Err(TryLockError::Error(error)) => Err(error.into()),
     }
@@ -365,6 +394,52 @@ mod tests {
         assert!(matches!(boot.try_lock(), Err(TryLockError::WouldBlock)));
         drop(desktop);
         boot.try_lock().unwrap();
+    }
+
+    #[test]
+    fn portable_lease_keeps_its_session_locked_until_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = portable_dns(dir.path()).unwrap();
+        assert_eq!(lease.recovery_paths(), (dir.path(), None));
+        let other = session_file(dir.path()).unwrap();
+        assert!(matches!(other.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(lease);
+        other.try_lock().unwrap();
+    }
+
+    #[test]
+    fn panic_recovery_defers_to_a_new_session_and_preserves_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("dns-recovery.json");
+        let log = dir.path().join("app.log");
+        fs::write(&journal, b"do not read an active session's journal").unwrap();
+        fs::write(&log, b"panic location\n").unwrap();
+        let desktop = session_file(dir.path()).unwrap();
+        desktop.try_lock().unwrap();
+        restore_after_panic(dir.path(), None).unwrap();
+        assert_eq!(
+            fs::read(&journal).unwrap(),
+            b"do not read an active session's journal"
+        );
+        drop(desktop);
+
+        // 空记录只需删除，不调用真实 DNS 接口或刷新缓存。
+        fs::write(&journal, b"[]").unwrap();
+        restore_after_panic(dir.path(), None).unwrap();
+        assert!(!journal.exists());
+        assert_eq!(fs::read(log).unwrap(), b"panic location\n");
+    }
+
+    #[test]
+    fn panic_recovery_cleans_empty_legacy_records_without_reinitializing_logging() {
+        let machine = tempfile::tempdir().unwrap();
+        let portable = tempfile::tempdir().unwrap();
+        let old = portable.path().join("dns-recovery.json");
+        fs::write(&old, b"[]").unwrap();
+        restore_after_panic(machine.path(), Some(portable.path())).unwrap();
+        assert!(!old.exists());
+        assert!(!machine.path().join("dns-recovery.json").exists());
+        assert!(!machine.path().join("app.log").exists());
     }
 
     #[test]
