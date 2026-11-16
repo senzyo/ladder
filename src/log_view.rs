@@ -1,61 +1,78 @@
-use super::{
-    Colors, FeedbackScope, MainWindow, TEXT_PRIMARY, caption, control, error_message, page_title,
-    panel, scroll_area,
+use super::{Colors, FeedbackScope, MainWindow, TEXT_PRIMARY, control, panel, scroll_area};
+use crate::{desktop, logging, logging::LogSource};
+use gpui::{
+    ClipboardItem, Context, Div, PathBuilder, Rgba, ScrollHandle, Stateful, canvas, div, point,
+    prelude::*, px,
 };
-use crate::{desktop, logging};
-use gpui::{ClipboardItem, Context, Div, ScrollHandle, Stateful, div, prelude::*, px};
 
 pub(super) struct LogView {
-    lines: Vec<String>,
-    warning: Option<String>,
+    source: LogSource,
+    lines: [Vec<String>; 3],
     paused: bool,
-    copied: bool,
-    scroll: ScrollHandle,
+    scroll: [ScrollHandle; 3],
 }
 
 impl LogView {
     pub(super) fn new() -> Self {
-        let scroll = ScrollHandle::new();
-        scroll.scroll_to_bottom();
         Self {
-            lines: Vec::new(),
-            warning: None,
+            source: LogSource::App,
+            lines: Default::default(),
             paused: false,
-            copied: false,
-            scroll,
+            scroll: std::array::from_fn(|_| {
+                let scroll = ScrollHandle::new();
+                scroll.scroll_to_bottom();
+                scroll
+            }),
         }
     }
 
     pub(super) fn refresh(&mut self) -> bool {
-        let warning = logging::warning();
-        let mut changed = warning != self.warning;
-        self.warning = warning;
-        if !self.paused {
-            let lines = logging::recent();
-            if lines != self.lines {
-                let at_bottom = -self.scroll.offset().y >= self.scroll.max_offset().height - px(2.);
-                self.lines = lines;
-                self.copied = false;
+        if self.paused {
+            return false;
+        }
+        let mut changed = false;
+        for source in LogSource::ALL {
+            let index = source.index();
+            let lines = logging::recent_for(source);
+            if lines != self.lines[index] {
+                let scroll = &self.scroll[index];
+                let at_bottom = -scroll.offset().y >= scroll.max_offset().height - px(2.);
+                self.lines[index] = lines;
                 if at_bottom {
-                    self.scroll.scroll_to_bottom();
+                    scroll.scroll_to_bottom();
                 }
-                changed = true;
+                changed |= source == self.source;
             }
         }
         changed
     }
 
+    fn select(&mut self, source: LogSource) {
+        self.source = source;
+        self.refresh();
+    }
+
+    fn toggle_paused(&mut self) {
+        self.paused = !self.paused;
+        if !self.paused {
+            self.refresh();
+            self.scroll[self.source.index()].scroll_to_bottom();
+        }
+    }
+
     pub(super) fn scroll_key(&self, key: &str) -> bool {
-        let mut offset = self.scroll.offset();
+        let scroll = &self.scroll[self.source.index()];
+        let mut offset = scroll.offset();
         offset.y = match key {
-            "pageup" => (offset.y + self.scroll.bounds().size.height * 0.9).min(px(0.)),
-            "pagedown" => (offset.y - self.scroll.bounds().size.height * 0.9)
-                .max(-self.scroll.max_offset().height),
+            "pageup" => (offset.y + scroll.bounds().size.height * 0.9).min(px(0.)),
+            "pagedown" => {
+                (offset.y - scroll.bounds().size.height * 0.9).max(-scroll.max_offset().height)
+            }
             "home" => px(0.),
-            "end" => -self.scroll.max_offset().height,
+            "end" => -scroll.max_offset().height,
             _ => return false,
         };
-        self.scroll.set_offset(offset);
+        scroll.set_offset(offset);
         true
     }
 }
@@ -73,8 +90,105 @@ fn button(label: &'static str, id: &'static str, index: isize, colors: Colors) -
         .child(label)
 }
 
+fn playback_icon(paused: bool, color: Rgba) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let scale = bounds.size.width / px(16.);
+            let p = |x, y| bounds.origin + point(px(x) * scale, px(y) * scale);
+            let mut path = PathBuilder::fill();
+            if paused {
+                path.move_to(p(4., 2.));
+                path.line_to(p(14., 8.));
+                path.line_to(p(4., 14.));
+                path.close();
+            } else {
+                for x in [3., 10.] {
+                    path.move_to(p(x, 2.));
+                    path.line_to(p(x + 3., 2.));
+                    path.line_to(p(x + 3., 14.));
+                    path.line_to(p(x, 14.));
+                    path.close();
+                }
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .size(px(16.))
+    .flex_shrink_0()
+}
+
+#[derive(Debug, PartialEq)]
+enum LogLevel {
+    Warning,
+    Error,
+}
+
+fn log_level(line: &str) -> Option<LogLevel> {
+    let header = line.split_whitespace().find(|word| {
+        !word.bytes().all(|byte| {
+            byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'/' | b':' | b'.' | b'T' | b'Z')
+        })
+    })?;
+    let level = header
+        .trim_start_matches('[')
+        .split(['[', ']', ':'])
+        .next()?;
+    if level.eq_ignore_ascii_case("error") || level.eq_ignore_ascii_case("fatal") {
+        Some(LogLevel::Error)
+    } else if level.eq_ignore_ascii_case("warn") || level.eq_ignore_ascii_case("warning") {
+        Some(LogLevel::Warning)
+    } else {
+        None
+    }
+}
+
 impl MainWindow {
     pub(super) fn logs_page(&self, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
+        let source = self.logs.source;
+        let mut sources = div()
+            .flex()
+            .flex_shrink_0()
+            .gap(px(2.))
+            .p(px(1.))
+            .bg(colors.canvas)
+            .border_1()
+            .border_color(colors.line)
+            .rounded(px(6.));
+        for item in LogSource::ALL {
+            sources = sources.child(
+                control(
+                    ("log-source", item.index()),
+                    5 + item.index() as isize,
+                    colors,
+                    false,
+                )
+                .h(px(26.))
+                .min_w(px(60.))
+                .px(px(8.))
+                .justify_center()
+                .text_size(px(TEXT_PRIMARY))
+                .when(source == item, |el| {
+                    el.bg(colors.selection).text_color(colors.accent)
+                })
+                .child(item.label())
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.logs.select(item);
+                    cx.notify();
+                })),
+            );
+        }
+        let playback_colors = if self.logs.paused {
+            colors
+        } else {
+            Colors {
+                accent_fill: colors.stop_fill,
+                accent_hover: colors.stop_hover,
+                ..colors
+            }
+        };
         div()
             .id("application-logs")
             .size_full()
@@ -86,61 +200,34 @@ impl MainWindow {
                     .flex()
                     .flex_shrink_0()
                     .items_center()
-                    .justify_between()
-                    .gap(px(12.))
-                    .child(page_title("应用日志"))
-                    .child(caption(
-                        format!("最近 {} 条", self.logs.lines.len()),
-                        colors,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_shrink_0()
                     .gap(px(8.))
+                    .child(sources)
                     .child(
-                        button(
-                            if self.logs.paused {
-                                "继续刷新"
-                            } else {
-                                "暂停刷新"
-                            },
-                            "pause-logs",
-                            5,
-                            colors,
-                        )
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.logs.paused = !view.logs.paused;
-                            if !view.logs.paused {
-                                view.logs.refresh();
-                                view.logs.scroll.scroll_to_bottom();
-                            }
-                            cx.notify();
-                        })),
+                        control("pause-logs", 8, playback_colors, true)
+                            .size(px(30.))
+                            .flex_shrink_0()
+                            .justify_center()
+                            .bg(playback_colors.accent_fill)
+                            .border_color(playback_colors.accent_fill)
+                            .child(playback_icon(self.logs.paused, colors.on_accent))
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.logs.toggle_paused();
+                                cx.notify();
+                            })),
                     )
                     .child(
-                        button(
-                            if self.logs.copied {
-                                "已复制"
-                            } else {
-                                "复制日志"
-                            },
-                            "copy-logs",
-                            6,
-                            colors,
-                        )
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                view.logs.lines.join("\n"),
-                            ));
-                            view.logs.copied = true;
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        button("打开日志目录", "open-log-folder", 7, colors).on_click(cx.listener(
+                        button("复制日志", "copy-logs", 9, colors).on_click(cx.listener(
                             |view, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    view.logs.lines[view.logs.source.index()].join("\n"),
+                                ));
+                            },
+                        )),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        button("打开日志目录", "open-log-folder", 10, colors).on_click(
+                            cx.listener(|view, _, _, cx| {
                                 if let Some(path) = logging::path()
                                     .and_then(|path| path.parent().map(std::path::Path::to_owned))
                                 {
@@ -151,34 +238,20 @@ impl MainWindow {
                                         cx,
                                     );
                                 } else {
-                                    view.set_command_result(
-                                        FeedbackScope::Logs,
-                                        Err("应用日志目录尚未初始化".into()),
-                                    );
+                                    logging::warn("desktop", "应用日志目录尚未初始化");
+                                    view.logs.refresh();
                                     cx.notify();
                                 }
-                            },
-                        )),
+                            }),
+                        ),
                     ),
-            )
-            .when_some(
-                self.command_error(FeedbackScope::Logs).cloned(),
-                |el, message| el.child(error_message(message, colors)),
-            )
-            .when_some(
-                self.logs
-                    .warning
-                    .as_ref()
-                    .filter(|warning| Some(*warning) != self.command_error(FeedbackScope::Logs))
-                    .cloned(),
-                |el, warning| el.child(error_message(warning, colors)),
             )
             .child(
                 panel(colors).flex_1().min_h(px(0.)).flex().child(
                     scroll_area(
-                        "log-scroll",
+                        ("log-scroll", source.index()),
                         div()
-                            .id("log-lines")
+                            .id(("log-lines", source.index()))
                             .flex_1()
                             .min_w(px(0.))
                             .min_h(px(0.))
@@ -188,31 +261,61 @@ impl MainWindow {
                             .p(px(12.))
                             .gap(px(6.))
                             .text_size(px(TEXT_PRIMARY))
-                            .when(self.logs.lines.is_empty(), |el| {
-                                el.child(caption("暂无应用日志", colors))
-                            })
-                            .children(self.logs.lines.iter().enumerate().map(|(index, line)| {
-                                let level = line
-                                    .split_once(" [")
-                                    .and_then(|(_, rest)| rest.split_once(']'))
-                                    .map(|(level, _)| level);
-                                div()
-                                    .id(index)
-                                    .flex_shrink_0()
-                                    .w_full()
-                                    .whitespace_normal()
-                                    .text_color(match level {
-                                        Some("ERROR") => colors.error,
-                                        Some("WARN") => colors.warning,
-                                        _ => colors.text,
-                                    })
-                                    .child(line.clone())
-                            })),
-                        &self.logs.scroll,
+                            .children(self.logs.lines[source.index()].iter().enumerate().map(
+                                |(index, line)| {
+                                    div()
+                                        .id(index)
+                                        .flex_shrink_0()
+                                        .w_full()
+                                        .whitespace_normal()
+                                        .text_color(match log_level(line) {
+                                            Some(LogLevel::Error) => colors.error,
+                                            Some(LogLevel::Warning) => colors.warning,
+                                            None => colors.text,
+                                        })
+                                        .child(line.clone())
+                                },
+                            )),
+                        &self.logs.scroll[source.index()],
                         colors,
                     )
                     .flex_1(),
                 ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_application_and_core_levels_without_matching_message_text() {
+        for (line, expected) in [
+            (
+                "2026-11-17 10:20:30.123 [ERROR] [app] failed",
+                Some(LogLevel::Error),
+            ),
+            (
+                "2026/11/17 10:20:30 [Warning] core: warning",
+                Some(LogLevel::Warning),
+            ),
+            (
+                "+0800 2026-11-17 10:20:30 ERROR [123 0ms] failed",
+                Some(LogLevel::Error),
+            ),
+            ("WARN[0000] deprecated", Some(LogLevel::Warning)),
+            ("[Error] failed", Some(LogLevel::Error)),
+            (
+                "2026-11-17T10:20:30Z [WARN] warning",
+                Some(LogLevel::Warning),
+            ),
+            ("2026-11-17 10:20:30 [INFO] [app] error count is zero", None),
+            ("INFO[0000] error count is zero", None),
+            ("connection reports an error", None),
+            ("", None),
+        ] {
+            assert_eq!(log_level(line), expected, "{line}");
+        }
     }
 }

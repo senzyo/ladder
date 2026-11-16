@@ -1,4 +1,4 @@
-//! 应用诊断只接收调用方挑选的安全摘要，不接收配置或核心原始输出。
+//! 应用诊断只落盘安全摘要；经过显示过滤的核心日志仅保存在各自的内存队列。
 
 use std::collections::VecDeque;
 use std::fmt::{self, Display, Write as _};
@@ -10,6 +10,8 @@ use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::SYSTEMTIME;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
+use crate::runtime::Core;
+
 const FILE_LIMIT: u64 = 2 * 1024 * 1024;
 const RECENT_LIMIT: usize = 500;
 const RECORD_LIMIT: usize = 8 * 1024;
@@ -17,20 +19,45 @@ const LIMIT_WARNING: &str = "本次运行日志已达 2 MiB 上限，后续日�
 
 static LOG: OnceLock<Mutex<LogState>> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogSource {
+    SingBox,
+    Xray,
+    App,
+}
+
+impl LogSource {
+    pub(crate) const ALL: [Self; 3] = [Self::SingBox, Self::Xray, Self::App];
+
+    pub(crate) fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::SingBox => "sing-box",
+            Self::Xray => "Xray",
+            Self::App => "Ladder",
+        }
+    }
+}
+
 #[derive(Default)]
 struct LogState {
     path: Option<PathBuf>,
     file: Option<CappedFile>,
     recent: VecDeque<String>,
-    warning: Option<String>,
+    cores: [VecDeque<String>; 2],
 }
 
 impl LogState {
     fn open(&mut self, path: &Path) -> io::Result<()> {
         self.path = Some(path.to_owned());
         self.file = None;
-        self.warning = None;
         self.recent.clear();
+        for lines in &mut self.cores {
+            lines.clear();
+        }
         match File::create(path) {
             Ok(file) => {
                 self.file = Some(CappedFile { file, written: 0 });
@@ -50,7 +77,6 @@ impl LogState {
                 Ok(false) => {}
                 Ok(true) => {
                     self.file = None;
-                    self.warning = Some(LIMIT_WARNING.into());
                     self.remember(format_record("WARN", "logging", LIMIT_WARNING));
                 }
                 Err(error) => self.file_failed(&error),
@@ -65,6 +91,22 @@ impl LogState {
         self.recent.push_back(line);
     }
 
+    fn record_core(&mut self, core: Core, line: String) {
+        let lines = &mut self.cores[core as usize];
+        if lines.len() == RECENT_LIMIT {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    fn recent_for(&self, source: LogSource) -> Vec<String> {
+        let lines = match source {
+            LogSource::App => &self.recent,
+            _ => &self.cores[source.index()],
+        };
+        lines.iter().cloned().collect()
+    }
+
     fn file_failed(&mut self, error: &io::Error) {
         self.file = None;
         // 不格式化自定义 IO 错误中的外部文本。
@@ -72,9 +114,10 @@ impl LogState {
             Some(code) => format!("Windows 错误 {code}"),
             None => format!("I/O 类型 {:?}", error.kind()),
         };
-        self.warning = Some(format!(
+        let message = format!(
             "应用日志无法写入文件（{reason}）。本次仅在界面保留最近 500 条日志，请检查日志目录权限或磁盘空间后重启 Ladder。"
-        ));
+        );
+        self.remember(format_record("WARN", "logging", message));
     }
 }
 
@@ -94,22 +137,23 @@ pub(crate) fn path() -> Option<PathBuf> {
         .clone()
 }
 
-pub(crate) fn warning() -> Option<String> {
+pub(crate) fn recent_for(source: LogSource) -> Vec<String> {
     state()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .warning
-        .clone()
+        .recent_for(source)
 }
 
+#[cfg(test)]
 pub(crate) fn recent() -> Vec<String> {
+    recent_for(LogSource::App)
+}
+
+pub(crate) fn record_core(core: Core, line: String) {
     state()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .recent
-        .iter()
-        .cloned()
-        .collect()
+        .record_core(core, line);
 }
 
 pub(crate) fn info(target: &'static str, message: impl Display) {
@@ -269,13 +313,43 @@ mod tests {
         let mut first = LogState::default();
         first.open(&path).unwrap();
         first.record("first".into());
+        first.record_core(Core::Xray, "old core output".into());
         first.open(&path).unwrap();
         assert!(first.recent.is_empty());
+        assert!(first.recent_for(LogSource::Xray).is_empty());
         assert_eq!(fs::metadata(&path).unwrap().len(), 0);
         first.record("second".into());
         assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
         assert_eq!(first.recent, ["second"]);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn core_streams_are_bounded_separate_and_never_written_to_app_log() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("app.log");
+        let mut state = LogState::default();
+        state.open(&path).unwrap();
+        state.record("application event".into());
+        for core in Core::ALL {
+            for index in 0..600 {
+                state.record_core(core, format!("{} {index}", core.label()));
+            }
+        }
+        for source in [LogSource::SingBox, LogSource::Xray] {
+            let lines = state.recent_for(source);
+            assert_eq!(lines.len(), RECENT_LIMIT);
+            assert!(lines.first().unwrap().ends_with(" 100"));
+            assert!(lines.last().unwrap().ends_with(" 599"));
+            let expected = if source == LogSource::SingBox {
+                "sing-box "
+            } else {
+                "xray "
+            };
+            assert!(lines.iter().all(|line| line.starts_with(expected)));
+        }
+        assert_eq!(state.recent_for(LogSource::App), ["application event"]);
+        assert_eq!(fs::read_to_string(path).unwrap(), "application event\n");
     }
 
     #[test]
@@ -296,7 +370,6 @@ mod tests {
         assert!(state.recent.front().unwrap().contains("0800 "));
         assert!(state.recent.back().unwrap().contains("1299 "));
         assert!(state.file.is_none());
-        assert_eq!(state.warning.as_deref(), Some(LIMIT_WARNING));
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
         assert!(fs::metadata(&path).unwrap().len() <= FILE_LIMIT);
         let data = fs::read_to_string(&path).unwrap();
@@ -350,7 +423,7 @@ mod tests {
         fs::create_dir(&path).unwrap();
         let mut state = LogState::default();
         assert!(state.open(&path).is_err());
-        assert!(state.warning.is_some());
+        assert!(state.recent.back().unwrap().contains("[WARN] [logging]"));
         for number in 0..600 {
             state.record(format!("event {number}"));
         }
@@ -363,7 +436,7 @@ mod tests {
         // 真实只读句柄模拟已初始化后的写入失败。
         state.file.as_mut().unwrap().file = File::open(&path).unwrap();
         state.record("write failed".into());
-        assert!(state.warning.is_some());
+        assert!(state.recent.back().unwrap().contains("[WARN] [logging]"));
         assert!(state.file.is_none());
         state.record("still available".into());
         assert_eq!(state.recent.back().unwrap(), "still available");
