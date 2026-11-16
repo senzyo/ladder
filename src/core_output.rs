@@ -1,5 +1,7 @@
-use std::io::Read;
+use std::io::{self, Read};
 use std::thread::{self, JoinHandle};
+
+use crate::{logging, runtime::Core};
 
 pub(crate) struct CoreOutput {
     stdout: JoinHandle<Option<&'static str>>,
@@ -8,28 +10,58 @@ pub(crate) struct CoreOutput {
 
 impl CoreOutput {
     pub(crate) fn capture(
+        core: Core,
         stdout: impl Read + Send + 'static,
         stderr: impl Read + Send + 'static,
     ) -> Self {
         Self {
-            stdout: thread::spawn(move || read_reason(stdout)),
-            stderr: thread::spawn(move || read_reason(stderr)),
+            stdout: thread::spawn(move || capture_reason(core, "stdout", stdout)),
+            stderr: thread::spawn(move || capture_reason(core, "stderr", stderr)),
         }
     }
 
     // 核心退出后等待两条管道读完, 再生成诊断。
     pub(crate) fn finish(self) -> Option<&'static str> {
-        let stdout = self.stdout.join().ok().flatten();
-        let stderr = self.stderr.join().ok().flatten();
+        let stdout = self
+            .stdout
+            .join()
+            .unwrap_or(Some("核心输出读取线程异常退出"));
+        let stderr = self
+            .stderr
+            .join()
+            .unwrap_or(Some("核心输出读取线程异常退出"));
         stderr.or(stdout)
     }
 }
 
-fn read_reason(mut pipe: impl Read) -> Option<&'static str> {
+fn capture_reason(core: Core, stream: &'static str, pipe: impl Read) -> Option<&'static str> {
+    match read_reason(pipe) {
+        Ok(reason) => reason,
+        Err(error) => {
+            // IO 错误的自定义文本也可能来自核心，日志只记录系统代码和种类。
+            logging::warn(
+                "core",
+                format_args!(
+                    "{} {stream} 读取失败（{:?}，系统错误码 {:?}）",
+                    core.label(),
+                    error.kind(),
+                    error.raw_os_error()
+                ),
+            );
+            Some("读取核心输出失败，诊断可能不完整")
+        }
+    }
+}
+
+fn read_reason(mut pipe: impl Read) -> io::Result<Option<&'static str>> {
     let mut buffer = [0; 4096];
     let mut pending = Vec::with_capacity(buffer.len() + 32);
     let mut reason = None;
-    while let Ok(size) = pipe.read(&mut buffer) {
+    loop {
+        let size = match pipe.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if size == 0 {
             break;
         }
@@ -60,7 +92,7 @@ fn read_reason(mut pipe: impl Read) -> Option<&'static str> {
         pending.copy_within(start.., 0);
         pending.truncate(keep);
     }
-    reason
+    Ok(reason)
 }
 
 #[cfg(test)]
@@ -86,18 +118,22 @@ mod tests {
             "cannot find the file",
             "no such file",
         ] {
-            let expected = read_reason(Cursor::new(phrase.as_bytes()));
+            let expected = read_reason(Cursor::new(phrase.as_bytes())).unwrap();
             assert!(expected.is_some());
             for split in 1..phrase.len() {
                 let pipe = Cursor::new(&phrase.as_bytes()[..split])
                     .chain(Cursor::new(&phrase.as_bytes()[split..]));
-                assert_eq!(read_reason(pipe), expected, "split {split} of {phrase}");
+                assert_eq!(
+                    read_reason(pipe).unwrap(),
+                    expected,
+                    "split {split} of {phrase}"
+                );
             }
         }
         let mut text = vec![b'x'; 4090];
         text.extend_from_slice(b"ACCESS IS DENIED: PRIVATE_FIXTURE_VALUE");
         assert_eq!(
-            read_reason(Cursor::new(text)),
+            read_reason(Cursor::new(text)).unwrap(),
             Some("核心没有访问所需资源的权限")
         );
     }
@@ -118,6 +154,7 @@ mod tests {
         }
         let gate = Arc::new(Barrier::new(2));
         let output = CoreOutput::capture(
+            Core::SingBox,
             Cursor::new(b"unknown field"),
             DelayedReader {
                 gate: Some(gate.clone()),
@@ -133,5 +170,32 @@ mod tests {
             Some("核心没有访问所需资源的权限")
         );
         finished.join().unwrap();
+    }
+
+    #[test]
+    fn interrupted_reads_retry_and_failures_return_a_safe_summary() {
+        struct FailingReader(bool);
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                if std::mem::take(&mut self.0) {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Err(io::Error::other("PRIVATE_PIPE_ERROR"))
+                }
+            }
+        }
+        assert_eq!(
+            read_reason(FailingReader(true)).unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(
+            capture_reason(Core::Xray, "stderr", FailingReader(true)),
+            Some("读取核心输出失败，诊断可能不完整")
+        );
+        assert!(
+            !logging::recent()
+                .iter()
+                .any(|line| line.contains("PRIVATE_PIPE_ERROR"))
+        );
     }
 }

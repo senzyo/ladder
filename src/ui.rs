@@ -5,11 +5,20 @@ use gpui::{
     Context, Div, ElementId, FocusHandle, FontWeight, Rgba, ScrollHandle, SharedString, Stateful,
     Task, Timer, Window, WindowAppearance, div, prelude::*, px, rgb, rgba,
 };
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+#[path = "log_view.rs"]
+mod log_view;
+use log_view::LogView;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Core(Core),
+    Logs,
     Settings,
 }
 
@@ -33,6 +42,7 @@ pub(crate) struct MainWindow {
     titlebar_dark: Option<bool>,
     command_error: Option<String>,
     focus: FocusHandle,
+    logs: LogView,
 }
 
 impl MainWindow {
@@ -66,12 +76,16 @@ impl MainWindow {
             titlebar_dark: None,
             command_error: None,
             focus,
+            logs: LogView::new(),
         };
         view.refresh(cx);
         view
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.page == Page::Logs && self.logs.refresh() {
+            cx.notify();
+        }
         let next = self.runtime.snapshot();
         if next != self.snapshot {
             for core in Core::ALL {
@@ -107,14 +121,43 @@ impl MainWindow {
                 return self.set_update_channel(core, channel, cx);
             }
             UiAction::Run(action) => self.runtime.send(action),
-            UiAction::OpenFolder(core) => desktop::open_folder(&self.runtime.config_dir(core)),
+            UiAction::OpenFolder(core) => {
+                return Self::open_external(
+                    self.runtime.config_dir(core),
+                    desktop::open_folder,
+                    cx,
+                );
+            }
             UiAction::Edit(core, name) => {
-                desktop::edit_config(&self.runtime.config_dir(core).join(name))
+                return Self::open_external(
+                    self.runtime.config_dir(core).join(name),
+                    desktop::edit_config,
+                    cx,
+                );
             }
         };
         self.command_error = result.err();
+        if let Some(message) = &self.command_error {
+            crate::logging::error("desktop", message);
+        }
         self.refresh(cx);
         cx.notify();
+    }
+
+    fn open_external(path: PathBuf, open: fn(&Path) -> Result<(), String>, cx: &mut Context<Self>) {
+        // ShellExecute 会泵 Windows 消息，执行时不能持有 GPUI 的 App 或实体借用。
+        cx.spawn(async move |view, cx| {
+            let result = open(&path);
+            if let Err(message) = &result {
+                crate::logging::error("desktop", message);
+            }
+            let _ = view.update(cx, |view, cx| {
+                view.command_error = result.err();
+                view.refresh(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn set_update_channel(&mut self, core: Core, channel: UpdateChannel, cx: &mut Context<Self>) {
@@ -149,6 +192,13 @@ impl MainWindow {
         self.pending_theme
             .as_ref()
             .map_or(self.snapshot.settings.theme, |(theme, _)| *theme)
+    }
+
+    fn visible_error(&self) -> Option<&String> {
+        self.command_error
+            .as_ref()
+            .or(self.snapshot.error.as_ref())
+            .or(self.snapshot.dns_task_warning.as_ref())
     }
 
     fn set_theme(&mut self, theme: ThemePreference, cx: &mut Context<Self>) {
@@ -201,6 +251,7 @@ impl MainWindow {
                 .on_click(cx.listener(move |view, _, _, cx| {
                     view.page = page;
                     view.command_error = None;
+                    view.refresh(cx);
                     cx.notify();
                 }))
         };
@@ -233,8 +284,9 @@ impl MainWindow {
             )
             .child(item(Page::Core(Core::SingBox), "sing-box", 1))
             .child(item(Page::Core(Core::Xray), "Xray", 2))
+            .child(item(Page::Logs, "应用日志", 3))
             .child(div().flex_1())
-            .child(item(Page::Settings, "软件设置", 3))
+            .child(item(Page::Settings, "软件设置", 4))
             .child(
                 caption(format!("v{}", env!("CARGO_PKG_VERSION")), colors)
                     .px(px(12.))
@@ -269,7 +321,7 @@ impl MainWindow {
             channels = channels.child(
                 action_button(
                     label,
-                    4 + index as isize,
+                    5 + index as isize,
                     can_update.then_some(UiAction::SetUpdateChannel(core, option)),
                     false,
                     colors,
@@ -340,7 +392,7 @@ impl MainWindow {
                     .gap(px(8.))
                     .child(action_button(
                         "启动",
-                        7,
+                        8,
                         (can_run && !state.running).then_some(UiAction::Run(Action::Start(core))),
                         true,
                         colors,
@@ -348,7 +400,7 @@ impl MainWindow {
                     ))
                     .child(action_button(
                         "停止",
-                        8,
+                        9,
                         (idle && state.running).then_some(UiAction::Run(Action::Stop(core))),
                         false,
                         colors,
@@ -356,7 +408,7 @@ impl MainWindow {
                     ))
                     .child(action_button(
                         "重启",
-                        9,
+                        10,
                         (can_run && state.running).then_some(UiAction::Run(Action::Restart(core))),
                         false,
                         colors,
@@ -379,7 +431,7 @@ impl MainWindow {
             let current = state.current.as_ref() == Some(name);
             let highlighted = selected == Some(name.as_str());
             let file = name.clone();
-            let tab_index = 12 + index as isize;
+            let tab_index = 13 + index as isize;
             // GPUI uses the tracked handle's tab order when a control supplies its own handle.
             let focus = self.config_focus[core_index(core)][name]
                 .clone()
@@ -430,7 +482,7 @@ impl MainWindow {
             );
         }
 
-        let footer_index = 12 + state.configs.len() as isize;
+        let footer_index = 13 + state.configs.len() as isize;
         let edit = selected.map(|name| UiAction::Edit(core, name.to_owned()));
         let apply = selected
             .filter(|name| can_use_config && state.current.as_deref() != Some(*name))
@@ -520,11 +572,11 @@ impl MainWindow {
                         if state.update_error.is_some() {
                             "重试更新"
                         } else if state.installed {
-                            "检查并更新"
+                            "检查更新"
                         } else {
                             "安装核心"
                         },
-                        6,
+                        7,
                         can_update.then_some(UiAction::Run(Action::Update(core))),
                         !state.installed,
                         colors,
@@ -576,7 +628,7 @@ impl MainWindow {
                     )
                     .child(action_button(
                         "打开目录",
-                        10,
+                        11,
                         Some(UiAction::OpenFolder(core)),
                         false,
                         colors,
@@ -609,7 +661,7 @@ impl MainWindow {
         {
             let selected = self.selected_theme() == theme;
             choices = choices.child(
-                control(label, 4 + index as isize, colors, false)
+                control(label, 5 + index as isize, colors, false)
                     .h(px(28.))
                     .px(px(8.))
                     .when(selected, |el| {
@@ -680,7 +732,7 @@ impl MainWindow {
                         .bg(colors.on_accent),
                 );
             rows = rows.child(
-                control(label, 7 + index as isize, colors, false)
+                control(label, 8 + index as isize, colors, false)
                     .min_h(px(68.))
                     .px(px(12.))
                     .py(px(10.))
@@ -733,6 +785,7 @@ impl Render for MainWindow {
         let colors = Colors::new(dark);
         let page = match self.page {
             Page::Core(core) => self.core_page(core, colors, cx),
+            Page::Logs => self.logs_page(colors, cx),
             Page::Settings => self.settings_page(colors, cx),
         };
         div()
@@ -765,6 +818,9 @@ impl Render for MainWindow {
                             cx.notify();
                         }
                     }
+                    cx.stop_propagation();
+                } else if view.page == Page::Logs && view.logs.scroll_key(&event.keystroke.key) {
+                    cx.notify();
                     cx.stop_propagation();
                 }
             }))
@@ -806,13 +862,9 @@ impl Render for MainWindow {
                                 )),
                         )
                     })
-                    .when_some(
-                        self.command_error
-                            .clone()
-                            .or_else(|| self.snapshot.error.clone())
-                            .or_else(|| self.snapshot.dns_task_warning.clone()),
-                        |el, message| el.child(error_message(message, colors)),
-                    )
+                    .when_some(self.visible_error().cloned(), |el, message| {
+                        el.child(error_message(message, colors))
+                    })
                     .child(div().flex_1().min_h(px(0.)).child(page)),
             )
     }
@@ -979,6 +1031,7 @@ struct Colors {
     hover: Rgba,
     disabled: Rgba,
     switch_off: Rgba,
+    warning: Rgba,
     error: Rgba,
     error_bg: Rgba,
 }
@@ -1015,6 +1068,7 @@ impl Colors {
             hover: tone(0xe9edf3, 0x303740),
             disabled: tone(0x858c98, 0x7f8998),
             switch_off: tone(0x737c8b, 0x657184),
+            warning: tone(0x8a6500, 0xf2cc60),
             error: tone(0xa62a36, 0xffadb5),
             error_bg: tone(0xfff0f1, 0x3c292e),
         }

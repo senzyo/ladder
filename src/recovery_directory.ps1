@@ -25,7 +25,7 @@ if (!$acl.AreAccessRulesProtected -or
     (Sorted-Aces $acl.GetSecurityDescriptorSddlForm($access)) -cne (Sorted-Aces $aces)) { exit 3 }
 
 $allowed = @('ladder-dns-recovery.exe', 'ladder-dns-recovery.tmp', 'dns-task.xml',
-             'dns-session.lock', 'dns-recovery.json', 'dns-recovery.tmp')
+             'dns-session.lock', 'dns-recovery.json', 'dns-recovery.tmp', 'app.log')
 $fileAces = $aces.Replace(';OICI;', ';;')
 foreach ($file in [IO.Directory]::EnumerateFileSystemEntries($path)) {
     # A boot recovery finishing concurrently can have just removed its journal.

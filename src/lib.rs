@@ -1,6 +1,7 @@
 mod core_output;
 mod desktop;
 mod dns;
+mod logging;
 mod managed_child;
 mod runtime;
 mod scheduler;
@@ -135,6 +136,7 @@ fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Res
     let mut window = None;
     let startup = runtime.snapshot();
     if !startup.settings.minimize_to_tray
+        || startup.error.is_some()
         || startup.dns_recovery_error.is_some()
         || startup.dns_task_warning.is_some()
     {
@@ -145,6 +147,7 @@ fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Res
         while let Ok(action) = incoming.recv().await {
             match action {
                 TrayAction::Exit => {
+                    logging::info("app", "正在退出 Ladder");
                     let worker = runtime.clone();
                     let result = cx
                         .background_executor()
@@ -209,6 +212,17 @@ fn run() -> Result<()> {
     }
     let exe = std::env::current_exe()?;
     let base = exe.parent().context("无法定位 Ladder 程序目录")?.to_owned();
+    // 日志失败不能阻止核心管理或 DNS 恢复；界面通过 warning 展示故障。
+    let _ = logging::init(&base.join("app.log"));
+    logging::info(
+        "app",
+        format_args!(
+            "Ladder {} 启动，架构 {}，进程 {}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::ARCH,
+            std::process::id()
+        ),
+    );
     let (dns, warning) = scheduler::desktop_dns(&base);
     let runtime = Runtime::open_with_dns(base, dns, warning).map_err(anyhow::Error::msg)?;
     let cleaned = Rc::new(Cell::new(false));
@@ -225,14 +239,17 @@ fn run() -> Result<()> {
     {
         report_dns_on_exit(&message);
     }
+    logging::info("app", "Ladder 已退出");
     Ok(())
 }
 
 fn report(message: &str) {
+    logging::error("app", message);
     message_box(message, MB_ICONERROR);
 }
 
 fn report_dns_on_exit(message: &str) {
+    logging::warn("dns", message);
     message_box(
         &format!("核心已停止，DNS 尚未恢复。下次打开 Ladder 时会再次尝试恢复。\n\n{message}"),
         MB_ICONWARNING,
@@ -252,6 +269,7 @@ fn message_box(message: &str, icon: u32) {
 }
 
 pub fn launch() -> ExitCode {
+    logging::install_panic_hook();
     if std::env::args_os().nth(1).as_deref() == Some(scheduler::BOOT_ARGUMENT.as_ref()) {
         return match scheduler::restore_on_boot() {
             Ok(()) => ExitCode::SUCCESS,

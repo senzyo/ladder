@@ -20,6 +20,7 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows_sys::Win32::UI::Shell::{CSIDL_PROGRAM_FILES, CSIDL_SYSTEM, SHGetFolderPathW};
 
 use crate::dns::DnsLease;
+use crate::logging;
 
 pub(crate) const BOOT_ARGUMENT: &str = "--restore-dns-on-boot";
 const TASK_NAME: &str = "Reset_DNS_On_Boot";
@@ -130,6 +131,7 @@ fn can_use_portable(directory: &Path, portable: &Path) -> bool {
 
 pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
     let unavailable = |error: anyhow::Error| {
+        logging::warn("dns", format_args!("机器级 DNS 恢复不可用：{error:#}"));
         (
             DesktopDns::Unavailable(format!(
                 "无法安全访问机器级 DNS 恢复记录。请检查恢复目录，或等待占用结束后重试：{error:#}"
@@ -143,6 +145,7 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
     };
     if let Err(error) = prepare_directory(&directory) {
         return if can_use_portable(&directory, portable) {
+            logging::warn("dns", format_args!("使用便携 DNS 恢复记录：{error:#}"));
             (
                 DesktopDns::Portable(DnsLease::new(portable)),
                 Some(format!(
@@ -165,6 +168,11 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
         .and_then(|exe| ensure_boot_dns_reset_task(&exe, &directory))
         .err()
         .map(|error| format!("更新开机 DNS 恢复任务失败：{error:#}"));
+    if let Some(message) = &warning {
+        logging::warn("dns", message);
+    } else {
+        logging::info("dns", "机器级 DNS 恢复目录与开机任务已就绪");
+    }
     (
         DesktopDns::Machine {
             lease: DnsLease::with_legacy(&directory, portable),
@@ -178,9 +186,17 @@ pub(crate) fn restore_on_boot() -> Result<()> {
     let directory = recovery_directory()?;
     let session = session_file(&directory)?;
     match session.try_lock() {
-        Ok(()) => DnsLease::new(&directory)
-            .restore_if_pending()
-            .map_err(anyhow::Error::msg),
+        Ok(()) => {
+            // 取得快照锁后才覆盖本次日志，避免与其他恢复进程争用文件。
+            let _ = logging::init(&directory.join("app.log"));
+            logging::info("dns", "开始开机 DNS 恢复");
+            let result = DnsLease::new(&directory).restore_if_pending();
+            match &result {
+                Ok(()) => logging::info("dns", "开机 DNS 恢复完成"),
+                Err(message) => logging::error("dns", message),
+            }
+            result.map_err(anyhow::Error::msg)
+        }
         // 已经打开的 Ladder 会在启动时恢复，之后由它独占正在运行的核心快照。
         Err(TryLockError::WouldBlock) => Ok(()),
         Err(TryLockError::Error(error)) => Err(error.into()),
@@ -336,6 +352,7 @@ mod tests {
             );
         check_directory(&machine, &script).unwrap();
         fs::write(machine.join("dns-recovery.json"), b"[]").unwrap();
+        fs::write(machine.join("app.log"), b"test session\n").unwrap();
         check_directory(&machine, &script).unwrap();
     }
 

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::dns::DnsLease;
+use crate::logging;
 use crate::managed_child::ManagedChild;
 use crate::scheduler::{DesktopDns, desktop_dns};
 use crate::update::{self, PreparedUpdate, UpdateChannel, UpdateProgress};
@@ -212,7 +213,15 @@ impl Runtime {
         dns: DesktopDns,
         task_warning: Option<String>,
     ) -> Result<Self, String> {
+        logging::info("dns", "检查启动时待恢复的 DNS 记录");
         let recovery_error = dns.lease().and_then(DnsLease::restore_if_pending).err();
+        match &recovery_error {
+            Some(error) => logging::error("dns", format_args!("启动时恢复 DNS 失败：{error}")),
+            None => logging::info("dns", "启动时 DNS 恢复检查完成"),
+        }
+        if let Some(warning) = &task_warning {
+            logging::warn("dns", warning);
+        }
         Self::start_worker(root, dns, recovery_error.clone(), task_warning.clone()).map_err(
             |mut error| {
                 if let Some(message) = recovery_error {
@@ -271,6 +280,7 @@ impl Runtime {
             .name("ladder-cores".into())
             .spawn(move || worker.run(rx))
             .map_err(|e| format!("创建核心管理线程失败: {e}"))?;
+        logging::info("runtime", "核心管理线程已启动");
         Ok(Self {
             root,
             state,
@@ -280,7 +290,11 @@ impl Runtime {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        self.state.lock().unwrap().clone()
+        let mut snapshot = self.state.lock().unwrap().clone();
+        if snapshot.error.is_none() {
+            snapshot.error = logging::warning();
+        }
+        snapshot
     }
 
     pub fn config_dir(&self, core: Core) -> PathBuf {
@@ -353,6 +367,7 @@ impl Runtime {
 
     /// 核心均已停止时返回可选的 DNS 恢复提示，失败的记录保留到下次启动。
     pub fn shutdown(&self) -> Result<Option<String>, String> {
+        logging::info("runtime", "请求停止核心并退出");
         self.quitting.store(true, Ordering::Release);
         let (tx, rx) = mpsc::channel();
         self.tx
@@ -375,12 +390,27 @@ impl Runtime {
         state.update = Some(UpdateProgress::Checking);
         state.update_error = None;
         state.update_message = None;
+        logging::info(
+            "update",
+            format_args!("{} 开始检查更新，通道：{channel:?}", core.label()),
+        );
         let runtime = self.clone();
         thread::Builder::new()
             .name(format!("{}-update", core.label()))
             .spawn(move || {
                 let result = runtime.prepare_update(core, channel);
                 if let Err(error) = result {
+                    if runtime.quitting.load(Ordering::Acquire) {
+                        logging::info(
+                            "update",
+                            format_args!("{} 更新已取消：{error}", core.label()),
+                        );
+                    } else {
+                        logging::error(
+                            "update",
+                            format_args!("{} 更新失败：{error}", core.label()),
+                        );
+                    }
                     let mut snapshot = runtime.state.lock().unwrap();
                     let state = snapshot.core_mut(core);
                     state.update = None;
@@ -392,6 +422,10 @@ impl Runtime {
             })
             .map_err(|e| {
                 state.update = None;
+                logging::error(
+                    "update",
+                    format_args!("{} 创建更新线程失败：{e}", core.label()),
+                );
                 format!("创建更新线程失败: {e}")
             })?;
         Ok(())
@@ -399,6 +433,12 @@ impl Runtime {
 
     fn prepare_update(&self, core: Core, channel: UpdateChannel) -> Result<(), String> {
         let version = update::local_version(core, &self.root);
+        if let Err(error) = &version {
+            logging::warn(
+                "update",
+                format_args!("{} 读取本地版本失败：{error}", core.label()),
+            );
+        }
         let local = version.as_ref().ok().and_then(|value| value.as_deref());
         {
             let mut snapshot = self.state.lock().unwrap();
@@ -413,7 +453,21 @@ impl Runtime {
             local,
             &self.quitting,
             |progress| {
-                self.state.lock().unwrap().core_mut(core).update = Some(progress);
+                let mut snapshot = self.state.lock().unwrap();
+                let state = snapshot.core_mut(core);
+                if state.update.as_ref().map(std::mem::discriminant)
+                    != Some(std::mem::discriminant(&progress))
+                {
+                    let phase = match progress {
+                        UpdateProgress::Checking => "检查发布信息",
+                        UpdateProgress::Downloading { .. } => "下载安装包",
+                        UpdateProgress::Verifying => "校验安装包",
+                        UpdateProgress::Extracting => "解压并验证核心",
+                        UpdateProgress::Installing => "安装核心",
+                    };
+                    logging::info("update", format_args!("{} {phase}", core.label()));
+                }
+                state.update = Some(progress);
             },
         )?;
         let Some(prepared) = prepared else {
@@ -421,6 +475,7 @@ impl Runtime {
             let state = snapshot.core_mut(core);
             state.update = None;
             state.update_message = Some("无需更新".into());
+            logging::info("update", format_args!("{} 无需更新", core.label()));
             return Ok(());
         };
         self.queue_prepared(core, prepared)
@@ -436,6 +491,10 @@ impl Runtime {
             if state.operation.is_none() {
                 state.operation = Some(CoreOperation::Updating);
                 state.update = Some(UpdateProgress::Installing);
+                logging::info(
+                    "update",
+                    format_args!("{} 更新准备完成，等待安装", core.label()),
+                );
                 return self
                     .tx
                     .send(Request::Prepared(core, prepared))
@@ -488,6 +547,7 @@ struct Worker {
 
 impl Worker {
     fn apply_update(&mut self, core: Core, mut prepared: PreparedUpdate) {
+        logging::info("update", format_args!("{} 开始安装核心", core.label()));
         self.poll(core);
         let old_version = self.state.lock().unwrap().core(core).version.clone();
         let result = self.replace_core(core, &mut prepared);
@@ -499,6 +559,17 @@ impl Worker {
         state.installed = core.executable(&self.root).is_file();
         match result {
             Ok(warning) => {
+                logging::info(
+                    "update",
+                    format_args!(
+                        "{} 安装完成，版本 {}，保持停止",
+                        core.label(),
+                        prepared.version
+                    ),
+                );
+                if let Some(warning) = &warning {
+                    logging::warn("update", format_args!("{} {warning}", core.label()));
+                }
                 state.version = Some(prepared.version.clone());
                 state.version_error = None;
                 state.update_error = warning;
@@ -506,6 +577,7 @@ impl Worker {
                 state.error = None;
             }
             Err(error) => {
+                logging::error("update", format_args!("{} 安装失败：{error}", core.label()));
                 state.version = old_version;
                 state.update_error = Some(error);
             }
@@ -535,6 +607,7 @@ impl Worker {
                 Core::Xray => self.saved.settings.auto_xray,
             };
             if auto {
+                logging::info("core", format_args!("{} 自动启动已启用", core.label()));
                 self.action(Action::Start(core));
             }
         }
@@ -545,6 +618,7 @@ impl Worker {
                 Ok(Request::Action(action)) => self.action(action),
                 Ok(Request::Prepared(core, prepared)) => self.apply_update(core, prepared),
                 Ok(Request::SetTheme(theme, reply)) => {
+                    logging::info("settings", format_args!("更改主题：{theme:?}"));
                     self.update_settings(|settings| settings.theme = theme);
                     let _ = reply.try_send(());
                 }
@@ -561,6 +635,7 @@ impl Worker {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    logging::warn("runtime", "核心管理请求通道已断开，停止托管核心");
                     let _ = self.stop_all();
                     break;
                 }
@@ -574,15 +649,27 @@ impl Worker {
                 last_scan = Instant::now();
             }
         }
+        logging::info("runtime", "核心管理线程已退出");
     }
 
     fn action(&mut self, action: Action) {
+        let operation = match &action {
+            Action::Start(core) => Some((*core, "启动")),
+            Action::Stop(core) => Some((*core, "停止")),
+            Action::Restart(core) => Some((*core, "重启")),
+            Action::Use(core, _) => Some((*core, "切换配置")),
+            _ => None,
+        };
+        if let Some((core, operation)) = operation {
+            logging::info("core", format_args!("{} 开始{operation}", core.label()));
+        }
         let (core, result) = match action {
             Action::RetryDns => {
                 self.retry_dns(desktop_dns);
                 return;
             }
             Action::Set(key, value) => {
+                logging::info("settings", format_args!("更改设置 {key:?}={value}"));
                 return self.update_settings(|settings| match key {
                     Setting::MinimizeToTray => settings.minimize_to_tray = value,
                     Setting::AutoSingBox => settings.auto_sing_box = value,
@@ -616,6 +703,14 @@ impl Worker {
             Action::Use(core, name) => (core, self.use_config(core, &name)),
             Action::Update(_) => unreachable!(),
         };
+        let (_, operation) = operation.unwrap();
+        match &result {
+            Ok(()) => logging::info("core", format_args!("{} {operation}操作完成", core.label())),
+            Err(error) => logging::error(
+                "core",
+                format_args!("{} {operation}失败：{error}", core.label()),
+            ),
+        }
         let mut snapshot = self.state.lock().unwrap();
         let status = snapshot.core_mut(core);
         status.operation = None;
@@ -631,17 +726,25 @@ impl Worker {
         let mut snapshot = self.state.lock().unwrap();
         match saved {
             Ok(()) => {
+                logging::info("settings", "软件设置已保存");
                 snapshot.settings = next.settings.clone();
                 self.saved = next;
                 snapshot.error = None;
             }
-            Err(e) => snapshot.error = Some(format!("保存软件设置失败: {e}")),
+            Err(e) => {
+                logging::error("settings", format_args!("保存软件设置失败：{e}"));
+                snapshot.error = Some(format!("保存软件设置失败: {e}"));
+            }
         }
     }
 
     fn set_update_channel(&mut self, core: Core, channel: UpdateChannel) {
         let mut snapshot = self.state.lock().unwrap();
         if snapshot.core(core).update.is_some() {
+            logging::warn(
+                "settings",
+                format_args!("{} 正在更新，版本通道未更改", core.label()),
+            );
             snapshot.error = Some("正在更新，版本通道未更改".into());
             return;
         }
@@ -652,6 +755,10 @@ impl Worker {
         }
         match next.store(&self.root) {
             Ok(()) => {
+                logging::info(
+                    "settings",
+                    format_args!("{} 版本通道已保存：{channel:?}", core.label()),
+                );
                 snapshot.settings = next.settings.clone();
                 self.saved = next;
                 let state = snapshot.core_mut(core);
@@ -659,7 +766,13 @@ impl Worker {
                 state.update_error = None;
                 snapshot.error = None;
             }
-            Err(e) => snapshot.error = Some(format!("保存版本通道失败: {e}")),
+            Err(e) => {
+                logging::error(
+                    "settings",
+                    format_args!("{} 保存版本通道失败：{e}", core.label()),
+                );
+                snapshot.error = Some(format!("保存版本通道失败: {e}"));
+            }
         }
     }
 
@@ -691,10 +804,21 @@ impl Worker {
             }
             match result {
                 Ok(files) => {
+                    if state.scan_error.is_some() {
+                        logging::info(
+                            "config",
+                            format_args!("{} 配置目录读取已恢复", core.label()),
+                        );
+                    }
                     state.configs = files;
                     state.scan_error = None;
                 }
-                Err(e) => state.scan_error = Some(e),
+                Err(e) => {
+                    if state.scan_error.as_deref() != Some(e.as_str()) {
+                        logging::error("config", format_args!("{} {e}", core.label()));
+                    }
+                    state.scan_error = Some(e);
+                }
             }
             let stamp = executable_stamp(&core.executable(&self.root));
             if self.version_files[core as usize] != stamp && state.update.is_none() {
@@ -716,12 +840,33 @@ impl Worker {
                                 && executable_stamp(&core.executable(&root)) == stamp
                             {
                                 match result {
-                                    Ok(version) => state.version = version,
-                                    Err(error) => state.version_error = Some(error),
+                                    Ok(version) => {
+                                        if let Some(version) = &version {
+                                            logging::info(
+                                                "core",
+                                                format_args!(
+                                                    "{} 本地版本：{version}",
+                                                    core.label()
+                                                ),
+                                            );
+                                        }
+                                        state.version = version;
+                                    }
+                                    Err(error) => {
+                                        logging::warn(
+                                            "core",
+                                            format_args!("{} 版本检测失败：{error}", core.label()),
+                                        );
+                                        state.version_error = Some(error);
+                                    }
                                 }
                             }
                         })
                     {
+                        logging::error(
+                            "core",
+                            format_args!("{} 创建版本检测线程失败：{error}", core.label()),
+                        );
                         state.version_error = Some(format!("创建版本检测线程失败: {error}"));
                     }
                 }
@@ -761,13 +906,22 @@ impl Worker {
         let child = ManagedChild::spawn(core, &self.root, &exe, &assets, config)
             .map_err(|e| format!("启动 {} 失败: {e}", core.label()))?;
         self.children[core as usize] = Some(child);
-        if hijack && let Err(error) = self.dns.lease().and_then(DnsLease::apply) {
-            let stopped = self.stop_process(core);
-            let _ = self.restore_dns();
-            return match stopped {
-                Ok(_) => Err(error),
-                Err(cleanup) => Err(format!("{error}；{cleanup}")),
-            };
+        logging::info("core", format_args!("{} 托管进程已创建", core.label()));
+        if hijack {
+            logging::info(
+                "dns",
+                format_args!("{} 请求劫持 DNS 到本地回环", core.label()),
+            );
+            if let Err(error) = self.dns.lease().and_then(DnsLease::apply) {
+                logging::error("dns", format_args!("劫持 DNS 失败：{error}"));
+                let stopped = self.stop_process(core);
+                let _ = self.restore_dns();
+                return match stopped {
+                    Ok(_) => Err(error),
+                    Err(cleanup) => Err(format!("{error}；{cleanup}")),
+                };
+            }
+            logging::info("dns", "DNS 劫持完成");
         }
         Ok(())
     }
@@ -781,17 +935,26 @@ impl Worker {
     }
 
     fn restore_dns(&self) -> Result<(), String> {
+        logging::info("dns", "开始恢复 DNS");
         let result = self.dns.lease().and_then(DnsLease::restore);
+        match &result {
+            Ok(()) => logging::info("dns", "DNS 恢复完成"),
+            Err(error) => logging::error("dns", format_args!("恢复 DNS 失败：{error}")),
+        }
         self.state.lock().unwrap().dns_recovery_error = result.as_ref().err().cloned();
         result
     }
 
     fn retry_dns(&mut self, reopen: impl FnOnce(&Path) -> (DesktopDns, Option<String>)) {
+        logging::info("dns", "收到重试恢复 DNS 请求");
         // 排队期间另一个操作可能已恢复 DNS，甚至已开始新一轮劫持。
         if self.state.lock().unwrap().dns_recovery_error.is_some() {
             if matches!(self.dns, DesktopDns::Unavailable(_)) {
                 let (dns, warning) = reopen(&self.root);
                 self.dns = dns;
+                if let Some(warning) = &warning {
+                    logging::warn("dns", warning);
+                }
                 self.state.lock().unwrap().dns_task_warning = warning;
             }
             let _ = self.restore_dns();
@@ -806,7 +969,11 @@ impl Worker {
                 .terminate()
                 .map_err(|e| format!("停止 {} 失败: {e}", core.label()))?;
         }
-        let reason = owned.take().and_then(|child| child.output.finish());
+        let reason = owned.take().and_then(|child| {
+            let reason = child.output.finish();
+            logging::info("core", format_args!("{} 托管进程树已停止", core.label()));
+            reason
+        });
         self.state.lock().unwrap().core_mut(core).running = false;
         Ok(reason)
     }
@@ -819,23 +986,34 @@ impl Worker {
             .collect();
         let previous_error = self.state.lock().unwrap().dns_recovery_error.clone();
         let dns_error = if running == 0 && previous_error.is_none() {
-            self.dns
+            let error = self
+                .dns
                 .lease()
                 .and_then(DnsLease::restore_if_pending)
-                .err()
+                .err();
+            if let Some(error) = &error {
+                logging::error("dns", format_args!("退出时检查待恢复 DNS 失败：{error}"));
+            }
+            error
         } else if failures.is_empty() || failures.len() < running {
             self.restore_dns().err()
         } else {
             previous_error
         };
         if failures.is_empty() {
+            logging::info("runtime", "所有托管核心已停止");
+            if dns_error.is_some() {
+                logging::warn("dns", "退出时仍有 DNS 恢复失败，恢复记录保留");
+            }
             Ok(dns_error)
         } else {
-            Err(failures
+            let error = failures
                 .into_iter()
                 .chain(dns_error)
                 .collect::<Vec<_>>()
-                .join("；"))
+                .join("；");
+            logging::error("runtime", format_args!("停止托管核心失败：{error}"));
+            Err(error)
         }
     }
 
@@ -846,8 +1024,13 @@ impl Worker {
         let status = match child.try_wait() {
             Ok(None) => return,
             Err(e) => {
-                self.state.lock().unwrap().core_mut(core).error =
-                    Some(format!("检查核心状态失败: {e}"));
+                let message = format!("检查核心状态失败: {e}");
+                let mut snapshot = self.state.lock().unwrap();
+                let state = snapshot.core_mut(core);
+                if state.error.as_deref() != Some(message.as_str()) {
+                    logging::error("core", format_args!("{} {message}", core.label()));
+                }
+                state.error = Some(message);
                 return;
             }
             Ok(Some(code)) => code,
@@ -856,13 +1039,19 @@ impl Worker {
         if result.is_ok() {
             let _ = self.restore_dns();
         }
-        self.state.lock().unwrap().core_mut(core).error = Some(match result {
+        let message = match result {
             Ok(reason) => format!(
                 "核心已退出 ({status}) 。{}",
                 reason.unwrap_or("请检查配置内容及核心所需的资源文件")
             ),
             Err(e) => format!("核心已退出 ({status}) 。{e}"),
-        });
+        };
+        let mut snapshot = self.state.lock().unwrap();
+        let state = snapshot.core_mut(core);
+        if state.error.as_deref() != Some(message.as_str()) {
+            logging::warn("core", format_args!("{} {message}", core.label()));
+        }
+        state.error = Some(message);
     }
 }
 
@@ -1045,6 +1234,9 @@ mod tests {
         assert!(error.contains("42"));
         assert!(error.contains("核心没有访问所需资源的权限"));
         assert!(!error.contains("PRIVATE_FIXTURE_VALUE"));
+        let logs = logging::recent().join("\n");
+        assert!(logs.contains("核心没有访问所需资源的权限"));
+        assert!(!logs.contains("PRIVATE_FIXTURE_VALUE"));
         assert!(runtime.snapshot().xray.running);
         runtime.send(Action::Start(Core::SingBox)).unwrap();
         let retry = failed(&runtime, Core::SingBox);
@@ -1415,6 +1607,11 @@ mod tests {
         let error = runtime.snapshot().dns_recovery_error.unwrap();
         assert!(error.contains("dns-recovery.json"));
         assert!(!error.contains("PRIVATE_FIXTURE_VALUE"));
+        assert!(
+            !logging::recent()
+                .iter()
+                .any(|line| line.contains("PRIVATE_FIXTURE_VALUE"))
+        );
         runtime
             .set_theme(ThemePreference::Dark)
             .unwrap()

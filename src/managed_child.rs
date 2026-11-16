@@ -147,7 +147,7 @@ impl ManagedChild {
         drop((stdin, stdout_write, stderr_write));
         Ok(Self {
             process,
-            output: CoreOutput::capture(stdout, stderr),
+            output: CoreOutput::capture(core, stdout, stderr),
         })
     }
 
