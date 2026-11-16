@@ -29,7 +29,7 @@ function Import-VcEnvironment {
     $targetArchitecture = if ($TargetArchitecture -eq 'arm64') { 'arm64' } else { 'x64' }
     $pair = if ($hostArchitecture -eq $targetArchitecture) { $hostArchitecture } else { "${hostArchitecture}_$targetArchitecture" }
     # cmd 只用于运行 VS 官方环境脚本，不执行文件删除或移动。
-    $environment = & $env:ComSpec /d /s /c "`"`"$vcvars`" $pair >nul && set`""
+    $environment = & $env:ComSpec /d /c "call `"$vcvars`" $pair >nul && set"
     if ($LASTEXITCODE -ne 0) { throw "无法加载 $pair 编译环境，请安装对应的 MSVC 组件。" }
     foreach ($line in $environment) {
         if ($line -match '^([^=]+)=(.*)$') {
