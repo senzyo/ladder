@@ -417,8 +417,6 @@ impl MainWindow {
         let can_use_config = idle && state.scan_error.is_none();
         let can_run = can_use_config && state.installed && current_exists;
         let connection_label = match state.operation {
-            Some(CoreOperation::Starting) => "启动中",
-            Some(CoreOperation::Stopping) => "停止中",
             Some(CoreOperation::Switching) => "切换中",
             _ if state.running => "停止核心",
             _ => "启动核心",

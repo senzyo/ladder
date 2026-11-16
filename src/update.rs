@@ -366,9 +366,7 @@ pub fn version_directory(core: Core, root: &Path, version: &str) -> Result<PathB
 }
 
 fn versions_directory(core: Core, root: &Path) -> Result<PathBuf, String> {
-    let core = core.core_dir(root);
-    check_directory(&core)?;
-    let directory = core.join("versions");
+    let directory = core.core_dir(root);
     check_directory(&directory)?;
     Ok(directory)
 }
@@ -1101,7 +1099,7 @@ mod tests {
                 ("sing-box-1.2.3-windows-amd64/empty-dir/", b""),
             ],
         );
-        let target = version_directory(core, root.path(), "1.2.3").unwrap();
+        let target = root.path().join("sing-box_core/1.2.3");
         let mut prepared = PreparedUpdate::new(core, root.path(), "1.2.3".into()).unwrap();
         prepared
             .extract(core, &archive, &AtomicBool::new(false))
@@ -1151,7 +1149,7 @@ mod tests {
             .extract(Core::Xray, &archive, &AtomicBool::new(false))
             .unwrap();
         prepared.install().unwrap();
-        let target = version_directory(Core::Xray, root.path(), "1.2.3").unwrap();
+        let target = root.path().join("xray_core/1.2.3");
         for (name, contents) in files {
             assert_eq!(fs::read(target.join(name)).unwrap(), *contents);
         }
@@ -1325,13 +1323,10 @@ mod tests {
             assert!(version_directory(Core::Xray, root.path(), version).is_err());
             assert!(delete_version(Core::Xray, root.path(), version).is_err());
         }
-        for depth in 0..3 {
+        for depth in 0..2 {
             let root = tempfile::tempdir().unwrap();
             let mut path = Core::Xray.core_dir(root.path());
             if depth > 0 {
-                path.push("versions");
-            }
-            if depth > 1 {
                 path.push("1.0.0");
             }
             fs::create_dir_all(path.parent().unwrap()).unwrap();

@@ -43,7 +43,7 @@ impl Core {
     #[cfg(test)]
     pub(crate) fn executable(self, root: &Path) -> PathBuf {
         self.core_dir(root)
-            .join("versions/1.0.0")
+            .join("1.0.0")
             .join(format!("{}.exe", self.label()))
     }
 }

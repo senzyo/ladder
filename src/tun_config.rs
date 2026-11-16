@@ -1,10 +1,9 @@
 use std::collections::hash_map::RandomState;
 use std::fs;
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tempfile::NamedTempFile;
@@ -128,13 +127,14 @@ fn config_key(core: Core, object: &Value, key: &str) -> String {
 }
 
 fn random_name() -> String {
-    static NEXT_NAME: AtomicU64 = AtomicU64::new(0);
-    let value = RandomState::new().hash_one((
-        std::process::id(),
-        NEXT_NAME.fetch_add(1, Ordering::Relaxed),
-        SystemTime::now(),
-    ));
-    format!("{TUN_PREFIX}{value:016x}")
+    let seed = RandomState::new();
+    let mut hasher = seed.build_hasher();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    hasher.write_u128(nanos);
+    format!("{TUN_PREFIX}{:06x}", hasher.finish() & 0xff_ffff)
 }
 
 // Xray 还允许 # 行注释。只遮盖字符串和已有注释以外的 #，保留错误行列位置。
@@ -214,7 +214,7 @@ mod tests {
         assert_ne!(first.names()[0], first.names()[1]);
         assert!(first.names().iter().all(|name| {
             name.starts_with(TUN_PREFIX)
-                && name.len() == TUN_PREFIX.len() + 16
+                && name.len() == TUN_PREFIX.len() + 6
                 && name[TUN_PREFIX.len()..]
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
