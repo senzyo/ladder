@@ -9,10 +9,12 @@ DNS 恢复继续保留机器级记录、便携降级，以及两处记录之间�
 ## 已确认的产品与界面方向
 
 - Ladder 是 Windows 上的 sing-box / Xray 轻量启动器。用户通过外部编辑器维护 JSON，应用负责配置选择、核心运行和必要的系统集成。
-- 沿用左侧导航与右侧内容的紧凑工具界面，固定为 **sing-box、Xray、应用日志、软件设置** 四页。“应用日志”与两个核心页面并列，“软件设置”保留在侧栏底部。
-- 每个核心页面只展示本核心的信息。用户不需要同时查看两个核心状态，不增加双核总览页或跨页状态面板。
+- 沿用左侧导航与右侧内容的紧凑工具界面，固定为 **sing-box、Xray、日志、软件设置** 四页。“日志”和“软件设置”依次放在侧栏底部。左上角仅显示 Ladder，不显示副标题和软件版本号。
+- 每个核心页面只展示本核心的信息，不增加双核总览页或跨页状态面板。核心运行时，在对应侧栏导航项右侧显示绿色小圆点，停止后隐藏。
 - 在软件设置页提供“跟随系统”“浅色”“深色”。新安装默认跟随 Windows 应用外观。手动选择立即应用到四页，并在下次打开 Ladder 时恢复。
 - 主题选择通过颜色区分选中状态，不显示对号，切换时不改变字号或字重。核心版本列表使用“稳定版 / 预览版”标签，分别提供下载、切换与删除。
+- 次要状态优先利用同一行的横向空间，避免无必要的副标题和换行。版本下载进度放在“稳定版 / 预览版”标签右侧，不额外增加一行。
+- 版本管理页不自动联网，点击标题右侧的 24px 蓝底白色刷新图标按钮才请求官方列表，悬停提示“获取版本列表”。当前使用版本置顶，其余按版本号降序；“已下载 / 全部”分段控件默认选中“已下载”，刷新不改变当前筛选。标题下分段控件居左，“打开目录”“返回配置页面”依次成组靠右。稳定版标签及侧栏运行圆点在深浅主题均使用亮绿 `#3fb950`，预览版标签均使用亮黄 `#d29922`。进度放在对应版本行内，已安装的当前版本右侧只显示加粗的“当前使用”；当前版本目录丢失时仍可重新下载。删除在原按钮内二次确认，点击其他位置或按 Esc 取消。
 - 先完成页面、交互和状态反馈，再加固后台能力、接入核心更新、完善发布。
 
 ## 需要保持的行为
@@ -280,6 +282,72 @@ Windows GUI 验收使用独立 package/lib/bin、实例锁和状态目录，`asI
 `cargo fmt --check`、`cargo clippy --locked --offline --all-targets -- -D warnings` 和 Debug 构建通过。使用 Computer Use 在一个可见的纯 UI 验收窗口中完成实际检查：浅色版本列表滚轮滚动、拖到最后一项、配置列表与日志滚动条显示、设置页和多个长错误的独立滚动、深色版本与设置、短列表无滚动条，以及版本页内外层滚动和轨道翻页。窗口采用测试数据与无副作用 stub，不编入真实 Runtime、DNS、TUN、恢复、核心进程或下载模块；验收后已关闭。证据见[浅色版本](../target/scrollbars-check/evidence/versions-light.png)、[拖到末尾](../target/scrollbars-check/evidence/versions-end.png)、[深色版本](../target/scrollbars-check/evidence/versions-dark.png)、[错误独立滚动](../target/scrollbars-check/evidence/error-end.png)和[内外层滚动](../target/scrollbars-check/evidence/nested-after.png)。本轮未完成最小窗口、完整 DPI 或键盘矩阵。
 
 此前运行完整测试得到 86 项通过、5 项超时失败、2 项忽略，期间用户报告断网，并通过重新连接无线网络、重启 ladder-main 恢复。测试会启动同名模拟核心，ladder-main 按进程名识别核心；未查明断网的直接原因，不能据此断言修改了真实 DNS。完整测试未重跑，后续此类进程测试应放在独立 Windows 沙盒。两轮隐藏 UI 检查分别因未完成窗口尺寸初始化、窗口可见性或焦点断言失败，均不算验收通过；最终以本轮 Computer Use 可见检查为证据。
+
+### 侧边栏精简与核心运行标识 · 2026-11-16
+
+左上角只保留 Ladder，移除“核心启动器”和底部软件版本号。“应用日志”导航改为“日志”，移至侧栏底部、“软件设置”上方。sing-box 和 Xray 导航项仅在对应核心运行时，于右侧显示 8px 绿色圆点；复用现有运行快照、刷新链路及浅深色运行状态颜色。
+
+`cargo fmt --check`、`git diff --check`、`cargo clippy --locked --offline --all-targets -- -D warnings` 和 `cargo build --locked --offline` 通过。独立只读复核确认导航与 Tab 顺序不变。本轮未启动应用或核心，未运行进程测试；实机画面及启停时圆点变化仍待验收。
+
+### 版本管理页调整 · 2026-11-16
+
+本轮取代此前“首次进入自动获取”和“本地版本优先”的交互：进入版本页只显示已有列表，手动点击“获取版本列表”才联网。当前版本置顶，其余使用现有数值版本比较降序排列，未新增发布时间字段或存储格式。“已下载版本”是独立于联网获取的筛选开关；“打开目录”定位对应核心根目录。标题下四按钮按约定横排，移除副标题；当前行右侧仅显示加粗文字，下载/切换用蓝字，删除及确认删除用红字。确认在原按钮内完成，点击其他位置或 Esc 取消。下载进度在该版本行中显示，重新获取列表时保留正在下载的行。浅色圆点改为更明亮的绿色，版本标签灰底略加深；浅深色的实心蓝、绿按钮均为白字。
+
+`cargo fmt --check`、`cargo clippy --locked --offline --all-targets -- -D warnings`、Debug 构建通过。三项精确过滤的纯测试覆盖 Release 解析、分页合并、当前置顶、已下载不额外优先，以及正式版/预览版数值排序；未运行启动进程的测试。独立复核发现切换后按钮消失会丢失键盘焦点，已在切换、确认删除及页面切换前移至持续存在的页面根焦点，复核通过。
+
+使用 Computer Use 在一个纯 UI 隔离窗口内完成 125% 缩放、默认 820×510 客户区的实际验收：[首次进入只显示本地版本](../target/version-ui-check/evidence/initial-local.png)、[浅色完整列表](../target/version-ui-check/evidence/list-light.png)、[已下载筛选](../target/version-ui-check/evidence/local-filter.png)、[原位确认](../target/version-ui-check/evidence/confirm.png)、[点击空白取消](../target/version-ui-check/evidence/outside-cancel.png)、[Esc 取消](../target/version-ui-check/evidence/escape.png)、[确认删除后](../target/version-ui-check/evidence/deleted.png)、[切换后的 Tab 焦点](../target/version-ui-check/evidence/switch-focus.png)、[浅色行内进度](../target/version-ui-check/evidence/progress-light.png)、[深色行内进度](../target/version-ui-check/evidence/progress-dark.png)、[Xray 首次进入无自动获取](../target/version-ui-check/evidence/xray-local.png)、[深色 Xray 列表](../target/version-ui-check/evidence/list-dark.png)及[返回配置](../target/version-ui-check/evidence/return.png)。隔离副本使用生产渲染代码和纯版本比较函数，Runtime 为内存测试数据，不编入真实核心、网络、DNS、TUN、任务或恢复模块；外部目录操作为 no-op。窗口已关闭，未改动本机网络。未验证真实下载/文件删除/目录打开，未完成最小窗口或完整 DPI 矩阵。
+
+### 下载进度同排显示 · 2026-11-16
+
+将版本下载进度移到“稳定版 / 预览版”标签右侧，放在同一行；进度不换行、不额外增加版本行高度。sing-box、Xray 共用此布局。格式检查和 Debug 构建通过；在纯 UI 隔离窗口中，以 125% 缩放、660×440 最小客户区检查了[浅色](../target/version-ui-check/evidence/inline-progress-light-min.png)和[深色](../target/version-ui-check/evidence/inline-progress-dark-min.png)，进度完整显示，右侧按钮仍可见。未启动真实核心或网络操作，验收窗口已关闭。
+
+### 标题旁刷新按钮 · 2026-11-16
+
+获取列表入口改为版本标题右侧的 30px 蓝底白色刷新图标按钮，标题下只保留筛选、打开目录和返回配置。刷新图标用内置矢量路径绘制，不依赖外部资源或字体；悬停显示“获取版本列表”，获取期间禁用重复点击。两个核心共用布局。格式检查、Clippy 和 Debug 构建通过；纯 UI 隔离窗口核对了[浅色图标位置](../target/version-ui-check/evidence/refresh-button-light.png)、[点击获取与提示](../target/version-ui-check/evidence/refresh-button-loaded.png)、[深色](../target/version-ui-check/evidence/refresh-button-dark.png)及[Xray 布局](../target/version-ui-check/evidence/refresh-button-xray.png)。未启动真实核心或网络操作，验收窗口已关闭。
+
+### 刷新按钮缩小与返回入口右对齐 · 2026-11-16
+
+刷新按钮从 30px 缩至 24px，白色矢量图标从 18px 等比缩至 16px。“返回配置页面”在工具栏单独靠右，左侧筛选与目录按钮保持 8px 间距。格式检查、Debug 构建通过；在纯 UI 隔离窗口中完成[实际布局核对](../target/version-ui-check/evidence/small-refresh-right.png)，未启动真实核心或改动网络，窗口已关闭。
+
+### 当前版本高亮铺满整行 · 2026-11-16
+
+修复版本列表为滚动条保留独立右侧列而截断高亮的问题。版本行现在占满列表宽度，滚动条覆盖在右侧，行右内距保留文字和按钮的避让空间；不改其他滚动区。格式检查、Clippy 和 Debug 构建通过。纯 UI 隔离窗口实际核对[无滚动条](../target/version-ui-check/evidence/full-highlight-short.png)、[有滚动条](../target/version-ui-check/evidence/full-highlight-long.png)、[滚动后](../target/version-ui-check/evidence/full-highlight-scroll.png)及[深色](../target/version-ui-check/evidence/full-highlight-dark.png)，高亮均延伸至列表右边界，滚动条区域滚轮操作正常。窗口已关闭，未启动核心或改动网络。
+
+### 默认已下载与分段筛选 · 2026-11-16
+
+两个核心的版本列表默认选中“已下载”，原筛选按钮改为“已下载 / 全部”分段控件，沿用主题选择器的样式。选择直接设置筛选值，重复选择当前项不反转、不重置滚动；两个核心在本次运行中分别保留选择。刷新不改变当前筛选，切换筛选仍取消删除确认并回到列表顶部；Tab 顺序同步调整。
+
+确认并补充文档：远端版本列表只在本次运行内存中保存，没有 TTL，不写入磁盘；切页及隐藏到托盘保留，完全退出后清除。手动刷新重新请求第一页，失败保留已有结果。本轮未修改缓存策略。
+
+格式检查、`cargo clippy --locked --offline --all-targets -- -D warnings`、Debug 构建和两项精确过滤的纯测试（分页合并与版本排序）通过，独立增量复核未发现待修复问题。纯 UI 隔离窗口在 125% 缩放下验证了[默认已下载](../target/version-ui-check/evidence/segmented-default.png)、刷新保持筛选、[全部列表](../target/version-ui-check/evidence/segmented-all.png)、重复选择不反转、两个核心独立状态、[Tab/Shift+Tab 与 Enter/空格](../target/version-ui-check/evidence/segmented-keyboard.png)，以及 660×440 最小客户区的[浅色](../target/version-ui-check/evidence/segmented-min-light.png)和[深色](../target/version-ui-check/evidence/segmented-min-dark.png)布局。隔离窗口已关闭；未启动真实核心或改动网络，未重跑进程测试、真实联网下载、完整 DPI 矩阵及 Release 构建。
+
+### 目录按钮右对齐与 GitHub 标签配色 · 2026-11-16
+
+“打开目录”移到“返回配置页面”左侧，两按钮以 8px 间距成组靠右，筛选控件独立居左，Tab 顺序保持不变。版本标签使用独立颜色字段：稳定版浅/深色为 `#1a7f37` / `#3fb950`，预览版为 `#9a6700` / `#d29922`，对应 [GitHub Primer 的 success 与 attention 前景色](https://primer.style/product/getting-started/react/theme-reference/)。浅色标签背景改为 [Primer 的 bgColor-muted](https://primer.style/product/primitives/color/) `#f6f8fa`，深色背景保留 `#1c1e22`；文字对比度分别为 4.77、4.57、6.57、6.61。运行状态、侧栏圆点和 WARN 日志颜色保持原值。
+
+`cargo fmt --check`、Clippy（全部 targets、warnings 作为错误）、Debug 构建及独立增量复核通过。纯 UI 隔离窗口在 125% 缩放、660×440 最小客户区下核对了[浅色](../target/version-ui-check/evidence/github-labels-light.png)和[深色](../target/version-ui-check/evidence/github-labels-dark.png)：目录/返回位置、稳定版与预览版颜色、筛选及滚动区布局正常。窗口已关闭；本轮未运行真实核心、进程测试或真实网络操作，未重跑完整 DPI 矩阵及 Release 构建。
+
+### 返回按钮视觉高度校正 · 2026-11-16
+
+核对源码及前轮截图：目录和返回按钮原本均为 30px；125% 缩放下两者外边界均为 37 个物理像素。蓝底边框与填充同色，比浅色描边显高。本轮仅将“返回配置页面”局部改为 28px，上下各内收 1px，保留蓝底、字号和容器居中对齐；其他按钮及点击行为不变。
+
+格式检查、Clippy、纯 UI 隔离构建及独立增量复核通过；在 125% 缩放、660×440 最小客户区验证了[浅色](../target/version-ui-check/evidence/equal-button-height-light.png)与[深色](../target/version-ui-check/evidence/equal-button-height-dark.png)的视觉高度和文字对齐。隔离窗口已关闭。常规 Debug 构建最初因运行中的 `target/debug/ladder.exe` 被占用未能覆盖，用户退出后重试成功，调试版已更新；未运行真实核心、进程测试或修改网络。
+
+### 侧栏运行圆点采用 Primer 绿色 · 2026-11-16
+
+侧栏运行状态圆点采用与稳定版标签一致的 GitHub Primer success 前景色：浅色 `#1a7f37`、深色 `#3fb950`。仅修改 `running_dot` 色值，圆点大小、显示条件及其他状态颜色不变。独立复核确认，在侧栏普通、选中、悬停背景上的深浅色对比度均高于 3:1（最低 4.30:1）。格式检查、Clippy 和 Debug 构建通过，调试版已更新；本轮未重复 GUI 实测、未启动核心或修改网络。
+
+### 精简版本提示与收紧分段筛选 · 2026-11-16
+
+移除切换、下载、删除成功提示及空列表文案，同时删除已无用途的成功消息状态；错误信息、行内下载进度和刷新悬停提示继续保留。“已下载 / 全部”外层内边距从 2px 减为 1px，选项高度从 28px 减为 26px、最小宽度从 64px 减为 60px、左右内边距从 10px 减为 8px，字号保持 13px。整体高度从 34px 收至 30px，与右侧按钮协调。
+
+格式检查、Clippy（全部 targets、warnings 作为错误）、Debug 构建及独立增量复核通过。纯 UI 隔离窗口在 125% 缩放、660×440 最小客户区核对了[浅色](../target/version-ui-check/evidence/compact-filter-light.png)、[深色](../target/version-ui-check/evidence/compact-filter-dark.png)、筛选切换，以及[已下载为空](../target/version-ui-check/evidence/empty-downloaded.png)和[全部为空](../target/version-ui-check/evidence/empty-all.png)：文字未裁切，空列表无文案。验收窗口已关闭；未启动真实核心或修改网络，未重跑完整 DPI 矩阵及 Release 构建。
+
+### 提交前审查 · 2026-11-16
+
+审查发现，已保存的当前版本目录被外部移走后，远端列表中的同版本仍被标为“当前使用”且缺少下载入口。仅将已安装且匹配选择的版本标为当前版本，使缺失目录的版本可重新下载。用户确认保留当前亮色：深浅主题统一使用稳定版/运行圆点 `#3fb950`、预览版 `#d29922`。这一决定取代前文分主题配色要求；前文色值及对比度为当时的历史验收记录。
+
+规范与需求两项独立复审均无未解决问题。格式检查、Clippy、Debug 构建及三项精确过滤的纯逻辑测试（发布列表解析、分页合并、当前版本置顶与版本号排序）通过。纯 UI 隔离窗口验证了[缺失版本的下载入口](../target/version-ui-check/evidence/missing-current-download.png)、[点击后的模拟进度](../target/version-ui-check/evidence/missing-current-downloading.png)及[模拟下载完成后的当前版本](../target/version-ui-check/evidence/missing-current-restored.png)。窗口已关闭，未运行真实核心、联网下载或会修改本机网络的测试。
 
 ## 后续开发注意点
 

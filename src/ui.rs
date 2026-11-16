@@ -2,8 +2,9 @@ use crate::desktop;
 use crate::runtime::{Action, Core, CoreOperation, Runtime, Setting, Snapshot, ThemePreference};
 use crate::update::{UpdateChannel, UpdateProgress};
 use gpui::{
-    App, Context, Div, ElementId, FocusHandle, FontWeight, Rgba, ScrollHandle, SharedString,
-    Stateful, Task, Timer, Window, WindowAppearance, div, prelude::*, px, rgb, rgba,
+    App, Context, Div, ElementId, FocusHandle, FontWeight, PathBuilder, Rgba, ScrollHandle,
+    SharedString, Stateful, Task, Timer, Window, WindowAppearance, canvas, div, point, prelude::*,
+    px, rgb, rgba,
 };
 use std::{
     collections::HashMap,
@@ -38,10 +39,11 @@ enum FeedbackScope {
 enum UiAction {
     Run(Action),
     OpenFolder(Core),
+    OpenCoreFolder(Core),
     Edit(Core, String),
     ShowVersions(Core, bool),
+    SetDownloadedOnly(Core, bool),
     ConfirmDelete(Core, String),
-    CancelDelete,
 }
 
 pub(crate) struct MainWindow {
@@ -54,6 +56,7 @@ pub(crate) struct MainWindow {
     core_page_scroll: [ScrollHandle; 2],
     pending_theme: Option<(ThemePreference, Task<()>)>,
     show_versions: [bool; 2],
+    downloaded_only: [bool; 2],
     version_focus: [HashMap<String, [FocusHandle; 2]>; 2],
     version_scroll: [ScrollHandle; 2],
     version_page_scroll: [ScrollHandle; 2],
@@ -94,6 +97,7 @@ impl MainWindow {
             core_page_scroll: Default::default(),
             pending_theme: None,
             show_versions: [false; 2],
+            downloaded_only: [true; 2],
             version_focus: Default::default(),
             version_scroll: Default::default(),
             version_page_scroll: Default::default(),
@@ -179,33 +183,35 @@ impl MainWindow {
                 | Action::DeleteVersion(core, _),
             )
             | UiAction::ShowVersions(core, _)
+            | UiAction::OpenCoreFolder(core)
+            | UiAction::SetDownloadedOnly(core, _)
             | UiAction::ConfirmDelete(core, _) => FeedbackScope::Versions(*core),
             UiAction::Run(Action::Set(..)) => FeedbackScope::Settings,
             UiAction::Run(Action::RetryDns) => FeedbackScope::Settings,
-            UiAction::CancelDelete => {
-                self.confirm_delete = None;
-                cx.notify();
-                return;
-            }
         };
         let result = match action {
             UiAction::ShowVersions(core, show) => {
                 self.show_versions[core_index(core)] = show;
                 self.confirm_delete = None;
-                let state = self.snapshot.core(core);
-                if show && !state.versions_loaded && !state.versions_loading {
-                    self.runtime.send(Action::RefreshVersions(core))
-                } else {
-                    cx.notify();
+                cx.notify();
+                return;
+            }
+            UiAction::SetDownloadedOnly(core, downloaded_only) => {
+                let index = core_index(core);
+                if self.downloaded_only[index] == downloaded_only {
                     return;
                 }
+                self.downloaded_only[index] = downloaded_only;
+                self.confirm_delete = None;
+                self.version_scroll[index].set_offset(gpui::point(px(0.), px(0.)));
+                cx.notify();
+                return;
             }
             UiAction::ConfirmDelete(core, version) => {
                 self.confirm_delete = Some((core, version));
                 cx.notify();
                 return;
             }
-            UiAction::CancelDelete => unreachable!(),
             UiAction::Run(action) => {
                 self.confirm_delete = None;
                 self.runtime.send(action)
@@ -213,6 +219,14 @@ impl MainWindow {
             UiAction::OpenFolder(core) => {
                 return Self::open_external(
                     self.runtime.config_dir(core),
+                    desktop::open_folder,
+                    scope,
+                    cx,
+                );
+            }
+            UiAction::OpenCoreFolder(core) => {
+                return Self::open_external(
+                    self.runtime.core_dir(core),
                     desktop::open_folder,
                     scope,
                     cx,
@@ -303,6 +317,7 @@ impl MainWindow {
     fn navigation(&self, colors: Colors, cx: &Context<Self>) -> Div {
         let item = |page, label: &'static str, index| {
             let selected = self.page == page;
+            let running = matches!(page, Page::Core(core) if self.snapshot.core(core).running);
             control(label, index, colors, false)
                 .w_full()
                 .h(px(38.))
@@ -320,7 +335,16 @@ impl MainWindow {
                         .rounded(px(2.))
                         .when(selected, |el| el.bg(colors.accent)),
                 )
-                .child(label)
+                .child(div().flex_1().child(label))
+                .when(running, |el| {
+                    el.child(
+                        div()
+                            .size(px(8.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(colors.running_dot),
+                    )
+                })
                 .on_click(cx.listener(move |view, _, _, cx| {
                     view.page = page;
                     view.confirm_delete = None;
@@ -344,27 +368,15 @@ impl MainWindow {
                 div()
                     .px(px(12.))
                     .mb(px(20.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(20.))
-                            .child("Ladder"),
-                    )
-                    .child(caption("核心启动器", colors)),
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(20.))
+                    .child("Ladder"),
             )
             .child(item(Page::Core(Core::SingBox), "sing-box", 1))
             .child(item(Page::Core(Core::Xray), "Xray", 2))
-            .child(item(Page::Logs, "应用日志", 3))
             .child(div().flex_1())
+            .child(item(Page::Logs, "日志", 3))
             .child(item(Page::Settings, "软件设置", 4))
-            .child(
-                caption(format!("v{}", env!("CARGO_PKG_VERSION")), colors)
-                    .px(px(12.))
-                    .mt(px(8.)),
-            )
     }
 
     fn core_page(&self, core: Core, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
@@ -673,61 +685,74 @@ impl MainWindow {
     fn versions_page(&self, core: Core, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
         let state = self.snapshot.core(core);
         let can_manage = state.operation.is_none() && state.update.is_none();
+        let downloaded_only = self.downloaded_only[core_index(core)];
+        let versions: Vec<_> = state
+            .versions
+            .iter()
+            .filter(|version| !downloaded_only || version.installed)
+            .collect();
         let mut rows = div()
             .id(("version-list", core_index(core)))
             .flex_1()
             .min_h(px(0.))
             .flex()
             .flex_col();
-        for (index, version) in state.versions.iter().enumerate() {
-            let current = state.selected_version.as_ref() == Some(&version.version);
-            let downloading = state.update.is_some()
-                && state.downloading_version.as_ref() == Some(&version.version);
+        for (index, version) in versions.iter().enumerate() {
+            let current =
+                version.installed && state.selected_version.as_ref() == Some(&version.version);
+            let progress = state
+                .update
+                .as_ref()
+                .filter(|_| state.downloading_version.as_ref() == Some(&version.version));
             let confirming = self
                 .confirm_delete
                 .as_ref()
                 .is_some_and(|(target, name)| *target == core && name == &version.version);
             let (label, color) = match version.channel {
-                UpdateChannel::Stable => ("稳定版", colors.running),
-                UpdateChannel::Preview => ("预览版", colors.warning),
+                UpdateChannel::Stable => ("稳定版", colors.version_stable),
+                UpdateChannel::Preview => ("预览版", colors.version_preview),
             };
-            let actions = if confirming {
-                vec![
-                    (
-                        "确认删除",
-                        can_manage.then_some(UiAction::Run(Action::DeleteVersion(
-                            core,
-                            version.version.clone(),
-                        ))),
-                    ),
-                    ("取消", Some(UiAction::CancelDelete)),
-                ]
+            let actions = if current {
+                vec![]
             } else if version.installed {
                 vec![
                     (
-                        if current { "当前使用" } else { "切换" },
-                        (can_manage && !current).then_some(UiAction::Run(Action::SwitchVersion(
+                        "切换",
+                        can_manage.then_some(UiAction::Run(Action::SwitchVersion(
                             core,
                             version.version.clone(),
                         ))),
                     ),
                     (
-                        "删除",
-                        (can_manage && !current)
-                            .then_some(UiAction::ConfirmDelete(core, version.version.clone())),
+                        if confirming { "确认删除" } else { "删除" },
+                        can_manage.then(|| {
+                            if confirming {
+                                UiAction::Run(Action::DeleteVersion(core, version.version.clone()))
+                            } else {
+                                UiAction::ConfirmDelete(core, version.version.clone())
+                            }
+                        }),
                     ),
                 ]
             } else {
                 vec![(
-                    if downloading { "下载中" } else { "下载" },
+                    if progress.is_some() {
+                        "下载中"
+                    } else {
+                        "下载"
+                    },
                     (can_manage && version.release_tag.is_some()).then_some(UiAction::Run(
                         Action::DownloadVersion(core, version.version.clone()),
                     )),
                 )]
             };
-            let mut buttons = div().flex().flex_shrink_0().gap(px(8.));
+            let mut buttons = div().flex().items_center().flex_shrink_0().gap(px(8.));
+            if current {
+                buttons = buttons.child(div().font_weight(FontWeight::BOLD).child("当前使用"));
+            }
             for (slot, (label, action)) in actions.into_iter().enumerate() {
-                let tab_index = 8 + (index * 2 + slot) as isize;
+                let tab_index = 10 + (index * 2 + slot) as isize;
+                let enabled = action.is_some();
                 let focus = self.version_focus[core_index(core)][&version.version][slot]
                     .clone()
                     .tab_stop(action.is_some())
@@ -740,7 +765,19 @@ impl MainWindow {
                             version.version
                         )))
                         .track_focus(&focus)
-                        .when(confirming && slot == 0, |el| el.text_color(colors.error)),
+                        .when(enabled, |el| {
+                            el.text_color(if slot == 1 {
+                                colors.error
+                            } else {
+                                colors.accent
+                            })
+                        })
+                        .when(confirming && slot == 1, |el| {
+                            el.on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                                view.confirm_delete = None;
+                                cx.notify();
+                            }))
+                        }),
                 );
             }
             rows = rows.child(
@@ -751,7 +788,8 @@ impl MainWindow {
                     .items_center()
                     .justify_between()
                     .gap(px(12.))
-                    .px(px(12.))
+                    .pl(px(12.))
+                    .pr(px(28.))
                     .py(px(12.))
                     .when(index > 0, |el| el.border_t_1().border_color(colors.line))
                     .when(current, |el| el.bg(colors.selection))
@@ -770,17 +808,18 @@ impl MainWindow {
                             .child(
                                 div()
                                     .flex()
-                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(6.))
-                                    .child(badge(label, color, colors))
+                                    .child(badge(label, color, colors).bg(colors.version_badge))
                                     .when(version.installed && !current, |el| {
                                         el.child(caption("已下载", colors))
                                     })
-                                    .when(confirming, |el| {
+                                    .when_some(progress, |el, progress| {
                                         el.child(
-                                            caption("删除此本地版本？", colors)
-                                                .text_color(colors.error),
+                                            caption(update_progress_text(progress), colors)
+                                                .whitespace_nowrap()
+                                                .flex_shrink_0()
+                                                .text_color(colors.accent),
                                         )
                                     }),
                             ),
@@ -788,25 +827,53 @@ impl MainWindow {
                     .child(buttons),
             );
         }
-        if state.versions.is_empty() {
-            rows = rows.child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
+        let footer_index = 10 + (versions.len() * 2) as isize;
+        let loading = state.versions_loading;
+        let refresh = action_button(
+            "",
+            5,
+            (!loading).then_some(UiAction::Run(Action::RefreshVersions(core))),
+            true,
+            colors,
+            cx,
+        )
+        .id("refresh-versions")
+        .size(px(24.))
+        .min_w(px(24.))
+        .px(px(0.))
+        .bg(colors.accent_fill)
+        .border_color(colors.accent_fill)
+        .when(loading, |el| el.opacity(0.55))
+        .child(refresh_icon(colors.on_accent))
+        .tooltip(move |_, cx| cx.new(|_| RefreshTooltip { loading, colors }).into());
+        let mut filter = div()
+            .flex()
+            .flex_shrink_0()
+            .gap(px(2.))
+            .p(px(1.))
+            .bg(colors.canvas)
+            .border_1()
+            .border_color(colors.line)
+            .rounded(px(6.));
+        for (index, (label, only_downloaded)) in
+            [("已下载", true), ("全部", false)].into_iter().enumerate()
+        {
+            filter = filter.child(
+                control(label, 6 + index as isize, colors, false)
+                    .h(px(26.))
+                    .min_w(px(60.))
+                    .px(px(8.))
                     .justify_center()
-                    .p(px(24.))
-                    .child(caption(
-                        if state.versions_loading {
-                            "正在获取版本列表…"
-                        } else {
-                            "暂无可用版本，请刷新列表。"
-                        },
-                        colors,
-                    )),
+                    .text_size(px(13.))
+                    .when(downloaded_only == only_downloaded, |el| {
+                        el.bg(colors.selection).text_color(colors.accent)
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.activate(UiAction::SetDownloadedOnly(core, only_downloaded), cx);
+                    })),
             );
         }
-        let footer_index = 8 + (state.versions.len() * 2) as isize;
         let content = div()
             .id(("versions-content", core_index(core)))
             .size_full()
@@ -818,64 +885,51 @@ impl MainWindow {
                     .flex()
                     .flex_shrink_0()
                     .items_center()
-                    .justify_between()
                     .gap(px(12.))
                     .child(page_title(if core == Core::Xray {
                         "Xray 版本"
                     } else {
                         "sing-box 版本"
                     }))
-                    .child(action_button(
-                        "返回配置",
-                        5,
-                        Some(UiAction::ShowVersions(core, false)),
-                        false,
-                        colors,
-                        cx,
-                    )),
+                    .child(refresh),
             )
             .child(
                 div()
                     .flex()
                     .flex_shrink_0()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap(px(8.))
-                    .child(caption(
-                        match &state.selected_version {
-                            Some(version) => format!("当前使用 v{version}"),
-                            None => "下载后选择一个版本使用".into(),
-                        },
-                        colors,
-                    ))
-                    .child(action_button(
-                        if state.versions_loading {
-                            "获取中"
-                        } else {
-                            "刷新列表"
-                        },
-                        6,
-                        (!state.versions_loading)
-                            .then_some(UiAction::Run(Action::RefreshVersions(core))),
-                        false,
-                        colors,
-                        cx,
-                    )),
+                    .child(filter)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(action_button(
+                                "打开目录",
+                                8,
+                                Some(UiAction::OpenCoreFolder(core)),
+                                false,
+                                colors,
+                                cx,
+                            ))
+                            .child(
+                                action_button(
+                                    "返回配置页面",
+                                    9,
+                                    Some(UiAction::ShowVersions(core, false)),
+                                    true,
+                                    colors,
+                                    cx,
+                                )
+                                // 蓝底上下各内收 1px，平衡旁边浅色描边按钮的视觉高度。
+                                .h(px(28.)),
+                            ),
+                    ),
             )
-            .when_some(state.update.as_ref(), |el, progress| {
-                let version = state.downloading_version.as_deref().unwrap_or("");
-                el.child(
-                    caption(
-                        format!("v{version} · {}", update_progress_text(progress)),
-                        colors,
-                    )
-                    .flex_shrink_0()
-                    .text_color(colors.accent),
-                )
-            })
-            .when_some(state.update_message.clone(), |el, message| {
-                el.child(caption(message, colors).flex_shrink_0())
-            })
             .when_some(state.update_error.clone(), |el, message| {
                 el.child(error_message(message, colors))
             })
@@ -902,16 +956,31 @@ impl MainWindow {
                     .flex_col()
                     .overflow_hidden()
                     .child(
-                        scroll_area(
-                            "version-scroll",
-                            rows,
-                            &self.version_scroll[core_index(core)],
-                            colors,
-                        )
-                        .flex_1(),
+                        div()
+                            .id("version-scroll")
+                            .relative()
+                            .flex()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .child(
+                                rows.min_w(px(0.))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.version_scroll[core_index(core)]),
+                            )
+                            .child(
+                                scrollbar(
+                                    "scrollbar",
+                                    &self.version_scroll[core_index(core)],
+                                    colors,
+                                )
+                                .absolute()
+                                .right_0()
+                                .top_0()
+                                .bottom_0(),
+                            ),
                     ),
             )
-            .when(state.versions_has_more, |el| {
+            .when(!downloaded_only && state.versions_has_more, |el| {
                 el.child(action_button(
                     "加载更多",
                     footer_index,
@@ -1135,16 +1204,19 @@ impl Render for MainWindow {
                     if let Page::Core(core) = view.page {
                         if view.show_versions[core_index(core)] {
                             let handles = &view.version_focus[core_index(core)];
-                            if let Some(index) =
-                                view.snapshot
-                                    .core(core)
-                                    .versions
-                                    .iter()
-                                    .position(|version| {
-                                        handles.get(&version.version).is_some_and(|handles| {
-                                            handles.iter().any(|handle| handle.is_focused(window))
-                                        })
+                            if let Some(index) = view
+                                .snapshot
+                                .core(core)
+                                .versions
+                                .iter()
+                                .filter(|version| {
+                                    !view.downloaded_only[core_index(core)] || version.installed
+                                })
+                                .position(|version| {
+                                    handles.get(&version.version).is_some_and(|handles| {
+                                        handles.iter().any(|handle| handle.is_focused(window))
                                     })
+                                })
                             {
                                 view.version_scroll[core_index(core)].scroll_to_item(index);
                                 cx.notify();
@@ -1210,6 +1282,53 @@ fn update_progress_text(progress: &UpdateProgress) -> String {
         UpdateProgress::Verifying => "正在校验下载文件…".into(),
         UpdateProgress::Extracting => "正在准备安装文件…".into(),
         UpdateProgress::Installing => "正在保存核心版本…".into(),
+    }
+}
+
+fn refresh_icon(color: Rgba) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let scale = bounds.size.width / px(18.);
+            let p = |x, y| bounds.origin + point(px(x) * scale, px(y) * scale);
+            let mut path = PathBuilder::stroke(px(1.6) * scale);
+            path.move_to(p(3., 7.));
+            path.cubic_bezier_to(p(14., 5.), p(4., 1.), p(11., 1.));
+            path.line_to(p(16., 7.));
+            path.move_to(p(16., 2.));
+            path.line_to(p(16., 7.));
+            path.line_to(p(11., 7.));
+            path.move_to(p(15., 11.));
+            path.cubic_bezier_to(p(4., 13.), p(14., 17.), p(7., 17.));
+            path.line_to(p(2., 11.));
+            path.move_to(p(2., 16.));
+            path.line_to(p(2., 11.));
+            path.line_to(p(7., 11.));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .size(px(16.))
+}
+
+struct RefreshTooltip {
+    loading: bool,
+    colors: Colors,
+}
+
+impl Render for RefreshTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        panel(self.colors)
+            .px(px(8.))
+            .py(px(4.))
+            .text_size(px(12.))
+            .text_color(self.colors.text)
+            .child(if self.loading {
+                "正在获取版本列表…"
+            } else {
+                "获取版本列表"
+            })
     }
 }
 
@@ -1371,7 +1490,16 @@ fn action_button(
         })
         .child(label)
         .when_some(action, |el, action| {
-            el.on_click(cx.listener(move |view, _, _, cx| view.activate(action.clone(), cx)))
+            el.on_click(cx.listener(move |view, _, window, cx| {
+                if matches!(
+                    &action,
+                    UiAction::Run(Action::SwitchVersion(..) | Action::DeleteVersion(..))
+                        | UiAction::ShowVersions(..)
+                ) {
+                    window.focus(&view.focus);
+                }
+                view.activate(action.clone(), cx);
+            }))
         })
 }
 
@@ -1388,6 +1516,10 @@ struct Colors {
     accent_hover: Rgba,
     on_accent: Rgba,
     running: Rgba,
+    running_dot: Rgba,
+    version_stable: Rgba,
+    version_preview: Rgba,
+    version_badge: Rgba,
     selection: Rgba,
     hover: Rgba,
     disabled: Rgba,
@@ -1421,10 +1553,14 @@ impl Colors {
             muted: tone(0x586174, 0xb3bccb),
             line: tone(0xd9dee7, 0x424852),
             accent: tone(0x185bb8, 0x9bc3ff),
-            accent_fill: tone(0x245fba, 0x9bc3ff),
-            accent_hover: tone(0x1c4e9d, 0xb7d3ff),
-            on_accent: tone(0xffffff, 0x172841),
+            accent_fill: tone(0x245fba, 0x2865bd),
+            accent_hover: tone(0x1c4e9d, 0x2256a3),
+            on_accent: rgb(0xffffff),
             running: tone(0x18704a, 0x83d9b1),
+            running_dot: tone(0x3fb950, 0x3fb950),
+            version_stable: tone(0x3fb950, 0x3fb950),
+            version_preview: tone(0xd29922, 0xd29922),
+            version_badge: tone(0xf6f8fa, 0x1c1e22),
             selection: tone(0xe3edfc, 0x2c3b51),
             hover: tone(0xe9edf3, 0x303740),
             disabled: tone(0x858c98, 0x7f8998),

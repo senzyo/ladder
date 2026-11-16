@@ -200,6 +200,17 @@ pub(crate) fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Orde
     })
 }
 
+pub(crate) fn sort_versions(versions: &mut [CoreVersion], selected: Option<&str>) {
+    versions.sort_by(|left, right| {
+        (selected == Some(right.version.as_str()))
+            .cmp(&(selected == Some(left.version.as_str())))
+            .then_with(|| {
+                compare_versions(&right.version, &left.version)
+                    .unwrap_or_else(|| right.version.cmp(&left.version))
+            })
+    });
+}
+
 fn parse_release(core: Core, data: &[u8]) -> Result<Download, String> {
     let release: Release =
         serde_json::from_slice(data).map_err(|_| "官方发布信息格式无效，请稍后重试".to_string())?;
@@ -301,7 +312,7 @@ fn parse_releases(core: Core, data: &[u8]) -> Result<ReleasePage, String> {
             release_tag: Some(release.tag_name),
         });
     }
-    versions.sort_by(|left, right| compare_versions(&right.version, &left.version).unwrap());
+    sort_versions(&mut versions, None);
     Ok(ReleasePage { versions, has_more })
 }
 
@@ -424,7 +435,7 @@ pub fn installed_versions(core: Core, root: &Path) -> Result<Vec<CoreVersion>, S
             release_tag,
         });
     }
-    versions.sort_by(|left, right| compare_versions(&right.version, &left.version).unwrap());
+    sort_versions(&mut versions, None);
     Ok(versions)
 }
 

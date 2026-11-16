@@ -88,7 +88,6 @@ pub struct CoreState {
     pub version_error: Option<String>,
     pub update: Option<UpdateProgress>,
     pub update_error: Option<String>,
-    pub update_message: Option<String>,
     pub versions: Vec<CoreVersion>,
     pub selected_version: Option<String>,
     pub versions_loading: bool,
@@ -293,7 +292,10 @@ impl Runtime {
             state.selected_version = saved.selected_version(core).clone();
             state.installed = saved.executable(core, &root).is_ok_and(|exe| exe.is_file());
             match update::installed_versions(core, &root) {
-                Ok(versions) => state.versions = versions,
+                Ok(mut versions) => {
+                    update::sort_versions(&mut versions, state.selected_version.as_deref());
+                    state.versions = versions;
+                }
                 Err(error) => state.local_versions_error = Some(error),
             }
             let auto = match core {
@@ -333,6 +335,10 @@ impl Runtime {
 
     pub fn config_dir(&self, core: Core) -> PathBuf {
         core.config_dir(&self.root)
+    }
+
+    pub fn core_dir(&self, core: Core) -> PathBuf {
+        core.core_dir(&self.root)
     }
 
     pub fn send(&self, action: Action) -> Result<(), String> {
@@ -376,7 +382,6 @@ impl Runtime {
             }
             active.operation = Some(operation);
             if operation == CoreOperation::Updating {
-                active.update_message = None;
                 active.update_error = None;
             } else {
                 active.run_error = None;
@@ -442,9 +447,17 @@ impl Runtime {
                 match result {
                     Ok(releases) => {
                         if !more {
-                            state.versions.retain(|version| version.installed);
+                            state.versions.retain(|version| {
+                                version.installed
+                                    || state.downloading_version.as_deref()
+                                        == Some(version.version.as_str())
+                            });
                         }
-                        merge_versions(&mut state.versions, releases.versions);
+                        merge_versions(
+                            &mut state.versions,
+                            releases.versions,
+                            state.selected_version.as_deref(),
+                        );
                         state.versions_loaded = true;
                         state.versions_has_more = releases.has_more;
                         state.versions_page = page;
@@ -490,7 +503,6 @@ impl Runtime {
         state.update = Some(UpdateProgress::Checking);
         state.downloading_version = Some(version.into());
         state.update_error = None;
-        state.update_message = None;
         logging::info(
             "update",
             format_args!("{} 开始下载版本 {version}", core.label()),
@@ -557,7 +569,11 @@ impl Runtime {
     }
 }
 
-fn merge_versions(existing: &mut Vec<CoreVersion>, versions: Vec<CoreVersion>) {
+fn merge_versions(
+    existing: &mut Vec<CoreVersion>,
+    versions: Vec<CoreVersion>,
+    selected: Option<&str>,
+) {
     for mut version in versions {
         if let Some(current) = existing
             .iter_mut()
@@ -573,12 +589,7 @@ fn merge_versions(existing: &mut Vec<CoreVersion>, versions: Vec<CoreVersion>) {
             existing.push(version);
         }
     }
-    existing.sort_by(|left, right| {
-        right.installed.cmp(&left.installed).then_with(|| {
-            update::compare_versions(&right.version, &left.version)
-                .unwrap_or_else(|| right.version.cmp(&left.version))
-        })
-    });
+    update::sort_versions(existing, selected);
 }
 
 fn list_configs(dir: &Path) -> Result<Vec<String>, String> {
@@ -664,7 +675,6 @@ impl Worker {
                         format_args!("{} 已下载版本 {}", core.label(), prepared.version),
                     );
                     state.update_error = None;
-                    state.update_message = Some(format!("{} 已下载，可切换使用", prepared.version));
                 }
                 Err(error) => {
                     logging::error("update", format_args!("{} 安装失败：{error}", core.label()));
@@ -850,8 +860,6 @@ impl Worker {
         }
         self.saved = next;
         self.version_files[core as usize] = None;
-        self.state.lock().unwrap().core_mut(core).update_message =
-            Some(format!("已切换到 {version}，请手动启动"));
         Ok(())
     }
 
@@ -860,8 +868,6 @@ impl Worker {
             return Err("当前使用的版本无法删除，请先切换到其他版本".into());
         }
         update::delete_version(core, &self.root, version)?;
-        self.state.lock().unwrap().core_mut(core).update_message =
-            Some(format!("已删除 {version}"));
         Ok(())
     }
 
@@ -896,7 +902,11 @@ impl Worker {
                     for release in &mut state.versions {
                         release.installed = false;
                     }
-                    merge_versions(&mut state.versions, versions);
+                    merge_versions(
+                        &mut state.versions,
+                        versions,
+                        state.selected_version.as_deref(),
+                    );
                     state
                         .versions
                         .retain(|release| release.installed || release.release_tag.is_some());
@@ -2245,16 +2255,56 @@ mod tests {
                 version("1.1.0", false, UpdateChannel::Preview, Some("v1.1.0")),
                 version("1.0.0", false, UpdateChannel::Stable, Some("v1.0.0")),
             ],
+            Some("1.0.0"),
         );
         assert_eq!(versions[0].version, "1.0.0");
         merge_versions(
             &mut versions,
             vec![version("1.1.0", true, UpdateChannel::Stable, None)],
+            Some("1.1.0"),
         );
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].version, "1.1.0");
         assert_eq!(versions[0].channel, UpdateChannel::Preview);
         assert!(versions.iter().all(|version| version.installed));
+    }
+
+    #[test]
+    fn version_merges_pin_only_current_and_sort_other_versions_numerically() {
+        use crate::update::UpdateChannel;
+        let version = |value: &str, installed| CoreVersion {
+            version: value.into(),
+            channel: UpdateChannel::Stable,
+            installed,
+            release_tag: Some(format!("v{value}")),
+        };
+        let mut versions = vec![version("1.0.0", true), version("1.1.0", true)];
+        merge_versions(
+            &mut versions,
+            vec![version("2.0.0-beta.2", false), version("2.0.0", false)],
+            Some("1.0.0"),
+        );
+        assert_eq!(
+            versions
+                .iter()
+                .map(|version| version.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.0.0", "2.0.0", "2.0.0-beta.2", "1.1.0"]
+        );
+        merge_versions(
+            &mut versions,
+            vec![version("2.0.0-beta.10", false), version("2.0.0", false)],
+            Some("1.1.0"),
+        );
+        assert_eq!(
+            versions
+                .iter()
+                .map(|version| version.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.1.0", "2.0.0", "2.0.0-beta.10", "2.0.0-beta.2", "1.0.0"]
+        );
+        assert!(versions[0].installed);
+        assert!(!versions[1].installed);
     }
 
     #[test]
