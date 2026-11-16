@@ -3207,6 +3207,7 @@ dependencies = [
  "same-file",
  "serde",
  "serde_json",
+ "serde_json_lenient",
  "sha2 0.11.1",
  "tempfile",
  "tray-icon",

@@ -34,10 +34,12 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::core_output::CoreOutput;
 use crate::runtime::Core;
+use crate::tun_config::PreparedConfig;
 
 pub(crate) struct ManagedChild {
     process: JobProcess,
     pub(crate) output: CoreOutput,
+    config: PreparedConfig,
 }
 
 pub(crate) struct JobProcess {
@@ -120,7 +122,7 @@ impl ManagedChild {
         root: &Path,
         exe: &Path,
         assets: &Path,
-        config: &Path,
+        config: PreparedConfig,
     ) -> io::Result<Self> {
         let stdin = File::open("NUL")?;
         let (stdout, stdout_write) = io::pipe()?;
@@ -140,7 +142,7 @@ impl ManagedChild {
             command.push("\"");
         }
         command.push(" -c \"");
-        command.push(config);
+        command.push(config.path());
         command.push("\"");
         let env = (core == Core::Xray).then(|| xray_environment(assets));
         let process = JobProcess::spawn(exe, root, command, env.as_deref(), stdio)?;
@@ -148,7 +150,12 @@ impl ManagedChild {
         Ok(Self {
             process,
             output: CoreOutput::capture(core, stdout, stderr),
+            config,
         })
+    }
+
+    pub(crate) fn tun_names(&self) -> &[String] {
+        self.config.names()
     }
 
     pub(crate) fn try_wait(&self) -> io::Result<Option<ExitStatus>> {

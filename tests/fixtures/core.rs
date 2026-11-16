@@ -23,6 +23,12 @@ fn main() {
         return;
     }
     let config = fs::read_to_string(&file).unwrap();
+    if config.contains("fixture_tun") {
+        let exe = env::current_exe().unwrap();
+        let root = exe.parent().unwrap().parent().unwrap();
+        let label = exe.file_stem().unwrap().to_str().unwrap();
+        fs::write(root.join(format!("{label}.config-path")), file.to_str().unwrap()).unwrap();
+    }
     if config.contains("fixture_failure") {
         eprintln!("access is denied: PRIVATE_FIXTURE_VALUE");
         process::exit(42);

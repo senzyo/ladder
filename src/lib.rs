@@ -5,6 +5,8 @@ mod logging;
 mod managed_child;
 mod runtime;
 mod scheduler;
+mod tun_cleanup;
+mod tun_config;
 mod ui;
 mod update;
 

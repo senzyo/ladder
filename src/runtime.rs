@@ -14,6 +14,7 @@ use crate::logging;
 use crate::managed_child::ManagedChild;
 use crate::scheduler::{DesktopDns, desktop_dns};
 use crate::update::{self, PreparedUpdate, UpdateChannel, UpdateProgress};
+use crate::{tun_cleanup, tun_config};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Core {
@@ -254,6 +255,7 @@ impl Runtime {
             let dir = core.config_dir(&root);
             fs::create_dir_all(&dir)
                 .map_err(|e| format!("创建 {} 配置目录失败: {e}", core.label()))?;
+            cleanup_runtime_configs(&dir);
             let state = snapshot.core_mut(core);
             state.configs = list_configs(&dir)?;
             state.current = saved.current(core).clone();
@@ -512,6 +514,7 @@ fn list_configs(dir: &Path) -> Result<Vec<String>, String> {
         let entry = entry.map_err(|e| format!("读取配置文件信息失败: {e}"))?;
         let path = entry.path();
         if is_json(&path)
+            && !is_runtime_config(&path)
             && path.is_file()
             && let Some(name) = entry.file_name().to_str()
         {
@@ -526,6 +529,28 @@ fn is_json(path: &Path) -> bool {
     path.extension()
         .and_then(OsStr::to_str)
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+}
+
+fn is_runtime_config(path: &Path) -> bool {
+    is_json(path)
+        && path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with(tun_config::RUNTIME_PREFIX))
+}
+
+fn cleanup_runtime_configs(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if is_runtime_config(&entry.path())
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+            && let Err(error) = fs::remove_file(entry.path())
+        {
+            logging::warn("tun", format_args!("删除遗留运行配置失败：{error}"));
+        }
+    }
 }
 
 fn executable_stamp(path: &Path) -> Option<(u64, Option<SystemTime>)> {
@@ -601,6 +626,7 @@ impl Worker {
     }
 
     fn run(mut self, rx: mpsc::Receiver<Request>) {
+        self.cleanup_tun();
         for core in Core::ALL {
             let auto = match core {
                 Core::SingBox => self.saved.settings.auto_sing_box,
@@ -879,6 +905,7 @@ impl Worker {
         if !matches!(name_path.components().next(), Some(Component::Normal(_)))
             || name_path.file_name() != Some(OsStr::new(name))
             || !is_json(name_path)
+            || is_runtime_config(name_path)
         {
             return Err("配置文件名无效".into());
         }
@@ -903,6 +930,18 @@ impl Worker {
             self.restore_dns()
                 .map_err(|_| "DNS 尚未恢复，无法开始新的 DNS 劫持")?;
         }
+        let config = tun_config::prepare(core, config)?;
+        if !config.names().is_empty() {
+            logging::info(
+                "tun",
+                format_args!(
+                    "{} 已生成 {} 个随机 TUN 接口名",
+                    core.label(),
+                    config.names().len()
+                ),
+            );
+            self.cleanup_tun();
+        }
         let child = ManagedChild::spawn(core, &self.root, &exe, &assets, config)
             .map_err(|e| format!("启动 {} 失败: {e}", core.label()))?;
         self.children[core as usize] = Some(child);
@@ -916,6 +955,7 @@ impl Worker {
                 logging::error("dns", format_args!("劫持 DNS 失败：{error}"));
                 let stopped = self.stop_process(core);
                 let _ = self.restore_dns();
+                self.cleanup_tun();
                 return match stopped {
                     Ok(_) => Err(error),
                     Err(cleanup) => Err(format!("{error}；{cleanup}")),
@@ -930,6 +970,7 @@ impl Worker {
         if self.children[core as usize].is_some() {
             self.stop_process(core)?;
             let _ = self.restore_dns();
+            self.cleanup_tun();
         }
         Ok(())
     }
@@ -978,6 +1019,16 @@ impl Worker {
         Ok(reason)
     }
 
+    fn cleanup_tun(&self) {
+        let protected_names = self
+            .children
+            .iter()
+            .flatten()
+            .flat_map(|child| child.tun_names().iter().cloned())
+            .collect::<Vec<_>>();
+        tun_cleanup::cleanup(&protected_names);
+    }
+
     fn stop_all(&mut self) -> Result<Option<String>, String> {
         let running = self.children.iter().flatten().count();
         let failures: Vec<_> = Core::ALL
@@ -1001,6 +1052,7 @@ impl Worker {
             previous_error
         };
         if failures.is_empty() {
+            self.cleanup_tun();
             logging::info("runtime", "所有托管核心已停止");
             if dns_error.is_some() {
                 logging::warn("dns", "退出时仍有 DNS 恢复失败，恢复记录保留");
@@ -1038,6 +1090,7 @@ impl Worker {
         let result = self.stop_process(core);
         if result.is_ok() {
             let _ = self.restore_dns();
+            self.cleanup_tun();
         }
         let message = match result {
             Ok(reason) => format!(
@@ -1306,6 +1359,129 @@ mod tests {
             Saved::load(root).unwrap().xray.as_deref(),
             Some("日常.JSON")
         );
+    }
+
+    #[test]
+    fn tun_runtime_copies_follow_core_lifetimes_and_preserve_sources() {
+        let folder = tempfile::Builder::new()
+            .prefix("梯子 TUN ")
+            .tempdir()
+            .unwrap();
+        let root = folder.path();
+        let _process_test = lock_and_install_fixture_cores(root);
+        let source_name = "TUN.json";
+        let sources = [
+            r#"{"fixture_tun":true,"inbounds":[{"type":"tun","interface_name":"original"}]}"#,
+            r#"{"fixture_tun":true,"Inbounds":[{"Protocol":"TUN","Settings":{"Name":"original"}}]}"#,
+        ];
+        for (core, source) in Core::ALL.into_iter().zip(sources) {
+            fs::write(core.config_dir(root).join(source_name), source).unwrap();
+            fs::write(core.config_dir(root).join(".ladder-tun-stale.json"), "{}").unwrap();
+        }
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        let copy_path = |core: Core, previous: &Path| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Ok(path) =
+                    fs::read_to_string(root.join(format!("{}.config-path", core.label())))
+                {
+                    let path = PathBuf::from(path);
+                    if path != previous && path.is_file() {
+                        next_pid(&path.with_extension("pid"), 0);
+                        return path;
+                    }
+                }
+                assert!(Instant::now() < deadline, "等待 TUN 运行副本超时");
+                thread::sleep(Duration::from_millis(30));
+            }
+        };
+        let mut copies = Vec::new();
+        for core in Core::ALL {
+            let state = runtime.snapshot().core(core).clone();
+            assert!(
+                !core
+                    .config_dir(root)
+                    .join(".ladder-tun-stale.json")
+                    .exists()
+            );
+            assert_eq!(state.configs.len(), 3);
+            runtime.send(Action::Use(core, source_name.into())).unwrap();
+            assert!(idle(&runtime, core).running);
+            let copy = copy_path(core, Path::new(""));
+            assert!(is_runtime_config(&copy));
+            assert_eq!(copy.parent(), Some(core.config_dir(root).as_path()));
+            assert!(
+                !list_configs(&core.config_dir(root))
+                    .unwrap()
+                    .iter()
+                    .any(|name| is_runtime_config(Path::new(name)))
+            );
+            copies.push(copy);
+        }
+        let xray_before = fs::read(&copies[1]).unwrap();
+        let sing_before: serde_json::Value =
+            serde_json::from_slice(&fs::read(&copies[0]).unwrap()).unwrap();
+        runtime.send(Action::Restart(Core::SingBox)).unwrap();
+        assert!(idle(&runtime, Core::SingBox).running);
+        let restarted = copy_path(Core::SingBox, &copies[0]);
+        let sing_after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&restarted).unwrap()).unwrap();
+        assert_ne!(
+            sing_before["inbounds"][0]["interface_name"],
+            sing_after["inbounds"][0]["interface_name"]
+        );
+        assert!(!copies[0].exists());
+        assert_eq!(fs::read(&copies[1]).unwrap(), xray_before);
+
+        fs::write(restarted.with_extension("exit"), []).unwrap();
+        failed(&runtime, Core::SingBox);
+        assert!(!restarted.exists());
+        assert!(runtime.snapshot().xray.running);
+
+        fs::write(
+            Core::SingBox.config_dir(root).join("失败TUN.json"),
+            r#"{"fixture_failure":true,"inbounds":[{"type":"tun"}]}"#,
+        )
+        .unwrap();
+        runtime
+            .send(Action::Use(Core::SingBox, "失败TUN.json".into()))
+            .unwrap();
+        failed(&runtime, Core::SingBox);
+        assert!(
+            !fs::read_dir(Core::SingBox.config_dir(root))
+                .unwrap()
+                .any(|entry| is_runtime_config(&entry.unwrap().path()))
+        );
+
+        runtime.send(Action::Stop(Core::Xray)).unwrap();
+        assert!(!idle(&runtime, Core::Xray).running);
+        assert!(!copies[1].exists());
+        runtime.send(Action::Start(Core::Xray)).unwrap();
+        assert!(idle(&runtime, Core::Xray).running);
+        let shutdown_copy = copy_path(Core::Xray, &copies[1]);
+        runtime.shutdown().unwrap();
+        assert!(!shutdown_copy.exists());
+        let prepared =
+            tun_config::prepare(Core::Xray, &Core::Xray.config_dir(root).join(source_name))
+                .unwrap();
+        let failed_spawn_copy = prepared.path().to_owned();
+        assert!(
+            ManagedChild::spawn(
+                Core::Xray,
+                root,
+                &root.join("missing-core.exe"),
+                &Core::Xray.core_dir(root),
+                prepared,
+            )
+            .is_err()
+        );
+        assert!(!failed_spawn_copy.exists());
+        for (core, source) in Core::ALL.into_iter().zip(sources) {
+            assert_eq!(
+                fs::read_to_string(core.config_dir(root).join(source_name)).unwrap(),
+                source
+            );
+        }
     }
 
     #[test]
