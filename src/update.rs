@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -26,6 +27,25 @@ pub enum UpdateChannel {
     #[default]
     Stable,
     Preview,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreVersion {
+    pub version: String,
+    pub channel: UpdateChannel,
+    pub installed: bool,
+    pub release_tag: Option<String>,
+}
+
+pub struct ReleasePage {
+    pub versions: Vec<CoreVersion>,
+    pub has_more: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct VersionRecord {
+    channel: UpdateChannel,
+    release_tag: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +76,8 @@ struct Asset {
 
 struct Download {
     version: String,
+    channel: UpdateChannel,
+    tag: String,
     url: String,
     size: u64,
     sha256: [u8; 32],
@@ -106,13 +128,6 @@ fn numeric_version(version: &str) -> Option<Vec<u32>> {
     values.into_iter().map(|part| part.parse().ok()).collect()
 }
 
-fn needs_update(local: Option<&str>, remote: &str) -> bool {
-    let Some(local) = local else {
-        return true;
-    };
-    compare_versions(remote, local).is_none_or(|order| order.is_gt())
-}
-
 fn version_parts(version: &str) -> Option<(Vec<u32>, Option<&str>)> {
     fn valid_identifiers(value: &str) -> bool {
         value.split('.').all(|part| {
@@ -138,7 +153,7 @@ fn version_parts(version: &str) -> Option<(Vec<u32>, Option<&str>)> {
     Some((numeric_version(base)?, prerelease))
 }
 
-fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+pub(crate) fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     let (mut left, left_pre) = version_parts(left)?;
     let (mut right, right_pre) = version_parts(right)?;
@@ -185,33 +200,13 @@ fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
     })
 }
 
-fn parse_release(core: Core, channel: UpdateChannel, data: &[u8]) -> Result<Download, String> {
-    let format_error = |_| "官方发布信息格式无效，请稍后重试".to_string();
-    let release: Release = match channel {
-        UpdateChannel::Stable => serde_json::from_slice(data).map_err(format_error)?,
-        UpdateChannel::Preview => {
-            let releases: Vec<Release> = serde_json::from_slice(data).map_err(format_error)?;
-            releases
-                .into_iter()
-                .filter(|release| {
-                    let version = release.tag_name.trim_start_matches('v');
-                    !release.draft
-                        && version_parts(version).is_some()
-                        && release
-                            .assets
-                            .iter()
-                            .any(|asset| asset.name == asset_name(core, version))
-                })
-                .max_by(|left, right| {
-                    compare_versions(
-                        left.tag_name.trim_start_matches('v'),
-                        right.tag_name.trim_start_matches('v'),
-                    )
-                    .expect("release versions were validated")
-                })
-                .ok_or("官方发布列表中没有适用于当前架构的可安装版本")?
-        }
-    };
+fn parse_release(core: Core, data: &[u8]) -> Result<Download, String> {
+    let release: Release =
+        serde_json::from_slice(data).map_err(|_| "官方发布信息格式无效，请稍后重试".to_string())?;
+    release_download(core, release)
+}
+
+fn release_download(core: Core, release: Release) -> Result<Download, String> {
     let version = release
         .tag_name
         .strip_prefix('v')
@@ -219,10 +214,8 @@ fn parse_release(core: Core, channel: UpdateChannel, data: &[u8]) -> Result<Down
     let Some((_, prerelease)) = version_parts(version) else {
         return Err("官方响应不是可安装的版本".into());
     };
-    if release.draft
-        || (channel == UpdateChannel::Stable && (release.prerelease || prerelease.is_some()))
-    {
-        return Err("官方响应不是所选通道的可安装版本".into());
+    if release.draft {
+        return Err("官方响应不是已发布的可安装版本".into());
     }
     let name = asset_name(core, version);
     let mut assets = release
@@ -260,10 +253,192 @@ fn parse_release(core: Core, channel: UpdateChannel, data: &[u8]) -> Result<Down
     }
     Ok(Download {
         version: version.into(),
+        channel: if release.prerelease || prerelease.is_some() {
+            UpdateChannel::Preview
+        } else {
+            UpdateChannel::Stable
+        },
+        tag: release.tag_name,
         url: asset.url,
         size: asset.size,
         sha256,
     })
+}
+
+fn parse_releases(core: Core, data: &[u8]) -> Result<ReleasePage, String> {
+    let releases: Vec<Release> =
+        serde_json::from_slice(data).map_err(|_| "官方发布列表格式无效，请稍后重试".to_string())?;
+    let has_more = releases.len() == 30;
+    let mut versions = Vec::new();
+    for release in releases {
+        let version = release
+            .tag_name
+            .strip_prefix('v')
+            .unwrap_or(&release.tag_name);
+        if release.draft
+            || version_parts(version).is_none()
+            || !release
+                .assets
+                .iter()
+                .any(|asset| asset.name == asset_name(core, version))
+        {
+            continue;
+        }
+        if versions
+            .iter()
+            .any(|item: &CoreVersion| item.version == version)
+        {
+            continue;
+        }
+        versions.push(CoreVersion {
+            version: version.into(),
+            channel: if release.prerelease || version_parts(version).unwrap().1.is_some() {
+                UpdateChannel::Preview
+            } else {
+                UpdateChannel::Stable
+            },
+            installed: false,
+            release_tag: Some(release.tag_name),
+        });
+    }
+    versions.sort_by(|left, right| compare_versions(&right.version, &left.version).unwrap());
+    Ok(ReleasePage { versions, has_more })
+}
+
+fn release_data(core: Core, endpoint: &str, cancelled: &AtomicBool) -> Result<Vec<u8>, String> {
+    check_cancelled(cancelled)?;
+    let url = format!(
+        "https://api.github.com/repos/{}/{endpoint}",
+        repository(core)
+    );
+    let data = ureq::get(&url)
+        .config()
+        .https_only(true)
+        .timeout_global(Some(NETWORK_TIMEOUT))
+        .build()
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(network_error)?
+        .body_mut()
+        .with_config()
+        .limit(16 * 1024 * 1024)
+        .read_to_vec()
+        .map_err(network_error)?;
+    check_cancelled(cancelled)?;
+    Ok(data)
+}
+
+pub fn fetch_releases(
+    core: Core,
+    page: u32,
+    cancelled: &AtomicBool,
+) -> Result<ReleasePage, String> {
+    if page == 0 {
+        return Err("版本列表页码无效".into());
+    }
+    let data = release_data(
+        core,
+        &format!("releases?per_page=30&page={page}"),
+        cancelled,
+    )?;
+    parse_releases(core, &data)
+}
+
+pub fn version_directory(core: Core, root: &Path, version: &str) -> Result<PathBuf, String> {
+    if version_parts(version).is_none() {
+        return Err("核心版本号无效".into());
+    }
+    let directory = versions_directory(core, root)?.join(version);
+    check_directory(&directory)?;
+    Ok(directory)
+}
+
+fn versions_directory(core: Core, root: &Path) -> Result<PathBuf, String> {
+    let core = core.core_dir(root);
+    check_directory(&core)?;
+    let directory = core.join("versions");
+    check_directory(&directory)?;
+    Ok(directory)
+}
+
+fn check_directory(directory: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if !metadata.is_dir() || is_reparse_point(&metadata) => {
+            Err("核心版本路径不是普通目录，无法执行操作".into())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("无法检查核心版本目录: {error}")),
+    }
+}
+
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_attributes() & 0x400 != 0
+}
+
+pub fn installed_versions(core: Core, root: &Path) -> Result<Vec<CoreVersion>, String> {
+    let directory = versions_directory(core, root)?;
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("无法读取本地核心版本: {error}")),
+    };
+    let mut versions = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("无法读取本地核心版本: {error}"))?;
+        let Some(version) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if version_parts(&version).is_none() {
+            continue;
+        }
+        if entry
+            .file_type()
+            .map_err(|error| format!("无法检查本地核心版本: {error}"))?
+            .is_file()
+        {
+            continue;
+        }
+        let path = version_directory(core, root, &version)?;
+        let record = match fs::read(path.join(".ladder-version.json")) {
+            Ok(data) => serde_json::from_slice::<VersionRecord>(&data).ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("无法读取核心版本记录: {error}")),
+        };
+        let (channel, release_tag) = match record {
+            Some(record) => (record.channel, record.release_tag),
+            None => (
+                if version_parts(&version).unwrap().1.is_some() {
+                    UpdateChannel::Preview
+                } else {
+                    UpdateChannel::Stable
+                },
+                None,
+            ),
+        };
+        versions.push(CoreVersion {
+            version,
+            channel,
+            installed: true,
+            release_tag,
+        });
+    }
+    versions.sort_by(|left, right| compare_versions(&right.version, &left.version).unwrap());
+    Ok(versions)
+}
+
+pub fn delete_version(core: Core, root: &Path, version: &str) -> Result<(), String> {
+    let directory = version_directory(core, root, version)?;
+    let parent = fs::canonicalize(directory.parent().unwrap())
+        .map_err(|error| format!("无法定位核心版本目录: {error}"))?;
+    let target =
+        fs::canonicalize(&directory).map_err(|error| format!("无法定位待删除版本: {error}"))?;
+    if target.parent() != Some(parent.as_path()) {
+        return Err("待删除版本不在核心版本目录内".into());
+    }
+    fs::remove_dir_all(&target)
+        .map_err(|error| format!("删除核心 {version} 失败，请关闭占用该版本的程序后重试: {error}"))
 }
 
 fn network_error(error: ureq::Error) -> String {
@@ -284,44 +459,34 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
     }
 }
 
-pub fn prepare(
+pub fn prepare_version(
     core: Core,
-    channel: UpdateChannel,
     root: &Path,
-    local_version: Option<&str>,
+    release: &CoreVersion,
     cancelled: &AtomicBool,
     mut progress: impl FnMut(UpdateProgress),
-) -> Result<Option<PreparedUpdate>, String> {
+) -> Result<PreparedUpdate, String> {
     check_cancelled(cancelled)?;
+    let target = version_directory(core, root, &release.version)?;
+    if target.exists() {
+        return Err("该版本已存在于本地，请先删除后再下载".into());
+    }
+    let tag = release
+        .release_tag
+        .as_deref()
+        .ok_or("请先刷新官方版本列表")?;
+    if tag.strip_prefix('v').unwrap_or(tag) != release.version {
+        return Err("官方版本标签与版本号不符，请刷新列表".into());
+    }
     progress(UpdateProgress::Checking);
-    let endpoint = match channel {
-        UpdateChannel::Stable => "releases/latest",
-        UpdateChannel::Preview => "releases?per_page=30",
-    };
-    let url = format!(
-        "https://api.github.com/repos/{}/{endpoint}",
-        repository(core)
-    );
-    let data = ureq::get(&url)
-        .config()
-        .https_only(true)
-        .timeout_global(Some(NETWORK_TIMEOUT))
-        .build()
-        .header("User-Agent", USER_AGENT)
-        .header("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(network_error)?
-        .body_mut()
-        .with_config()
-        .limit(16 * 1024 * 1024)
-        .read_to_vec()
-        .map_err(network_error)?;
-    check_cancelled(cancelled)?;
-    let download = parse_release(core, channel, &data)?;
-    if !needs_update(local_version, &download.version) {
-        return Ok(None);
+    let data = release_data(core, &format!("releases/tags/{tag}"), cancelled)?;
+    let download = parse_release(core, &data)?;
+    if download.version != release.version || download.tag != tag {
+        return Err("官方发布响应与所选版本不符，请刷新列表".into());
     }
     let mut prepared = PreparedUpdate::new(core, root, download.version.clone())?;
+    prepared.channel = download.channel;
+    prepared.release_tag = Some(download.tag.clone());
     let archive = prepared.directory.path().join("package.zip");
     let request = ureq::get(&download.url).config().https_only(true).build();
     download_archive(
@@ -346,7 +511,7 @@ pub fn prepare(
         return Err("安装包中的核心版本与官方发布信息不符，现有核心未修改".into());
     }
     check_cancelled(cancelled)?;
-    Ok(Some(prepared))
+    Ok(prepared)
 }
 
 fn download_archive(
@@ -413,44 +578,40 @@ fn download_archive(
     Ok(())
 }
 
-#[derive(PartialEq)]
-enum InstallState {
-    Prepared,
-    Installed,
-    RolledBack,
-    Committed,
-}
-
-struct Replacement {
-    name: &'static str,
-    backed_up: bool,
-    installed: bool,
-}
-
 pub struct PreparedUpdate {
     pub version: String,
+    pub channel: UpdateChannel,
+    release_tag: Option<String>,
     core: Core,
+    root: PathBuf,
     directory: TempDir,
-    target: PathBuf,
-    files: Vec<Replacement>,
-    state: InstallState,
+    files: Vec<&'static str>,
+    installed: bool,
 }
 
 impl PreparedUpdate {
     fn new(core: Core, root: &Path, version: String) -> Result<Self, String> {
+        version_directory(core, root, &version)?;
         let directory = tempfile::Builder::new()
-            .prefix(&format!(".ladder-update-{}-", core.label()))
+            .prefix(&format!(".ladder-download-{}-", core.label()))
             .tempdir_in(root)
-            .map_err(|e| format!("创建更新暂存目录失败: {e}"))?;
+            .map_err(|e| format!("创建下载暂存目录失败: {e}"))?;
         fs::create_dir(directory.path().join("new"))
-            .map_err(|e| format!("创建更新暂存目录失败: {e}"))?;
+            .map_err(|e| format!("创建下载暂存目录失败: {e}"))?;
+        let channel = if version_parts(&version).unwrap().1.is_some() {
+            UpdateChannel::Preview
+        } else {
+            UpdateChannel::Stable
+        };
         Ok(Self {
             version,
+            channel,
+            release_tag: None,
             core,
+            root: root.into(),
             directory,
-            target: core.core_dir(root),
             files: Vec::new(),
-            state: InstallState::Prepared,
+            installed: false,
         })
     }
 
@@ -492,7 +653,7 @@ impl PreparedUpdate {
             else {
                 continue;
             };
-            if self.files.iter().any(|file| file.name == name) {
+            if self.files.contains(&name) {
                 return Err(format!("安装包包含重复的 {name}"));
             }
             let size = entry.size();
@@ -529,147 +690,42 @@ impl PreparedUpdate {
             output
                 .sync_all()
                 .map_err(|e| format!("保存暂存文件失败: {e}"))?;
-            self.files.push(Replacement {
-                name,
-                backed_up: false,
-                installed: false,
-            });
+            self.files.push(name);
         }
-        for required in &artifacts(core)[..2] {
-            if !self.files.iter().any(|file| file.name == *required) {
-                return Err(format!("安装包缺少 {required}"));
-            }
+        let executable = artifacts(core)[0];
+        if !self.files.contains(&executable) {
+            return Err(format!("安装包缺少 {executable}"));
         }
         Ok(())
     }
 
     pub fn install(&mut self) -> Result<(), String> {
-        if self.state != InstallState::Prepared {
-            return Err("该更新已执行过替换，请重新下载".into());
+        if self.installed {
+            return Err("该版本已完成下载".into());
         }
-        fs::create_dir_all(&self.target).map_err(|e| format!("创建核心目录失败: {e}"))?;
-        for file in &self.files {
-            match fs::symlink_metadata(self.target.join(file.name)) {
-                Ok(metadata) if !metadata.is_file() || metadata.is_symlink() => {
-                    return Err(format!("{} 不是可替换的普通文件", file.name));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("无法检查 {}: {error}", file.name)),
-            }
+        let target = version_directory(self.core, &self.root, &self.version)?;
+        if target.exists() {
+            return Err("该版本已存在于本地，请先删除后再下载".into());
         }
-        for name in artifacts(self.core) {
-            let backup = self.target.join(format!("{name}.old"));
-            match fs::symlink_metadata(&backup) {
-                Ok(metadata) if !metadata.is_file() || metadata.is_symlink() => {
-                    return Err(format!("{name}.old 不是可清理的普通备份文件"));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("无法检查 {name}.old: {error}")),
-            }
-        }
-        // 只有进入实际替换时才清理上次备份；下载、校验和无需更新均不触碰 .old。
-        for name in artifacts(self.core) {
-            match fs::remove_file(self.target.join(format!("{name}.old"))) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "清理 {name}.old 失败，请关闭占用该备份的程序后重试: {error}"
-                    ));
-                }
-            }
-        }
-        // 回滚失败时保留暂存内容，旧版本独立保留在核心目录的 .old 文件。
-        self.directory.disable_cleanup(true);
-        self.state = InstallState::Installed;
-        let result = self.replace();
-        if let Err(message) = result {
-            return match self.rollback() {
-                Ok(()) => Err(format!("{message}；已恢复到更新前的文件")),
-                Err(rollback) => Err(format!("{message}；{rollback}")),
-            };
-        }
+        let staged = self.directory.path().join("new");
+        let record = VersionRecord {
+            channel: self.channel,
+            release_tag: self.release_tag.clone(),
+        };
+        let mut file = File::create(staged.join(".ladder-version.json"))
+            .map_err(|error| format!("创建版本记录失败: {error}"))?;
+        serde_json::to_writer(&mut file, &record)
+            .map_err(|error| format!("保存版本记录失败: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("保存版本记录失败: {error}"))?;
+        drop(file);
+        fs::create_dir_all(target.parent().unwrap())
+            .map_err(|error| format!("创建核心版本目录失败: {error}"))?;
+        version_directory(self.core, &self.root, &self.version)?;
+        fs::rename(&staged, &target)
+            .map_err(|error| format!("保存核心版本失败，现有版本未修改: {error}"))?;
+        self.installed = true;
         Ok(())
-    }
-
-    fn replace(&mut self) -> Result<(), String> {
-        for file in &mut self.files {
-            let target = self.target.join(file.name);
-            match fs::rename(&target, self.target.join(format!("{}.old", file.name))) {
-                Ok(()) => file.backed_up = true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "备份 {} 失败，请关闭占用该文件的程序后重试: {error}",
-                        file.name
-                    ));
-                }
-            }
-            fs::rename(self.directory.path().join("new").join(file.name), &target)
-                .map_err(|error| format!("替换 {} 失败: {error}", file.name))?;
-            file.installed = true;
-        }
-        Ok(())
-    }
-
-    pub fn rollback(&mut self) -> Result<(), String> {
-        match self.state {
-            InstallState::Prepared | InstallState::RolledBack => return Ok(()),
-            InstallState::Committed => return Err("更新已提交，无法再自动回滚".into()),
-            InstallState::Installed => {}
-        }
-        let mut failed = Vec::new();
-        for file in self.files.iter_mut().rev() {
-            let target = self.target.join(file.name);
-            if file.installed {
-                match fs::remove_file(&target) {
-                    Ok(()) => file.installed = false,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        file.installed = false
-                    }
-                    Err(_) => {
-                        failed.push(file.name);
-                        continue;
-                    }
-                }
-            }
-            if file.backed_up {
-                match fs::rename(self.target.join(format!("{}.old", file.name)), &target) {
-                    Ok(()) => file.backed_up = false,
-                    Err(_) => failed.push(file.name),
-                }
-            }
-        }
-        if !failed.is_empty() {
-            return Err(format!(
-                "无法自动恢复 {}；请关闭占用文件的程序，旧文件保留在 {} 的同名 .old 文件中",
-                failed.join("、"),
-                self.target.display()
-            ));
-        }
-        self.state = InstallState::RolledBack;
-        self.directory.disable_cleanup(false);
-        Ok(())
-    }
-
-    pub fn commit(&mut self) -> Result<(), String> {
-        if self.state != InstallState::Installed {
-            return Err("更新尚未安装，无法提交".into());
-        }
-        // .old 留到下一次安装，提交只清理本次下载和暂存内容。
-        self.state = InstallState::Committed;
-        match fs::remove_dir_all(self.directory.path()) {
-            Ok(()) => {
-                self.directory.disable_cleanup(false);
-                Ok(())
-            }
-            Err(_) => Err(format!(
-                "核心已更新，暂存文件清理失败，可稍后删除 {}",
-                self.directory.path().display()
-            )),
-        }
     }
 
     #[cfg(test)]
@@ -687,21 +743,9 @@ impl PreparedUpdate {
                 .find(|allowed| allowed == name)
                 .unwrap();
             fs::write(prepared.directory.path().join("new").join(name), contents).unwrap();
-            prepared.files.push(Replacement {
-                name,
-                backed_up: false,
-                installed: false,
-            });
+            prepared.files.push(name);
         }
         prepared
-    }
-}
-
-impl Drop for PreparedUpdate {
-    fn drop(&mut self) {
-        if self.state == InstallState::Installed {
-            let _ = self.rollback();
-        }
     }
 }
 
@@ -723,15 +767,8 @@ fn parse_version(core: Core, output: &str) -> Option<String> {
     Some(version.into())
 }
 
-pub fn local_version(core: Core, root: &Path) -> Result<Option<String>, String> {
-    let executable = core.executable(root);
-    match fs::metadata(&executable) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("无法读取核心文件: {error}")),
-        Ok(metadata) if !metadata.is_file() => return Err("核心路径不是普通文件".into()),
-        Ok(_) => {}
-    }
-    read_version(core, &executable, VERSION_TIMEOUT).map(Some)
+pub fn read_version_for(core: Core, executable: &Path) -> Result<String, String> {
+    read_version(core, executable, VERSION_TIMEOUT)
 }
 
 fn read_version(core: Core, executable: &Path, timeout: Duration) -> Result<String, String> {
@@ -807,7 +844,6 @@ mod tests {
     use super::*;
     use std::io;
     use std::net::{TcpListener, TcpStream};
-    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::os::windows::process::CommandExt;
     use std::process::{Child, Command, Stdio};
@@ -834,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_channels_select_the_newest_installable_release_for_both_cores() {
+    fn release_lists_preserve_stable_and_preview_versions_and_sort_numerically() {
         for core in Core::ALL {
             let mut draft = release_version(core, "9.0.0", true);
             draft["draft"] = true.into();
@@ -846,76 +882,57 @@ mod tests {
                 release_version(core, "1.2.3", false),
                 missing_arch,
                 release_version(core, "1.3.0-beta.10", true),
-                release_version(core, "1.3.0-alpha.20", true)
+                release_version(core, "1.3.0-alpha.20", false),
+                release_version(core, "26.11.10", true),
+                release_version(core, "26.11.9", false),
+                release_version(core, "1.2.3", false)
             ]);
-            let parsed = parse_release(
-                core,
-                UpdateChannel::Preview,
-                &serde_json::to_vec(&releases).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(parsed.version, "1.3.0-beta.10");
-
-            // Xray 预览版也可能使用纯数字标签；正式版更高时仍应选择正式版。
-            for (preview, stable, expected) in [
-                ("26.11.10", "26.11.9", "26.11.10"),
-                ("26.9.30", "26.11.9", "26.11.9"),
-            ] {
-                let releases = serde_json::json!([
-                    release_version(core, preview, true),
-                    release_version(core, stable, false)
-                ]);
-                assert_eq!(
-                    parse_release(
-                        core,
-                        UpdateChannel::Preview,
-                        &serde_json::to_vec(&releases).unwrap()
-                    )
-                    .unwrap()
-                    .version,
-                    expected
-                );
-            }
-            let mut invalid = release_version(core, "2.0.0-beta.1", true);
-            invalid["assets"][0]["digest"] = serde_json::Value::Null;
-            let releases = serde_json::json!([invalid, release(core)]);
-            assert!(
-                parse_release(
-                    core,
-                    UpdateChannel::Preview,
-                    &serde_json::to_vec(&releases).unwrap()
-                )
-                .err()
-                .unwrap()
-                .contains("SHA-256")
+            let parsed = parse_releases(core, &serde_json::to_vec(&releases).unwrap()).unwrap();
+            assert!(!parsed.has_more);
+            let versions: Vec<_> = parsed
+                .versions
+                .iter()
+                .map(|item| item.version.as_str())
+                .collect();
+            assert_eq!(
+                versions,
+                [
+                    "26.11.10",
+                    "26.11.9",
+                    "1.3.0-beta.10",
+                    "1.3.0-beta.2",
+                    "1.3.0-alpha.20",
+                    "1.2.3"
+                ]
             );
+            assert_eq!(parsed.versions[0].channel, UpdateChannel::Preview);
+            assert_eq!(parsed.versions[1].channel, UpdateChannel::Stable);
+            assert_eq!(parsed.versions[4].channel, UpdateChannel::Preview);
+            assert!(
+                parsed
+                    .versions
+                    .iter()
+                    .all(|item| !item.installed && item.release_tag.is_some())
+            );
+            let mut unavailable = release(core);
+            unavailable["assets"][0]["digest"] = serde_json::Value::Null;
+            let page = vec![unavailable; 30];
+            let parsed = parse_releases(core, &serde_json::to_vec(&page).unwrap()).unwrap();
+            assert!(parsed.has_more);
+            assert_eq!(parsed.versions.len(), 1);
         }
     }
 
     #[test]
-    fn only_official_stable_archives_with_complete_sha256_are_accepted() {
+    fn downloads_require_official_assets_and_complete_sha256() {
         for core in Core::ALL {
             let good = release(core);
-            let parsed = parse_release(
-                core,
-                UpdateChannel::Stable,
-                &serde_json::to_vec(&good).unwrap(),
-            )
-            .unwrap();
+            let parsed = parse_release(core, &serde_json::to_vec(&good).unwrap()).unwrap();
             assert_eq!(parsed.version, "1.2.3");
             assert_eq!(parsed.sha256, [0xab; 32]);
-            for field in ["draft", "prerelease"] {
-                let mut bad = good.clone();
-                bad[field] = true.into();
-                assert!(
-                    parse_release(
-                        core,
-                        UpdateChannel::Stable,
-                        &serde_json::to_vec(&bad).unwrap()
-                    )
-                    .is_err()
-                );
-            }
+            let mut bad = good.clone();
+            bad["draft"] = true.into();
+            assert!(parse_release(core, &serde_json::to_vec(&bad).unwrap()).is_err());
             for digest in [
                 "sha256:abcd",
                 "md5:abcd",
@@ -924,14 +941,7 @@ mod tests {
             ] {
                 let mut bad = good.clone();
                 bad["assets"][0]["digest"] = digest.into();
-                assert!(
-                    parse_release(
-                        core,
-                        UpdateChannel::Stable,
-                        &serde_json::to_vec(&bad).unwrap()
-                    )
-                    .is_err()
-                );
+                assert!(parse_release(core, &serde_json::to_vec(&bad).unwrap()).is_err());
             }
             for url in [
                 "https://example.invalid/core.zip",
@@ -939,50 +949,26 @@ mod tests {
             ] {
                 let mut bad = good.clone();
                 bad["assets"][0]["browser_download_url"] = url.into();
-                assert!(
-                    parse_release(
-                        core,
-                        UpdateChannel::Stable,
-                        &serde_json::to_vec(&bad).unwrap()
-                    )
-                    .is_err()
-                );
+                assert!(parse_release(core, &serde_json::to_vec(&bad).unwrap()).is_err());
             }
             let mut bad = good.clone();
-            bad["tag_name"] = "v1.2.3-beta.1".into();
-            assert!(
-                parse_release(
-                    core,
-                    UpdateChannel::Stable,
-                    &serde_json::to_vec(&bad).unwrap()
-                )
-                .is_err()
-            );
-            let mut bad = good.clone();
             bad["assets"] = serde_json::json!([good["assets"][0], good["assets"][0]]);
-            assert!(
-                parse_release(
-                    core,
-                    UpdateChannel::Stable,
-                    &serde_json::to_vec(&bad).unwrap()
-                )
-                .is_err()
-            );
+            assert!(parse_release(core, &serde_json::to_vec(&bad).unwrap()).is_err());
             let mut bad = good.clone();
             bad["assets"][0]["digest"] = serde_json::Value::Null;
-            assert!(
-                parse_release(
-                    core,
-                    UpdateChannel::Stable,
-                    &serde_json::to_vec(&bad).unwrap()
-                )
-                .is_err()
-            );
+            assert!(parse_release(core, &serde_json::to_vec(&bad).unwrap()).is_err());
+            for (version, prerelease) in [("1.3.0-beta.1", false), ("26.11.10", true)] {
+                let data = serde_json::to_vec(&release_version(core, version, prerelease)).unwrap();
+                assert_eq!(
+                    parse_release(core, &data).unwrap().channel,
+                    UpdateChannel::Preview
+                );
+            }
         }
     }
 
     #[test]
-    fn version_parsing_preserves_prereleases_and_avoids_downgrades() {
+    fn version_parsing_and_ordering_preserve_prereleases() {
         assert_eq!(
             parse_version(Core::SingBox, "sing-box version 1.14.4\nEnvironment: go"),
             Some("1.14.4".into())
@@ -1002,12 +988,6 @@ mod tests {
             parse_version(Core::Xray, "PRIVATE_CONFIG_VALUE 26.11.9"),
             None
         );
-        assert!(needs_update(Some("1.2.3-beta.1"), "1.2.3"));
-        assert!(needs_update(Some("1.2.9"), "1.2.10"));
-        assert!(needs_update(None, "1.2.3"));
-        assert!(!needs_update(Some("1.3.0-beta.1"), "1.2.3"));
-        assert!(!needs_update(Some("1.2.3"), "1.2.3"));
-        assert!(!needs_update(Some("1.2.3+build"), "1.2.3"));
         for (older, newer) in [
             ("1.2.3-alpha.9", "1.2.3-beta.1"),
             ("1.2.3-beta.2", "1.2.3-beta.10"),
@@ -1016,12 +996,23 @@ mod tests {
             ("1.2.3", "1.3.0-alpha.1"),
             ("26.9.30", "26.11.9"),
         ] {
-            assert!(needs_update(Some(older), newer));
-            assert!(!needs_update(Some(newer), older));
-            assert!(!needs_update(Some(newer), newer));
+            assert_eq!(
+                compare_versions(older, newer),
+                Some(std::cmp::Ordering::Less)
+            );
+            assert_eq!(
+                compare_versions(newer, older),
+                Some(std::cmp::Ordering::Greater)
+            );
         }
-        assert!(!needs_update(Some("1.2.3-beta.1+build"), "1.2.3-beta.1"));
-        assert!(!needs_update(Some("1.2.3.0"), "1.2.3"));
+        assert_eq!(
+            compare_versions("1.2.3-beta.1+build", "1.2.3-beta.1"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_versions("1.2.3.0", "1.2.3"),
+            Some(std::cmp::Ordering::Equal)
+        );
         for invalid in ["1.2.3-", "1.2.3-beta..1", "1.2.3+", "1.2.3+build+other"] {
             assert!(version_parts(invalid).is_none());
         }
@@ -1041,12 +1032,15 @@ mod tests {
     }
 
     #[test]
-    fn archives_are_fully_staged_without_touching_existing_resources() {
+    fn archives_are_staged_then_committed_as_separate_versions() {
         let root = tempfile::tempdir().unwrap();
-        let target = Core::SingBox.core_dir(root.path());
-        fs::create_dir(&target).unwrap();
-        fs::write(target.join("sing-box.exe"), b"old").unwrap();
-        fs::write(target.join("cache.db"), b"cache").unwrap();
+        let core = Core::SingBox;
+        let first = version_directory(core, root.path(), "1.0.0").unwrap();
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("sing-box.exe"), b"old").unwrap();
+        let configs = root.path().join("configs");
+        fs::create_dir(&configs).unwrap();
+        fs::write(configs.join("user.json"), b"private config").unwrap();
         let archive = zip_file(
             root.path(),
             &[
@@ -1058,117 +1052,177 @@ mod tests {
                 ),
             ],
         );
-        let mut prepared = PreparedUpdate::new(Core::SingBox, root.path(), "1.2.3".into()).unwrap();
+        let target = version_directory(core, root.path(), "1.2.3").unwrap();
+        let mut prepared = PreparedUpdate::new(core, root.path(), "1.2.3".into()).unwrap();
         prepared
-            .extract(Core::SingBox, &archive, &AtomicBool::new(false))
+            .extract(core, &archive, &AtomicBool::new(false))
             .unwrap();
-        assert_eq!(fs::read(target.join("sing-box.exe")).unwrap(), b"old");
-        assert!(!target.join("libcronet.dll").exists());
+        assert!(!target.exists());
         prepared.install().unwrap();
-        prepared.commit().unwrap();
+        drop(prepared);
         assert_eq!(fs::read(target.join("sing-box.exe")).unwrap(), b"new");
         assert_eq!(fs::read(target.join("libcronet.dll")).unwrap(), b"dll");
-        assert_eq!(fs::read(target.join("cache.db")).unwrap(), b"cache");
         assert!(!target.join("config.json").exists());
-        assert_eq!(fs::read(target.join("sing-box.exe.old")).unwrap(), b"old");
-        assert!(!target.join("libcronet.dll.old").exists());
+        assert_eq!(fs::read(first.join("sing-box.exe")).unwrap(), b"old");
+        assert_eq!(
+            fs::read(configs.join("user.json")).unwrap(),
+            b"private config"
+        );
+        assert_eq!(installed_versions(core, root.path()).unwrap().len(), 2);
     }
 
     #[test]
-    fn committed_backups_remain_until_the_next_install_and_only_known_files_are_cleaned() {
+    fn versions_coexist_and_deletion_preserves_other_versions_and_cores() {
         let root = tempfile::tempdir().unwrap();
         for core in Core::ALL {
-            let target = core.core_dir(root.path());
-            fs::create_dir(&target).unwrap();
-            for name in artifacts(core) {
-                fs::write(target.join(name), b"version 1").unwrap();
-            }
-            fs::write(target.join("custom.old"), b"custom").unwrap();
-            let files: Vec<_> = artifacts(core)
-                .iter()
-                .map(|&name| (name, b"version 2".as_slice()))
-                .collect();
-            let mut prepared = PreparedUpdate::for_test(core, root.path(), "2.0.0", &files);
-            prepared.install().unwrap();
-            prepared.commit().unwrap();
-            drop(prepared);
-            let prepared = PreparedUpdate::for_test(
-                core,
-                root.path(),
-                "3.0.0",
-                &[(artifacts(core)[0], b"version 3")],
-            );
-            drop(prepared);
-            for name in artifacts(core) {
-                assert_eq!(
-                    fs::read(target.join(format!("{name}.old"))).unwrap(),
-                    b"version 1"
+            for version in ["1.0.0", "2.0.0", "3.0.0-beta.1"] {
+                let mut prepared = PreparedUpdate::for_test(
+                    core,
+                    root.path(),
+                    version,
+                    &[(artifacts(core)[0], version.as_bytes())],
                 );
+                if version == "2.0.0" {
+                    prepared.channel = UpdateChannel::Preview;
+                    prepared.release_tag = Some("v2.0.0".into());
+                }
+                prepared.install().unwrap();
             }
-            let mut prepared = PreparedUpdate::for_test(
-                core,
-                root.path(),
-                "3.0.0",
-                &[(artifacts(core)[0], b"version 3")],
-            );
-            prepared.install().unwrap();
-            prepared.commit().unwrap();
-            assert_eq!(
-                fs::read(target.join(format!("{}.old", artifacts(core)[0]))).unwrap(),
-                b"version 2"
-            );
-            for name in &artifacts(core)[1..] {
-                assert!(!target.join(format!("{name}.old")).exists());
-                assert_eq!(fs::read(target.join(name)).unwrap(), b"version 2");
-            }
-            assert_eq!(fs::read(target.join("custom.old")).unwrap(), b"custom");
+            let versions = installed_versions(core, root.path()).unwrap();
+            assert_eq!(versions.len(), 3);
+            assert_eq!(versions[0].version, "3.0.0-beta.1");
+            assert_eq!(versions[1].channel, UpdateChannel::Preview);
+            assert_eq!(versions[1].release_tag.as_deref(), Some("v2.0.0"));
         }
+        delete_version(Core::SingBox, root.path(), "2.0.0").unwrap();
+        let versions = installed_versions(Core::SingBox, root.path()).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(versions.iter().all(|item| item.version != "2.0.0"));
         assert_eq!(
-            fs::read(Core::SingBox.core_dir(root.path()).join("sing-box.exe.old")).unwrap(),
-            b"version 2"
+            installed_versions(Core::Xray, root.path()).unwrap().len(),
+            3
+        );
+        assert_eq!(
+            fs::read(
+                version_directory(Core::SingBox, root.path(), "1.0.0")
+                    .unwrap()
+                    .join("sing-box.exe")
+            )
+            .unwrap(),
+            b"1.0.0"
         );
     }
 
     #[test]
-    fn locked_or_non_file_old_backups_abort_before_changing_the_installed_core() {
+    fn duplicate_installs_and_abandoned_downloads_never_replace_existing_files() {
         let root = tempfile::tempdir().unwrap();
-        let target = Core::Xray.core_dir(root.path());
-        fs::create_dir(&target).unwrap();
-        fs::write(target.join("xray.exe"), b"current").unwrap();
-        let backup = target.join("xray.exe.old");
-        fs::write(&backup, b"previous").unwrap();
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&backup)
-            .unwrap();
-        let mut prepared =
-            PreparedUpdate::for_test(Core::Xray, root.path(), "2.0.0", &[("xray.exe", b"new")]);
+        let core = Core::Xray;
+        let mut first =
+            PreparedUpdate::for_test(core, root.path(), "1.0.0", &[("xray.exe", b"original")]);
+        first.install().unwrap();
+        assert!(first.install().is_err());
+        let mut duplicate =
+            PreparedUpdate::for_test(core, root.path(), "1.0.0", &[("xray.exe", b"replacement")]);
+        assert!(duplicate.install().unwrap_err().contains("已存在"));
+        let abandoned =
+            PreparedUpdate::for_test(core, root.path(), "2.0.0", &[("xray.exe", b"abandoned")]);
+        let staging = abandoned.directory.path().to_owned();
+        drop(abandoned);
+        assert!(!staging.exists());
         assert!(
-            prepared
-                .install()
-                .unwrap_err()
-                .contains("清理 xray.exe.old 失败")
+            !version_directory(core, root.path(), "2.0.0")
+                .unwrap()
+                .exists()
         );
-        assert_eq!(fs::read(target.join("xray.exe")).unwrap(), b"current");
-        drop(lock);
-        assert_eq!(fs::read(&backup).unwrap(), b"previous");
-        fs::remove_file(&backup).unwrap();
-        fs::create_dir(&backup).unwrap();
-        assert!(
-            prepared
-                .install()
-                .unwrap_err()
-                .contains("不是可清理的普通备份文件")
+        assert_eq!(
+            fs::read(
+                version_directory(core, root.path(), "1.0.0")
+                    .unwrap()
+                    .join("xray.exe")
+            )
+            .unwrap(),
+            b"original"
         );
-        assert_eq!(fs::read(target.join("xray.exe")).unwrap(), b"current");
     }
 
     #[test]
-    fn missing_libraries_unsafe_paths_and_duplicate_artifacts_abort_before_replacement() {
+    fn archives_without_optional_libraries_and_damaged_metadata_remain_manageable() {
+        let root = tempfile::tempdir().unwrap();
+        for core in Core::ALL {
+            let archive = zip_file(
+                root.path(),
+                &[(artifacts(core)[0], b"historical executable")],
+            );
+            let mut prepared = PreparedUpdate::new(core, root.path(), "1.0.0".into()).unwrap();
+            prepared
+                .extract(core, &archive, &AtomicBool::new(false))
+                .unwrap();
+            prepared.install().unwrap();
+            let target = version_directory(core, root.path(), "1.0.0").unwrap();
+            fs::write(target.join(".ladder-version.json"), b"broken json").unwrap();
+            let versions = installed_versions(core, root.path()).unwrap();
+            assert_eq!(versions.len(), 1);
+            assert!(versions[0].installed);
+            assert_eq!(versions[0].channel, UpdateChannel::Stable);
+            assert_eq!(versions[0].release_tag, None);
+            fs::remove_file(target.join(artifacts(core)[0])).unwrap();
+            let incomplete = installed_versions(core, root.path()).unwrap();
+            assert_eq!(incomplete.len(), 1);
+            assert!(incomplete[0].installed);
+            delete_version(core, root.path(), "1.0.0").unwrap();
+            assert!(installed_versions(core, root.path()).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn version_paths_reject_traversal_and_junctions_before_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("keep.txt"), b"keep").unwrap();
+        for version in [
+            "..",
+            "../1.0.0",
+            "1.0.0/../2.0.0",
+            "1.0.0:stream",
+            "C:\\outside",
+            "1.0.0 ",
+        ] {
+            assert!(version_directory(Core::Xray, root.path(), version).is_err());
+            assert!(delete_version(Core::Xray, root.path(), version).is_err());
+        }
+        for depth in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let mut path = Core::Xray.core_dir(root.path());
+            if depth > 0 {
+                path.push("versions");
+            }
+            if depth > 1 {
+                path.push("1.0.0");
+            }
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let status = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&path)
+                .arg(outside.path())
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert!(version_directory(Core::Xray, root.path(), "1.0.0").is_err());
+            assert!(delete_version(Core::Xray, root.path(), "1.0.0").is_err());
+            assert!(installed_versions(Core::Xray, root.path()).is_err());
+            assert_eq!(fs::read(outside.path().join("keep.txt")).unwrap(), b"keep");
+            fs::remove_dir(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_executables_unsafe_paths_and_duplicate_artifacts_abort_before_installing() {
         let root = tempfile::tempdir().unwrap();
         let cases: &[&[(&str, &[u8])]] = &[
-            &[("sing-box.exe", b"exe")],
+            &[("libcronet.dll", b"dll")],
             &[
                 ("sing-box.exe", b"exe"),
                 ("libcronet.dll", b"dll"),
@@ -1197,86 +1251,6 @@ mod tests {
             );
             assert!(!Core::SingBox.core_dir(root.path()).exists());
         }
-    }
-
-    #[test]
-    fn a_locked_later_artifact_rolls_back_replacements_and_removes_new_files() {
-        let root = tempfile::tempdir().unwrap();
-        let target = Core::Xray.core_dir(root.path());
-        fs::create_dir(&target).unwrap();
-        fs::write(target.join("xray.exe"), b"old exe").unwrap();
-        fs::write(target.join("geosite.dat"), b"old geosite").unwrap();
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(target.join("geosite.dat"))
-            .unwrap();
-        let mut prepared = PreparedUpdate::for_test(
-            Core::Xray,
-            root.path(),
-            "1.2.3",
-            &[
-                ("xray.exe", b"new exe"),
-                ("geoip.dat", b"new geoip"),
-                ("geosite.dat", b"new geosite"),
-            ],
-        );
-        assert!(prepared.install().unwrap_err().contains("已恢复到更新前"));
-        assert_eq!(fs::read(target.join("xray.exe")).unwrap(), b"old exe");
-        assert!(!target.join("geoip.dat").exists());
-        drop(lock);
-        assert_eq!(
-            fs::read(target.join("geosite.dat")).unwrap(),
-            b"old geosite"
-        );
-    }
-
-    #[test]
-    fn rollback_failure_retains_backup_and_can_be_retried_after_unlocking() {
-        let root = tempfile::tempdir().unwrap();
-        let target = Core::Xray.core_dir(root.path());
-        fs::create_dir(&target).unwrap();
-        fs::write(target.join("xray.exe"), b"old").unwrap();
-        let mut prepared =
-            PreparedUpdate::for_test(Core::Xray, root.path(), "1.2.3", &[("xray.exe", b"new")]);
-        prepared.install().unwrap();
-        let backup = target.join("xray.exe.old");
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(target.join("xray.exe"))
-            .unwrap();
-        assert!(prepared.rollback().unwrap_err().contains("旧文件保留在"));
-        assert_eq!(fs::read(&backup).unwrap(), b"old");
-        drop(lock);
-        prepared.rollback().unwrap();
-        assert_eq!(fs::read(target.join("xray.exe")).unwrap(), b"old");
-        assert!(!backup.exists());
-    }
-
-    #[test]
-    fn dropping_an_uncommitted_update_restores_old_files_and_preserves_blocked_backups() {
-        let root = tempfile::tempdir().unwrap();
-        let target = Core::Xray.core_dir(root.path());
-        fs::create_dir(&target).unwrap();
-        fs::write(target.join("xray.exe"), b"old").unwrap();
-        let mut prepared =
-            PreparedUpdate::for_test(Core::Xray, root.path(), "1.2.3", &[("xray.exe", b"new")]);
-        prepared.install().unwrap();
-        drop(prepared);
-        assert_eq!(fs::read(target.join("xray.exe")).unwrap(), b"old");
-        let mut prepared =
-            PreparedUpdate::for_test(Core::Xray, root.path(), "1.2.3", &[("xray.exe", b"new")]);
-        prepared.install().unwrap();
-        let backup = target.join("xray.exe.old");
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(target.join("xray.exe"))
-            .unwrap();
-        drop(prepared);
-        assert_eq!(fs::read(backup).unwrap(), b"old");
-        drop(lock);
     }
 
     fn server(replies: Vec<Vec<u8>>) -> (String, thread::JoinHandle<()>) {
@@ -1323,6 +1297,8 @@ mod tests {
     fn download_for(data: &[u8]) -> Download {
         Download {
             version: "1.2.3".into(),
+            channel: UpdateChannel::Stable,
+            tag: "v1.2.3".into(),
             url: String::new(),
             size: data.len() as u64,
             sha256: Sha256::digest(data).into(),
@@ -1503,17 +1479,16 @@ fn main() {
     #[test]
     fn version_commands_have_a_deadline_and_never_expose_raw_output() {
         let root = tempfile::tempdir().unwrap();
-        assert_eq!(local_version(Core::SingBox, root.path()).unwrap(), None);
-        let target = Core::SingBox.core_dir(root.path());
-        fs::create_dir(&target).unwrap();
+        let target = version_directory(Core::SingBox, root.path(), "1.0.0").unwrap();
+        fs::create_dir_all(&target).unwrap();
         let exe = Core::SingBox.executable(root.path());
         fs::copy(version_fixture(), &exe).unwrap();
         assert_eq!(
-            local_version(Core::SingBox, root.path()).unwrap(),
-            Some("1.2.3-beta.1".into())
+            read_version_for(Core::SingBox, &exe).unwrap(),
+            "1.2.3-beta.1"
         );
         fs::write(target.join("failure"), b"").unwrap();
-        let error = local_version(Core::SingBox, root.path()).unwrap_err();
+        let error = read_version_for(Core::SingBox, &exe).unwrap_err();
         assert!(!error.contains("PRIVATE_CORE_OUTPUT"));
         fs::remove_file(target.join("failure")).unwrap();
         fs::write(target.join("sleep"), b"").unwrap();
@@ -1583,8 +1558,8 @@ fn main() {
             return;
         }
         let root = tempfile::tempdir().unwrap();
-        let target = Core::SingBox.core_dir(root.path());
-        fs::create_dir(&target).unwrap();
+        let target = version_directory(Core::SingBox, root.path(), "1.0.0").unwrap();
+        fs::create_dir_all(&target).unwrap();
         fs::copy(version_fixture(), Core::SingBox.executable(root.path())).unwrap();
         fs::write(target.join("sleep"), b"").unwrap();
         fs::write(target.join("tree"), b"").unwrap();
@@ -1623,8 +1598,8 @@ fn main() {
     #[test]
     fn successful_version_commands_also_clean_up_their_descendants() {
         let root = tempfile::tempdir().unwrap();
-        let target = Core::SingBox.core_dir(root.path());
-        fs::create_dir(&target).unwrap();
+        let target = version_directory(Core::SingBox, root.path(), "1.0.0").unwrap();
+        fs::create_dir_all(&target).unwrap();
         let executable = Core::SingBox.executable(root.path());
         fs::copy(version_fixture(), &executable).unwrap();
         fs::write(target.join("tree"), b"").unwrap();
@@ -1663,32 +1638,29 @@ fn main() {
         let root = tempfile::tempdir().unwrap();
         for core in Core::ALL {
             let cancelled = AtomicBool::new(false);
-            let mut prepared = prepare(core, channel, root.path(), None, &cancelled, |_| {})
-                .unwrap_or_else(|error| panic!("{}: {error}", core.label()))
-                .expect("a clean directory requires installation");
-            let version = prepared.version.clone();
-            assert!(!core.executable(root.path()).exists());
-            prepared.install().unwrap();
-            prepared.commit().unwrap();
-            assert_eq!(
-                local_version(core, root.path()).unwrap(),
-                Some(version.clone())
-            );
-            assert!(
-                prepare(
-                    core,
-                    channel,
-                    root.path(),
-                    Some(&version),
-                    &cancelled,
-                    |_| {}
-                )
+            let release = fetch_releases(core, 1, &cancelled)
                 .unwrap()
-                .is_none()
+                .versions
+                .into_iter()
+                .find(|item| item.channel == channel)
+                .expect("official first page must contain requested release channel");
+            let mut prepared = prepare_version(core, root.path(), &release, &cancelled, |_| {})
+                .unwrap_or_else(|error| panic!("{}: {error}", core.label()));
+            let target = version_directory(core, root.path(), &release.version).unwrap();
+            assert!(!target.exists());
+            prepared.install().unwrap();
+            assert_eq!(
+                read_version_for(core, &target.join(artifacts(core)[0])).unwrap(),
+                release.version
             );
+            assert!(prepare_version(core, root.path(), &release, &cancelled, |_| {}).is_err());
+            let local = installed_versions(core, root.path()).unwrap();
+            assert_eq!(local.len(), 1);
+            assert_eq!(local[0].channel, channel);
             eprintln!(
-                "{} {channel:?} {version}: official installation, version probe and repeat check passed",
-                core.label()
+                "{} {channel:?} {}: isolated installation and version probe passed",
+                core.label(),
+                release.version
             );
         }
     }

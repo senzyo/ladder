@@ -140,7 +140,7 @@ fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Res
     let mut window = None;
     let startup = runtime.snapshot();
     if !startup.settings.minimize_to_tray
-        || startup.error.is_some()
+        || startup.settings_error.is_some()
         || startup.dns_recovery_error.is_some()
         || startup.dns_task_warning.is_some()
     {

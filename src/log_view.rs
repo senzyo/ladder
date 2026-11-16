@@ -1,4 +1,6 @@
-use super::{Colors, MainWindow, caption, control, error_message, page_title, panel};
+use super::{
+    Colors, FeedbackScope, MainWindow, caption, control, error_message, page_title, panel,
+};
 use crate::{desktop, logging};
 use gpui::{
     Bounds, ClipboardItem, Context, Div, HitboxBehavior, MouseButton, MouseDownEvent,
@@ -249,9 +251,17 @@ impl MainWindow {
                                 if let Some(path) = logging::path()
                                     .and_then(|path| path.parent().map(std::path::Path::to_owned))
                                 {
-                                    Self::open_external(path, desktop::open_folder, cx);
+                                    Self::open_external(
+                                        path,
+                                        desktop::open_folder,
+                                        FeedbackScope::Logs,
+                                        cx,
+                                    );
                                 } else {
-                                    view.command_error = Some("应用日志目录尚未初始化".into());
+                                    view.set_command_result(
+                                        FeedbackScope::Logs,
+                                        Err("应用日志目录尚未初始化".into()),
+                                    );
                                     cx.notify();
                                 }
                             },
@@ -259,10 +269,14 @@ impl MainWindow {
                     ),
             )
             .when_some(
+                self.command_error(FeedbackScope::Logs).cloned(),
+                |el, message| el.child(error_message(message, colors)),
+            )
+            .when_some(
                 self.logs
                     .warning
                     .as_ref()
-                    .filter(|warning| Some(*warning) != self.visible_error())
+                    .filter(|warning| Some(*warning) != self.command_error(FeedbackScope::Logs))
                     .cloned(),
                 |el, warning| el.child(error_message(warning, colors)),
             )

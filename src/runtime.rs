@@ -13,7 +13,7 @@ use crate::dns::DnsLease;
 use crate::logging;
 use crate::managed_child::ManagedChild;
 use crate::scheduler::{DesktopDns, desktop_dns};
-use crate::update::{self, PreparedUpdate, UpdateChannel, UpdateProgress};
+use crate::update::{self, CoreVersion, PreparedUpdate, UpdateProgress};
 use crate::{tun_cleanup, tun_config};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,8 +40,11 @@ impl Core {
         root.join(format!("{}_core", self.label()))
     }
 
+    #[cfg(test)]
     pub(crate) fn executable(self, root: &Path) -> PathBuf {
-        self.core_dir(root).join(format!("{}.exe", self.label()))
+        self.core_dir(root)
+            .join("versions/1.0.0")
+            .join(format!("{}.exe", self.label()))
     }
 }
 
@@ -61,17 +64,6 @@ pub struct Settings {
     pub auto_sing_box: bool,
     pub auto_xray: bool,
     pub hijack_dns: bool,
-    pub sing_box_update_channel: UpdateChannel,
-    pub xray_update_channel: UpdateChannel,
-}
-
-impl Settings {
-    pub fn update_channel(&self, core: Core) -> UpdateChannel {
-        match core {
-            Core::SingBox => self.sing_box_update_channel,
-            Core::Xray => self.xray_update_channel,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,13 +82,22 @@ pub struct CoreState {
     pub installed: bool,
     pub running: bool,
     pub operation: Option<CoreOperation>,
-    pub error: Option<String>,
+    pub run_error: Option<String>,
     pub scan_error: Option<String>,
     pub version: Option<String>,
     pub version_error: Option<String>,
     pub update: Option<UpdateProgress>,
     pub update_error: Option<String>,
     pub update_message: Option<String>,
+    pub versions: Vec<CoreVersion>,
+    pub selected_version: Option<String>,
+    pub versions_loading: bool,
+    pub versions_loaded: bool,
+    pub versions_has_more: bool,
+    pub versions_error: Option<String>,
+    pub local_versions_error: Option<String>,
+    pub downloading_version: Option<String>,
+    versions_page: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -104,7 +105,7 @@ pub struct Snapshot {
     pub settings: Settings,
     pub sing_box: CoreState,
     pub xray: CoreState,
-    pub error: Option<String>,
+    pub settings_error: Option<String>,
     pub dns_recovery_error: Option<String>,
     pub dns_recovery_busy: bool,
     pub dns_task_warning: Option<String>,
@@ -142,13 +143,16 @@ pub enum Action {
     Use(Core, String),
     Set(Setting, bool),
     RetryDns,
-    Update(Core),
+    RefreshVersions(Core),
+    LoadMoreVersions(Core),
+    DownloadVersion(Core, String),
+    SwitchVersion(Core, String),
+    DeleteVersion(Core, String),
 }
 
 enum Request {
     Action(Action),
     SetTheme(ThemePreference, async_channel::Sender<()>),
-    SetUpdateChannel(Core, UpdateChannel, async_channel::Sender<()>),
     Shutdown(mpsc::Sender<Result<Option<String>, String>>),
     Prepared(Core, PreparedUpdate),
     #[cfg(test)]
@@ -160,6 +164,8 @@ struct Saved {
     settings: Settings,
     sing_box: Option<String>,
     xray: Option<String>,
+    sing_box_version: Option<String>,
+    xray_version: Option<String>,
 }
 
 impl Saved {
@@ -193,6 +199,28 @@ impl Saved {
             Core::SingBox => &self.sing_box,
             Core::Xray => &self.xray,
         }
+    }
+
+    fn selected_version(&self, core: Core) -> &Option<String> {
+        match core {
+            Core::SingBox => &self.sing_box_version,
+            Core::Xray => &self.xray_version,
+        }
+    }
+
+    fn select_version(&mut self, core: Core, version: String) {
+        match core {
+            Core::SingBox => self.sing_box_version = Some(version),
+            Core::Xray => self.xray_version = Some(version),
+        }
+    }
+
+    fn executable(&self, core: Core, root: &Path) -> Result<PathBuf, String> {
+        let version = self
+            .selected_version(core)
+            .as_deref()
+            .ok_or("未找到核心程序，请先下载并选择核心版本")?;
+        Ok(update::version_directory(core, root, version)?.join(format!("{}.exe", core.label())))
     }
 }
 
@@ -262,7 +290,12 @@ impl Runtime {
             let state = snapshot.core_mut(core);
             state.configs = list_configs(&dir)?;
             state.current = saved.current(core).clone();
-            state.installed = core.executable(&root).is_file();
+            state.selected_version = saved.selected_version(core).clone();
+            state.installed = saved.executable(core, &root).is_ok_and(|exe| exe.is_file());
+            match update::installed_versions(core, &root) {
+                Ok(versions) => state.versions = versions,
+                Err(error) => state.local_versions_error = Some(error),
+            }
             let auto = match core {
                 Core::SingBox => saved.settings.auto_sing_box,
                 Core::Xray => saved.settings.auto_xray,
@@ -295,11 +328,7 @@ impl Runtime {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let mut snapshot = self.state.lock().unwrap().clone();
-        if snapshot.error.is_none() {
-            snapshot.error = logging::warning();
-        }
-        snapshot
+        self.state.lock().unwrap().clone()
     }
 
     pub fn config_dir(&self, core: Core) -> PathBuf {
@@ -307,8 +336,13 @@ impl Runtime {
     }
 
     pub fn send(&self, action: Action) -> Result<(), String> {
-        if let Action::Update(core) = action {
-            return self.begin_update(core);
+        match action {
+            Action::RefreshVersions(core) => return self.load_versions(core, false),
+            Action::LoadMoreVersions(core) => return self.load_versions(core, true),
+            Action::DownloadVersion(core, ref version) => {
+                return self.begin_download(core, version);
+            }
+            _ => {}
         }
         let mut snapshot = self.state.lock().unwrap();
         let retry_dns = matches!(action, Action::RetryDns);
@@ -317,6 +351,12 @@ impl Runtime {
             Action::Stop(core) => Some((*core, CoreOperation::Stopping)),
             Action::Restart(core) => Some((*core, CoreOperation::Restarting)),
             Action::Use(core, _) => Some((*core, CoreOperation::Switching)),
+            Action::SwitchVersion(core, _) | Action::DeleteVersion(core, _) => {
+                if snapshot.core(*core).update.is_some() {
+                    return Err("正在下载核心，完成后可切换或删除版本".into());
+                }
+                Some((*core, CoreOperation::Updating))
+            }
             Action::Set(_, _) => None,
             Action::RetryDns => {
                 if snapshot.dns_recovery_error.is_none() || snapshot.dns_recovery_busy {
@@ -325,7 +365,9 @@ impl Runtime {
                 snapshot.dns_recovery_busy = true;
                 None
             }
-            Action::Update(_) => unreachable!(),
+            Action::RefreshVersions(_)
+            | Action::LoadMoreVersions(_)
+            | Action::DownloadVersion(_, _) => unreachable!(),
         };
         if let Some((core, operation)) = target {
             let active = snapshot.core_mut(core);
@@ -333,7 +375,12 @@ impl Runtime {
                 return Err(format!("{} 正在处理上一项操作", core.label()));
             }
             active.operation = Some(operation);
-            active.error = None;
+            if operation == CoreOperation::Updating {
+                active.update_message = None;
+                active.update_error = None;
+            } else {
+                active.run_error = None;
+            }
         }
         self.tx.send(Request::Action(action)).map_err(|_| {
             if let Some((core, _)) = target {
@@ -354,22 +401,6 @@ impl Runtime {
         Ok(rx)
     }
 
-    pub fn set_update_channel(
-        &self,
-        core: Core,
-        channel: UpdateChannel,
-    ) -> Result<async_channel::Receiver<()>, String> {
-        let snapshot = self.state.lock().unwrap();
-        if snapshot.core(core).update.is_some() {
-            return Err("正在更新，完成后可切换版本通道".into());
-        }
-        let (tx, rx) = async_channel::bounded(1);
-        self.tx
-            .send(Request::SetUpdateChannel(core, channel, tx))
-            .map_err(|_| "核心管理线程已关闭".to_string())?;
-        Ok(rx)
-    }
-
     /// 核心均已停止时返回可选的 DNS 恢复提示，失败的记录保留到下次启动。
     pub fn shutdown(&self) -> Result<Option<String>, String> {
         logging::info("runtime", "请求停止核心并退出");
@@ -382,107 +413,122 @@ impl Runtime {
             .map_err(|_| "核心管理线程未返回退出结果".to_string())?
     }
 
-    fn begin_update(&self, core: Core) -> Result<(), String> {
+    fn load_versions(&self, core: Core, more: bool) -> Result<(), String> {
+        if self.quitting.load(Ordering::Acquire) {
+            return Err("正在退出，无法获取版本列表".into());
+        }
+        let mut snapshot = self.state.lock().unwrap();
+        let state = snapshot.core_mut(core);
+        if state.versions_loading {
+            return Err("正在获取版本列表".into());
+        }
+        if more && (!state.versions_loaded || !state.versions_has_more) {
+            return Err("没有更多版本".into());
+        }
+        let page = if more { state.versions_page + 1 } else { 1 };
+        state.versions_loading = true;
+        state.versions_error = None;
+        let runtime = self.clone();
+        thread::Builder::new()
+            .name(format!("{}-releases", core.label()))
+            .spawn(move || {
+                let result = update::fetch_releases(core, page, &runtime.quitting);
+                let mut snapshot = runtime.state.lock().unwrap();
+                let state = snapshot.core_mut(core);
+                state.versions_loading = false;
+                if runtime.quitting.load(Ordering::Acquire) {
+                    return;
+                }
+                match result {
+                    Ok(releases) => {
+                        if !more {
+                            state.versions.retain(|version| version.installed);
+                        }
+                        merge_versions(&mut state.versions, releases.versions);
+                        state.versions_loaded = true;
+                        state.versions_has_more = releases.has_more;
+                        state.versions_page = page;
+                        logging::info(
+                            "update",
+                            format_args!("{} 已获取第 {page} 页版本列表", core.label()),
+                        );
+                    }
+                    Err(error) => {
+                        logging::warn(
+                            "update",
+                            format_args!("{} 获取版本列表失败：{error}", core.label()),
+                        );
+                        state.versions_error =
+                            Some(format!("{} 版本列表加载失败：{error}", core.label()));
+                    }
+                }
+            })
+            .map_err(|error| {
+                state.versions_loading = false;
+                format!("创建版本列表线程失败: {error}")
+            })?;
+        Ok(())
+    }
+
+    fn begin_download(&self, core: Core, version: &str) -> Result<(), String> {
         let mut snapshot = self.state.lock().unwrap();
         if self.quitting.load(Ordering::Acquire) {
-            return Err("正在退出，无法开始更新，请完成退出后重新打开 Ladder".into());
+            return Err("正在退出，无法开始下载".into());
         }
-        let channel = snapshot.settings.update_channel(core);
         let state = snapshot.core_mut(core);
         if state.update.is_some() || state.operation.is_some() {
             return Err(format!("{} 正在处理上一项操作", core.label()));
         }
+        let release = state
+            .versions
+            .iter()
+            .find(|release| {
+                release.version == version && !release.installed && release.release_tag.is_some()
+            })
+            .cloned()
+            .ok_or("请先获取版本列表并选择尚未下载的版本")?;
         state.update = Some(UpdateProgress::Checking);
+        state.downloading_version = Some(version.into());
         state.update_error = None;
         state.update_message = None;
         logging::info(
             "update",
-            format_args!("{} 开始检查更新，通道：{channel:?}", core.label()),
+            format_args!("{} 开始下载版本 {version}", core.label()),
         );
         let runtime = self.clone();
         thread::Builder::new()
-            .name(format!("{}-update", core.label()))
+            .name(format!("{}-download", core.label()))
             .spawn(move || {
-                let result = runtime.prepare_update(core, channel);
+                let result = runtime.prepare_download(core, &release);
                 if let Err(error) = result {
-                    if runtime.quitting.load(Ordering::Acquire) {
-                        logging::info(
-                            "update",
-                            format_args!("{} 更新已取消：{error}", core.label()),
-                        );
-                    } else {
-                        logging::error(
-                            "update",
-                            format_args!("{} 更新失败：{error}", core.label()),
-                        );
-                    }
+                    logging::warn("update", format_args!("{} 下载失败：{error}", core.label()));
                     let mut snapshot = runtime.state.lock().unwrap();
                     let state = snapshot.core_mut(core);
                     state.update = None;
-                    state.update_error = Some(error);
+                    state.downloading_version = None;
+                    state.update_error = Some(format!(
+                        "{} v{} 下载失败：{error}",
+                        core.label(),
+                        release.version
+                    ));
                     if state.operation == Some(CoreOperation::Updating) {
                         state.operation = None;
                     }
                 }
             })
-            .map_err(|e| {
+            .map_err(|error| {
                 state.update = None;
-                logging::error(
-                    "update",
-                    format_args!("{} 创建更新线程失败：{e}", core.label()),
-                );
-                format!("创建更新线程失败: {e}")
+                state.downloading_version = None;
+                format!("创建下载线程失败: {error}")
             })?;
         Ok(())
     }
 
-    fn prepare_update(&self, core: Core, channel: UpdateChannel) -> Result<(), String> {
-        let version = update::local_version(core, &self.root);
-        if let Err(error) = &version {
-            logging::warn(
-                "update",
-                format_args!("{} 读取本地版本失败：{error}", core.label()),
-            );
-        }
-        let local = version.as_ref().ok().and_then(|value| value.as_deref());
-        {
-            let mut snapshot = self.state.lock().unwrap();
-            let state = snapshot.core_mut(core);
-            state.version = local.map(str::to_owned);
-            state.version_error = version.as_ref().err().cloned();
-        }
-        let prepared = update::prepare(
-            core,
-            channel,
-            &self.root,
-            local,
-            &self.quitting,
-            |progress| {
-                let mut snapshot = self.state.lock().unwrap();
-                let state = snapshot.core_mut(core);
-                if state.update.as_ref().map(std::mem::discriminant)
-                    != Some(std::mem::discriminant(&progress))
-                {
-                    let phase = match progress {
-                        UpdateProgress::Checking => "检查发布信息",
-                        UpdateProgress::Downloading { .. } => "下载安装包",
-                        UpdateProgress::Verifying => "校验安装包",
-                        UpdateProgress::Extracting => "解压并验证核心",
-                        UpdateProgress::Installing => "安装核心",
-                    };
-                    logging::info("update", format_args!("{} {phase}", core.label()));
-                }
-                state.update = Some(progress);
-            },
-        )?;
-        let Some(prepared) = prepared else {
-            let mut snapshot = self.state.lock().unwrap();
-            let state = snapshot.core_mut(core);
-            state.update = None;
-            state.update_message = Some("无需更新".into());
-            logging::info("update", format_args!("{} 无需更新", core.label()));
-            return Ok(());
-        };
+    fn prepare_download(&self, core: Core, release: &CoreVersion) -> Result<(), String> {
+        let prepared =
+            update::prepare_version(core, &self.root, release, &self.quitting, |progress| {
+                self.state.lock().unwrap().core_mut(core).update = Some(progress);
+            })?;
         self.queue_prepared(core, prepared)
     }
 
@@ -509,6 +555,30 @@ impl Runtime {
             thread::sleep(Duration::from_millis(30));
         }
     }
+}
+
+fn merge_versions(existing: &mut Vec<CoreVersion>, versions: Vec<CoreVersion>) {
+    for mut version in versions {
+        if let Some(current) = existing
+            .iter_mut()
+            .find(|current| current.version == version.version)
+        {
+            version.installed |= current.installed;
+            if version.release_tag.is_none() {
+                version.release_tag = current.release_tag.clone();
+                version.channel = current.channel;
+            }
+            *current = version;
+        } else {
+            existing.push(version);
+        }
+    }
+    existing.sort_by(|left, right| {
+        right.installed.cmp(&left.installed).then_with(|| {
+            update::compare_versions(&right.version, &left.version)
+                .unwrap_or_else(|| right.version.cmp(&left.version))
+        })
+    });
 }
 
 fn list_configs(dir: &Path) -> Result<Vec<String>, String> {
@@ -575,57 +645,33 @@ struct Worker {
 
 impl Worker {
     fn apply_update(&mut self, core: Core, mut prepared: PreparedUpdate) {
-        logging::info("update", format_args!("{} 开始安装核心", core.label()));
-        self.poll(core);
-        let old_version = self.state.lock().unwrap().core(core).version.clone();
-        let result = self.replace_core(core, &mut prepared);
-        let mut snapshot = self.state.lock().unwrap();
-        let state = snapshot.core_mut(core);
-        state.operation = None;
-        state.update = None;
-        state.running = self.children[core as usize].is_some();
-        state.installed = core.executable(&self.root).is_file();
-        match result {
-            Ok(warning) => {
-                logging::info(
-                    "update",
-                    format_args!(
-                        "{} 安装完成，版本 {}，保持停止",
-                        core.label(),
-                        prepared.version
-                    ),
-                );
-                if let Some(warning) = &warning {
-                    logging::warn("update", format_args!("{} {warning}", core.label()));
+        let result = if self.quitting.load(Ordering::Acquire) {
+            Err("下载已取消，现有核心文件保持不变".into())
+        } else {
+            prepared.install()
+        };
+        self.refresh();
+        {
+            let mut snapshot = self.state.lock().unwrap();
+            let state = snapshot.core_mut(core);
+            state.operation = None;
+            state.update = None;
+            state.downloading_version = None;
+            match result {
+                Ok(()) => {
+                    logging::info(
+                        "update",
+                        format_args!("{} 已下载版本 {}", core.label(), prepared.version),
+                    );
+                    state.update_error = None;
+                    state.update_message = Some(format!("{} 已下载，可切换使用", prepared.version));
                 }
-                state.version = Some(prepared.version.clone());
-                state.version_error = None;
-                state.update_error = warning;
-                state.update_message = Some("安装完成".into());
-                state.error = None;
-            }
-            Err(error) => {
-                logging::error("update", format_args!("{} 安装失败：{error}", core.label()));
-                state.version = old_version;
-                state.update_error = Some(error);
+                Err(error) => {
+                    logging::error("update", format_args!("{} 安装失败：{error}", core.label()));
+                    state.update_error = Some(error);
+                }
             }
         }
-    }
-
-    fn replace_core(
-        &mut self,
-        core: Core,
-        prepared: &mut PreparedUpdate,
-    ) -> Result<Option<String>, String> {
-        if self.quitting.load(Ordering::Acquire) {
-            return Err("更新已取消，现有核心文件保持不变".into());
-        }
-        self.stop(core)?;
-        if self.quitting.load(Ordering::Acquire) {
-            return Err("更新已取消，现有核心文件保持不变".into());
-        }
-        prepared.install()?;
-        Ok(prepared.commit().err())
     }
 
     fn run(mut self, rx: mpsc::Receiver<Request>) {
@@ -656,10 +702,6 @@ impl Worker {
                     self.update_settings(|settings| settings.theme = theme);
                     let _ = reply.try_send(());
                 }
-                Ok(Request::SetUpdateChannel(core, channel, reply)) => {
-                    self.set_update_channel(core, channel);
-                    let _ = reply.try_send(());
-                }
                 Ok(Request::Shutdown(reply)) => {
                     let result = self.stop_all();
                     let done = result.is_ok();
@@ -687,11 +729,17 @@ impl Worker {
     }
 
     fn action(&mut self, action: Action) {
+        let version_action = matches!(
+            action,
+            Action::SwitchVersion(..) | Action::DeleteVersion(..)
+        );
         let operation = match &action {
             Action::Start(core) => Some((*core, "启动")),
             Action::Stop(core) => Some((*core, "停止")),
             Action::Restart(core) => Some((*core, "重启")),
             Action::Use(core, _) => Some((*core, "切换配置")),
+            Action::SwitchVersion(core, _) => Some((*core, "切换版本")),
+            Action::DeleteVersion(core, _) => Some((*core, "删除版本")),
             _ => None,
         };
         if let Some((core, operation)) = operation {
@@ -735,7 +783,11 @@ impl Worker {
                 (core, result)
             }
             Action::Use(core, name) => (core, self.use_config(core, &name)),
-            Action::Update(_) => unreachable!(),
+            Action::SwitchVersion(core, version) => (core, self.switch_version(core, &version)),
+            Action::DeleteVersion(core, version) => (core, self.delete_version(core, &version)),
+            Action::RefreshVersions(_)
+            | Action::LoadMoreVersions(_)
+            | Action::DownloadVersion(_, _) => unreachable!(),
         };
         let (_, operation) = operation.unwrap();
         match &result {
@@ -745,12 +797,17 @@ impl Worker {
                 format_args!("{} {operation}失败：{error}", core.label()),
             ),
         }
+        self.refresh();
         let mut snapshot = self.state.lock().unwrap();
         let status = snapshot.core_mut(core);
         status.operation = None;
         status.running = self.children[core as usize].is_some();
         status.current = self.saved.current(core).clone();
-        status.error = result.err();
+        if version_action {
+            status.update_error = result.err();
+        } else {
+            status.run_error = result.err();
+        }
     }
 
     fn update_settings(&mut self, change: impl FnOnce(&mut Settings)) {
@@ -763,51 +820,49 @@ impl Worker {
                 logging::info("settings", "软件设置已保存");
                 snapshot.settings = next.settings.clone();
                 self.saved = next;
-                snapshot.error = None;
+                snapshot.settings_error = None;
             }
             Err(e) => {
                 logging::error("settings", format_args!("保存软件设置失败：{e}"));
-                snapshot.error = Some(format!("保存软件设置失败: {e}"));
+                snapshot.settings_error = Some(format!("保存软件设置失败: {e}"));
             }
         }
     }
 
-    fn set_update_channel(&mut self, core: Core, channel: UpdateChannel) {
-        let mut snapshot = self.state.lock().unwrap();
-        if snapshot.core(core).update.is_some() {
-            logging::warn(
-                "settings",
-                format_args!("{} 正在更新，版本通道未更改", core.label()),
-            );
-            snapshot.error = Some("正在更新，版本通道未更改".into());
-            return;
+    fn switch_version(&mut self, core: Core, version: &str) -> Result<(), String> {
+        let path = update::version_directory(core, &self.root, version)?;
+        if !path.join(format!("{}.exe", core.label())).is_file() {
+            return Err("所选版本尚未下载或核心文件已丢失".into());
+        }
+        if self.saved.selected_version(core).as_deref() == Some(version) {
+            return Ok(());
         }
         let mut next = self.saved.clone();
-        match core {
-            Core::SingBox => next.settings.sing_box_update_channel = channel,
-            Core::Xray => next.settings.xray_update_channel = channel,
-        }
-        match next.store(&self.root) {
-            Ok(()) => {
-                logging::info(
-                    "settings",
-                    format_args!("{} 版本通道已保存：{channel:?}", core.label()),
-                );
-                snapshot.settings = next.settings.clone();
-                self.saved = next;
-                let state = snapshot.core_mut(core);
-                state.update_message = None;
-                state.update_error = None;
-                snapshot.error = None;
+        next.select_version(core, version.into());
+        next.store(&self.root)
+            .map_err(|error| format!("保存核心版本失败: {error}"))?;
+        // 保存失败不能中断当前进程；停止失败时仍保留其运行版本，禁止误删。
+        if let Err(error) = self.stop(core) {
+            if let Err(save_error) = self.saved.store(&self.root) {
+                return Err(format!("{error}；恢复版本选择失败: {save_error}"));
             }
-            Err(e) => {
-                logging::error(
-                    "settings",
-                    format_args!("{} 保存版本通道失败：{e}", core.label()),
-                );
-                snapshot.error = Some(format!("保存版本通道失败: {e}"));
-            }
+            return Err(error);
         }
+        self.saved = next;
+        self.version_files[core as usize] = None;
+        self.state.lock().unwrap().core_mut(core).update_message =
+            Some(format!("已切换到 {version}，请手动启动"));
+        Ok(())
+    }
+
+    fn delete_version(&mut self, core: Core, version: &str) -> Result<(), String> {
+        if self.saved.selected_version(core).as_deref() == Some(version) {
+            return Err("当前使用的版本无法删除，请先切换到其他版本".into());
+        }
+        update::delete_version(core, &self.root, version)?;
+        self.state.lock().unwrap().core_mut(core).update_message =
+            Some(format!("已删除 {version}"));
+        Ok(())
     }
 
     fn use_config(&mut self, core: Core, name: &str) -> Result<(), String> {
@@ -828,10 +883,26 @@ impl Worker {
     fn refresh(&mut self) {
         for core in Core::ALL {
             let result = list_configs(&core.config_dir(&self.root));
-            let installed = core.executable(&self.root).is_file();
+            let exe = self.saved.executable(core, &self.root).ok();
+            let installed = exe.as_ref().is_some_and(|path| path.is_file());
+            let local_versions = update::installed_versions(core, &self.root);
             let mut snapshot = self.state.lock().unwrap();
             let state = snapshot.core_mut(core);
             state.installed = installed;
+            state.selected_version = self.saved.selected_version(core).clone();
+            match local_versions {
+                Ok(versions) => {
+                    state.local_versions_error = None;
+                    for release in &mut state.versions {
+                        release.installed = false;
+                    }
+                    merge_versions(&mut state.versions, versions);
+                    state
+                        .versions
+                        .retain(|release| release.installed || release.release_tag.is_some());
+                }
+                Err(error) => state.local_versions_error = Some(error),
+            }
             if !installed {
                 state.version = None;
                 state.version_error = None;
@@ -854,37 +925,32 @@ impl Worker {
                     state.scan_error = Some(e);
                 }
             }
-            let stamp = executable_stamp(&core.executable(&self.root));
-            if self.version_files[core as usize] != stamp && state.update.is_none() {
+            let stamp = exe.as_deref().and_then(executable_stamp);
+            if self.version_files[core as usize] != stamp {
                 self.version_files[core as usize] = stamp;
                 state.version = None;
                 state.version_error = None;
-                if stamp.is_some() {
-                    let root = self.root.clone();
+                if let Some(exe) = exe.filter(|_| stamp.is_some()) {
                     let snapshot = self.state.clone();
                     let quitting = self.quitting.clone();
+                    let selected_version = state.selected_version.clone();
                     if let Err(error) = thread::Builder::new()
                         .name(format!("{}-version", core.label()))
                         .spawn(move || {
-                            let result = update::local_version(core, &root);
+                            let result = update::read_version_for(core, &exe);
                             let mut snapshot = snapshot.lock().unwrap();
                             let state = snapshot.core_mut(core);
                             if !quitting.load(Ordering::Acquire)
-                                && state.update.is_none()
-                                && executable_stamp(&core.executable(&root)) == stamp
+                                && state.selected_version == selected_version
+                                && executable_stamp(&exe) == stamp
                             {
                                 match result {
                                     Ok(version) => {
-                                        if let Some(version) = &version {
-                                            logging::info(
-                                                "core",
-                                                format_args!(
-                                                    "{} 本地版本：{version}",
-                                                    core.label()
-                                                ),
-                                            );
-                                        }
-                                        state.version = version;
+                                        logging::info(
+                                            "core",
+                                            format_args!("{} 本地版本：{version}", core.label()),
+                                        );
+                                        state.version = Some(version);
                                     }
                                     Err(error) => {
                                         logging::warn(
@@ -928,8 +994,8 @@ impl Worker {
     }
 
     fn start(&mut self, core: Core, config: &Path) -> Result<(), String> {
-        let assets = core.core_dir(&self.root);
-        let exe = core.executable(&self.root);
+        let exe = self.saved.executable(core, &self.root)?;
+        let assets = exe.parent().expect("version executable has a parent");
         if !exe.is_file() {
             return Err(format!("未找到核心程序: {}", exe.display()));
         }
@@ -950,7 +1016,7 @@ impl Worker {
             );
             self.cleanup_tun();
         }
-        let child = ManagedChild::spawn(core, &self.root, &exe, &assets, config)
+        let child = ManagedChild::spawn(core, &self.root, &exe, assets, config)
             .map_err(|e| format!("启动 {} 失败: {e}", core.label()))?;
         self.children[core as usize] = Some(child);
         logging::info("core", format_args!("{} 托管进程已创建", core.label()));
@@ -1088,10 +1154,10 @@ impl Worker {
                 let message = format!("检查核心状态失败: {e}");
                 let mut snapshot = self.state.lock().unwrap();
                 let state = snapshot.core_mut(core);
-                if state.error.as_deref() != Some(message.as_str()) {
+                if state.run_error.as_deref() != Some(message.as_str()) {
                     logging::error("core", format_args!("{} {message}", core.label()));
                 }
-                state.error = Some(message);
+                state.run_error = Some(message);
                 return;
             }
             Ok(Some(code)) => code,
@@ -1110,10 +1176,10 @@ impl Worker {
         };
         let mut snapshot = self.state.lock().unwrap();
         let state = snapshot.core_mut(core);
-        if state.error.as_deref() != Some(message.as_str()) {
+        if state.run_error.as_deref() != Some(message.as_str()) {
             logging::warn("core", format_args!("{} {message}", core.label()));
         }
-        state.error = Some(message);
+        state.run_error = Some(message);
     }
 }
 
@@ -1143,7 +1209,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let state = runtime.snapshot().core(core).clone();
-            if state.operation.is_none() && !state.running && state.error.is_some() {
+            if state.operation.is_none() && !state.running && state.run_error.is_some() {
                 return state;
             }
             assert!(Instant::now() < deadline, "等待核心退出超时: {state:?}");
@@ -1194,8 +1260,8 @@ mod tests {
             String::from_utf8_lossy(&build.stderr)
         );
         for core in Core::ALL {
-            let dir = root.join(format!("{}_core", core.label()));
-            fs::create_dir(&dir).unwrap();
+            let dir = core.executable(root).parent().unwrap().to_owned();
+            fs::create_dir_all(&dir).unwrap();
             fs::copy(&exe, dir.join(format!("{}.exe", core.label()))).unwrap();
             fs::create_dir_all(core.config_dir(root)).unwrap();
             let config = match core {
@@ -1209,6 +1275,11 @@ mod tests {
             )
             .unwrap();
         }
+        let mut saved = Saved::load(root).unwrap();
+        for core in Core::ALL {
+            saved.select_version(core, "1.0.0".into());
+        }
+        saved.store(root).unwrap();
         guard
     }
 
@@ -1222,7 +1293,7 @@ mod tests {
         let root = folder.path();
         let _process_test = lock_and_install_fixture_cores(root);
         let mut external = FixtureChild(
-            Command::new(root.join("sing-box_core/sing-box.exe"))
+            Command::new(Core::SingBox.executable(root))
                 .arg(Core::SingBox.config_dir(root).join("日常.JSON"))
                 .spawn()
                 .unwrap(),
@@ -1250,7 +1321,7 @@ mod tests {
             runtime.send(Action::Restart(core)).unwrap();
             let restarted = idle(&runtime, core);
             assert!(restarted.running, "{restarted:?}");
-            assert!(restarted.error.is_none(), "{restarted:?}");
+            assert!(restarted.run_error.is_none(), "{restarted:?}");
             assert_eq!(restarted.current.as_deref(), Some("日常.JSON"));
             pids[core as usize] =
                 next_pid(&core.config_dir(root).join("日常.pid"), pids[core as usize]);
@@ -1275,7 +1346,7 @@ mod tests {
         let unchanged = idle(&runtime, Core::SingBox);
         assert!(unchanged.running);
         assert_eq!(unchanged.current.as_deref(), Some("日常.JSON"));
-        assert!(unchanged.error.unwrap().contains("保存当前配置失败"));
+        assert!(unchanged.run_error.unwrap().contains("保存当前配置失败"));
         assert_eq!(
             Saved::load(root).unwrap().sing_box.as_deref(),
             Some("日常.JSON")
@@ -1292,7 +1363,7 @@ mod tests {
             Saved::load(root).unwrap().sing_box.as_deref(),
             Some("失败.json")
         );
-        let error = stopped.error.unwrap();
+        let error = stopped.run_error.unwrap();
         assert!(error.contains("42"));
         assert!(error.contains("核心没有访问所需资源的权限"));
         assert!(!error.contains("PRIVATE_FIXTURE_VALUE"));
@@ -1303,7 +1374,7 @@ mod tests {
         runtime.send(Action::Start(Core::SingBox)).unwrap();
         let retry = failed(&runtime, Core::SingBox);
         assert_eq!(retry.current.as_deref(), Some("失败.json"));
-        assert!(retry.error.unwrap().contains("42"));
+        assert!(retry.run_error.unwrap().contains("42"));
         runtime
             .send(Action::Set(Setting::AutoSingBox, true))
             .unwrap();
@@ -1334,7 +1405,7 @@ mod tests {
             if !snapshot.xray.running
                 && snapshot
                     .xray
-                    .error
+                    .run_error
                     .as_deref()
                     .is_some_and(|e| e.contains("23"))
                 && snapshot.dns_recovery_error.is_some()
@@ -1355,13 +1426,13 @@ mod tests {
         let reopened = Runtime::open(root.to_owned()).unwrap();
         let restarted = failed(&reopened, Core::SingBox);
         assert_eq!(restarted.current.as_deref(), Some("失败.json"));
-        assert!(restarted.error.unwrap().contains("42"));
+        assert!(restarted.run_error.unwrap().contains("42"));
         assert!(!reopened.snapshot().xray.running);
         assert!(reopened.snapshot().settings.minimize_to_tray);
         reopened.shutdown().unwrap();
         for state in [restart_without_file, switch_without_file] {
             assert!(state.running, "{state:?}");
-            assert!(state.error.is_some());
+            assert!(state.run_error.is_some());
             assert_eq!(state.current.as_deref(), Some("日常.JSON"));
         }
         assert_eq!(
@@ -1524,6 +1595,8 @@ mod tests {
             },
             sing_box: Some(config.into()),
             xray: Some(config.into()),
+            sing_box_version: Some("1.0.0".into()),
+            xray_version: Some("1.0.0".into()),
         };
         saved.store(root).unwrap();
         let tree = |core: Core| {
@@ -1557,7 +1630,7 @@ mod tests {
             .join(config)
             .with_extension("exit");
         fs::write(&signal, []).unwrap();
-        assert!(failed(&runtime, Core::SingBox).error.is_some());
+        assert!(failed(&runtime, Core::SingBox).run_error.is_some());
         exited(&sing);
         for handle in &xray {
             assert_eq!(
@@ -1654,6 +1727,8 @@ mod tests {
                 },
                 sing_box: Some("进程树.json".into()),
                 xray: Some("进程树.json".into()),
+                sing_box_version: Some("1.0.0".into()),
+                xray_version: Some("1.0.0".into()),
             }
             .store(root)
             .unwrap();
@@ -1788,7 +1863,7 @@ mod tests {
             .send(Action::Use(Core::SingBox, "日常.JSON".into()))
             .unwrap();
         let refused = idle(&runtime, Core::SingBox);
-        assert!(!refused.running && refused.error.is_some());
+        assert!(!refused.running && refused.run_error.is_some());
         assert!(runtime.snapshot().xray.running);
         assert_eq!(runtime.shutdown().unwrap().as_deref(), Some(error));
         assert_eq!(fs::read(journal).unwrap(), bytes);
@@ -1807,6 +1882,7 @@ mod tests {
         .unwrap();
         let saved = Saved {
             xray: Some("日常.JSON".into()),
+            xray_version: Some("1.0.0".into()),
             settings: Settings {
                 auto_xray: true,
                 ..Default::default()
@@ -1891,7 +1967,7 @@ mod tests {
         for core in Core::ALL {
             runtime.send(Action::Use(core, "日常.JSON".into())).unwrap();
             let state = idle(&runtime, core);
-            assert!(state.running && state.error.is_none(), "{state:?}");
+            assert!(state.running && state.run_error.is_none(), "{state:?}");
             assert!(journal.is_file(), "{} 启动后缺少 DNS 原值", core.label());
         }
         // 关闭开关只影响下一次启动。当前会话仍应在任意核心退出时恢复。
@@ -1913,7 +1989,7 @@ mod tests {
         fs::write(Core::SingBox.config_dir(root).join("日常.exit"), []).unwrap();
         assert!(
             failed(&runtime, Core::SingBox)
-                .error
+                .run_error
                 .unwrap()
                 .contains("23")
         );
@@ -2032,9 +2108,6 @@ mod tests {
         let defaults = Saved::load(root).unwrap().settings;
         assert_eq!(defaults.theme, ThemePreference::System);
         assert!(!defaults.hijack_dns);
-        for core in Core::ALL {
-            assert_eq!(defaults.update_channel(core), UpdateChannel::Stable);
-        }
         let path = root.join("ladder-state.json");
         Saved {
             settings: Settings {
@@ -2043,6 +2116,7 @@ mod tests {
             },
             sing_box: Some("日常.json".into()),
             xray: None,
+            ..Default::default()
         }
         .store(root)
         .unwrap();
@@ -2051,12 +2125,6 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), saved);
         assert_eq!(runtime.snapshot().settings.theme, ThemePreference::System);
         assert!(!runtime.snapshot().settings.hijack_dns);
-        for core in Core::ALL {
-            assert_eq!(
-                runtime.snapshot().settings.update_channel(core),
-                UpdateChannel::Stable
-            );
-        }
         runtime.send(Action::Set(Setting::HijackDns, true)).unwrap();
         for (theme, stored) in [
             (ThemePreference::Dark, "dark"),
@@ -2109,77 +2177,84 @@ mod tests {
             .unwrap();
         let snapshot = runtime.snapshot();
         assert_eq!(snapshot.settings.theme, ThemePreference::Light);
-        assert!(snapshot.error.unwrap().contains("保存软件设置失败"));
+        assert!(
+            snapshot
+                .settings_error
+                .unwrap()
+                .contains("保存软件设置失败")
+        );
         assert_eq!(fs::read(path).unwrap(), previous);
         runtime.shutdown().unwrap();
     }
 
     #[test]
-    fn update_channels_are_independent_persisted_and_locked_during_updates() {
+    fn version_selection_is_persisted_and_save_failure_keeps_process_running() {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
+        let _guard = lock_and_install_fixture_cores(root);
+        let core = Core::SingBox;
+        let source = fs::read(core.executable(root)).unwrap();
+        let mut prepared =
+            PreparedUpdate::for_test(core, root, "0.9.0", &[("sing-box.exe", &source)]);
+        prepared.install().unwrap();
         let runtime = Runtime::open(root.to_owned()).unwrap();
-        for core in Core::ALL {
-            runtime
-                .set_update_channel(core, UpdateChannel::Preview)
-                .unwrap()
-                .recv_blocking()
-                .unwrap();
-            assert_eq!(
-                runtime.snapshot().settings.update_channel(core),
-                UpdateChannel::Preview
-            );
-            if core == Core::SingBox {
-                assert_eq!(
-                    runtime.snapshot().settings.update_channel(Core::Xray),
-                    UpdateChannel::Stable
-                );
-            }
-        }
-        runtime.shutdown().unwrap();
-        let runtime = Runtime::open(root.to_owned()).unwrap();
-        for core in Core::ALL {
-            assert_eq!(
-                runtime.snapshot().settings.update_channel(core),
-                UpdateChannel::Preview
-            );
-            runtime.state.lock().unwrap().core_mut(core).update = Some(UpdateProgress::Checking);
-            assert!(
-                runtime
-                    .set_update_channel(core, UpdateChannel::Stable)
-                    .is_err()
-            );
-            runtime.state.lock().unwrap().core_mut(core).update = None;
-        }
-        runtime
-            .set_update_channel(Core::Xray, UpdateChannel::Stable)
-            .unwrap()
-            .recv_blocking()
-            .unwrap();
-        let saved = Saved::load(root).unwrap();
-        assert_eq!(
-            saved.settings.sing_box_update_channel,
-            UpdateChannel::Preview
-        );
-        assert_eq!(saved.settings.xray_update_channel, UpdateChannel::Stable);
-
+        runtime.send(Action::Use(core, "日常.JSON".into())).unwrap();
+        assert!(idle(&runtime, core).running);
         fs::create_dir(root.join("ladder-state.json.tmp")).unwrap();
         runtime
-            .set_update_channel(Core::SingBox, UpdateChannel::Stable)
-            .unwrap()
-            .recv_blocking()
+            .send(Action::SwitchVersion(core, "0.9.0".into()))
             .unwrap();
-        let snapshot = runtime.snapshot();
+        let unchanged = idle(&runtime, core);
+        assert!(unchanged.running);
+        assert_eq!(unchanged.selected_version.as_deref(), Some("1.0.0"));
+        assert!(unchanged.update_error.unwrap().contains("保存核心版本失败"));
+        fs::remove_dir(root.join("ladder-state.json.tmp")).unwrap();
+        runtime
+            .send(Action::SwitchVersion(core, "0.9.0".into()))
+            .unwrap();
+        let switched = idle(&runtime, core);
+        assert!(!switched.running);
+        assert_eq!(switched.selected_version.as_deref(), Some("0.9.0"));
+        assert_eq!(switched.current.as_deref(), Some("日常.JSON"));
+        runtime.shutdown().unwrap();
+        let runtime = Runtime::open(root.to_owned()).unwrap();
         assert_eq!(
-            snapshot.settings.sing_box_update_channel,
-            UpdateChannel::Preview
+            runtime.snapshot().sing_box.selected_version.as_deref(),
+            Some("0.9.0")
         );
-        assert!(snapshot.error.unwrap().contains("保存版本通道失败"));
         assert_eq!(
-            Saved::load(root).unwrap().settings.sing_box_update_channel,
-            UpdateChannel::Preview
+            runtime.snapshot().xray.selected_version.as_deref(),
+            Some("1.0.0")
         );
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn merging_release_pages_keeps_local_versions_and_official_preview_labels() {
+        use crate::update::UpdateChannel;
+        let version = |value: &str, installed, channel, tag: Option<&str>| CoreVersion {
+            version: value.into(),
+            installed,
+            channel,
+            release_tag: tag.map(str::to_owned),
+        };
+        let mut versions = vec![version("1.0.0", true, UpdateChannel::Stable, None)];
+        merge_versions(
+            &mut versions,
+            vec![
+                version("1.1.0", false, UpdateChannel::Preview, Some("v1.1.0")),
+                version("1.0.0", false, UpdateChannel::Stable, Some("v1.0.0")),
+            ],
+        );
+        assert_eq!(versions[0].version, "1.0.0");
+        merge_versions(
+            &mut versions,
+            vec![version("1.1.0", true, UpdateChannel::Stable, None)],
+        );
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version, "1.1.0");
+        assert_eq!(versions[0].channel, UpdateChannel::Preview);
+        assert!(versions.iter().all(|version| version.installed));
     }
 
     #[test]
@@ -2197,7 +2272,7 @@ mod tests {
             .unwrap();
         let state = failed(&runtime, Core::SingBox);
         assert_eq!(state.current.as_deref(), Some("选中的配置.json"));
-        assert!(state.error.unwrap().contains("未找到核心程序"));
+        assert!(state.run_error.unwrap().contains("未找到核心程序"));
         assert_eq!(
             Saved::load(folder.path()).unwrap().sing_box.as_deref(),
             Some("选中的配置.json")
@@ -2215,7 +2290,7 @@ mod tests {
         let config_dir = Core::SingBox.config_dir(root);
         fs::write(config_dir.join("配置.json"), "{}").unwrap();
         let state = Arc::new(Mutex::new(Snapshot::default()));
-        state.lock().unwrap().sing_box.error = Some("核心退出错误".into());
+        state.lock().unwrap().sing_box.run_error = Some("核心退出错误".into());
         let mut worker = Worker {
             root: root.to_owned(),
             state: state.clone(),
@@ -2229,8 +2304,9 @@ mod tests {
         assert_eq!(state.lock().unwrap().sing_box.configs, vec!["配置.json"]);
         assert!(!state.lock().unwrap().sing_box.installed);
         let executable = Core::SingBox.executable(root);
-        fs::create_dir(Core::SingBox.core_dir(root)).unwrap();
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
         fs::write(&executable, []).unwrap();
+        worker.saved.select_version(Core::SingBox, "1.0.0".into());
         worker.refresh();
         assert!(state.lock().unwrap().sing_box.installed);
         fs::remove_file(executable).unwrap();
@@ -2245,11 +2321,11 @@ mod tests {
         let snapshot = state.lock().unwrap();
         assert!(snapshot.sing_box.scan_error.is_none());
         assert_eq!(snapshot.sing_box.configs, vec!["恢复.json"]);
-        assert_eq!(snapshot.sing_box.error.as_deref(), Some("核心退出错误"));
+        assert_eq!(snapshot.sing_box.run_error.as_deref(), Some("核心退出错误"));
     }
 
     #[test]
-    fn update_keeps_download_controls_live_and_only_stops_the_target_at_install() {
+    fn downloaded_versions_coexist_without_stopping_cores_and_switch_only_stops_target() {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
         let _guard = lock_and_install_fixture_cores(root);
@@ -2258,110 +2334,183 @@ mod tests {
             runtime.send(Action::Use(core, "日常.JSON".into())).unwrap();
             assert!(idle(&runtime, core).running);
         }
+        let core = Core::SingBox;
         let xray_pid = next_pid(&Core::Xray.config_dir(root).join("日常.pid"), 0);
-        let source = fs::read(Core::SingBox.executable(root)).unwrap();
-        let config = fs::read(Core::SingBox.config_dir(root).join("日常.JSON")).unwrap();
+        let source = fs::read(core.executable(root)).unwrap();
+        let config = fs::read(core.config_dir(root).join("日常.JSON")).unwrap();
         let saved = fs::read(root.join("ladder-state.json")).unwrap();
-        fs::write(
-            Core::SingBox.core_dir(root).join("custom.dat"),
-            b"user data",
-        )
-        .unwrap();
         runtime.state.lock().unwrap().sing_box.update = Some(UpdateProgress::Downloading {
             received: 1,
             total: 10,
         });
-        assert!(runtime.send(Action::Update(Core::SingBox)).is_err());
-        runtime.send(Action::Stop(Core::SingBox)).unwrap();
-        assert!(!idle(&runtime, Core::SingBox).running);
-        runtime.send(Action::Start(Core::SingBox)).unwrap();
-        assert!(idle(&runtime, Core::SingBox).running);
-        let prepared = PreparedUpdate::for_test(
-            Core::SingBox,
-            root,
-            "1.0.0",
-            &[("sing-box.exe", &source), ("libcronet.dll", b"new library")],
-        );
-        runtime.queue_prepared(Core::SingBox, prepared).unwrap();
-        let state = idle(&runtime, Core::SingBox);
         assert!(
-            !state.running && state.update.is_none() && state.update_error.is_none(),
+            runtime
+                .send(Action::DownloadVersion(core, "2.0.0".into()))
+                .is_err()
+        );
+        runtime.send(Action::Stop(core)).unwrap();
+        assert!(!idle(&runtime, core).running);
+        runtime.send(Action::Start(core)).unwrap();
+        assert!(idle(&runtime, core).running);
+        let prepared = PreparedUpdate::for_test(core, root, "2.0.0", &[("sing-box.exe", &source)]);
+        runtime.queue_prepared(core, prepared).unwrap();
+        let state = idle(&runtime, core);
+        assert!(
+            state.running && state.update.is_none() && state.update_error.is_none(),
             "{state:?}"
         );
-        assert_eq!(state.current.as_deref(), Some("日常.JSON"));
+        assert_eq!(
+            state
+                .versions
+                .iter()
+                .filter(|version| version.installed)
+                .count(),
+            2
+        );
+        assert_eq!(state.selected_version.as_deref(), Some("1.0.0"));
+        assert_eq!(fs::read(root.join("ladder-state.json")).unwrap(), saved);
+        runtime
+            .send(Action::DeleteVersion(core, "1.0.0".into()))
+            .unwrap();
+        assert!(
+            idle(&runtime, core)
+                .update_error
+                .unwrap()
+                .contains("当前使用")
+        );
+        assert!(core.executable(root).is_file());
+        runtime
+            .send(Action::SwitchVersion(core, "2.0.0".into()))
+            .unwrap();
+        let switched = idle(&runtime, core);
+        assert!(!switched.running);
+        assert_eq!(switched.selected_version.as_deref(), Some("2.0.0"));
         assert!(runtime.snapshot().xray.running);
         assert_eq!(
             next_pid(&Core::Xray.config_dir(root).join("日常.pid"), 0),
             xray_pid
         );
-        assert_eq!(fs::read(root.join("ladder-state.json")).unwrap(), saved);
+        runtime
+            .send(Action::DeleteVersion(core, "1.0.0".into()))
+            .unwrap();
+        assert!(idle(&runtime, core).update_error.is_none());
+        assert!(!core.executable(root).exists());
         assert_eq!(
-            fs::read(Core::SingBox.config_dir(root).join("日常.JSON")).unwrap(),
+            fs::read(core.config_dir(root).join("日常.JSON")).unwrap(),
             config
         );
-        assert_eq!(
-            fs::read(Core::SingBox.core_dir(root).join("custom.dat")).unwrap(),
-            b"user data"
-        );
-        assert_eq!(
-            fs::read(Core::SingBox.core_dir(root).join("libcronet.dll")).unwrap(),
-            b"new library"
-        );
-        runtime.send(Action::Start(Core::SingBox)).unwrap();
-        assert!(idle(&runtime, Core::SingBox).running);
+        runtime.send(Action::Start(core)).unwrap();
+        assert!(idle(&runtime, core).running);
         runtime.shutdown().unwrap();
     }
 
     #[test]
-    fn locked_update_preserves_old_files_and_late_result_after_exit_is_ignored() {
-        use std::os::windows::fs::OpenOptionsExt;
+    fn late_download_after_exit_does_not_install_a_version() {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
-        let _guard = lock_and_install_fixture_cores(root);
-        let core = Core::SingBox;
-        let source = fs::read(core.executable(root)).unwrap();
         let runtime = Runtime::open(root.to_owned()).unwrap();
-        runtime.send(Action::Use(core, "日常.JSON".into())).unwrap();
-        assert!(idle(&runtime, core).running);
-        let locked = fs::File::options()
-            .read(true)
-            .share_mode(1)
-            .open(core.executable(root))
-            .unwrap();
-        let prepared =
-            PreparedUpdate::for_test(core, root, "2.0.0", &[("sing-box.exe", b"replacement")]);
-        runtime.queue_prepared(core, prepared).unwrap();
-        let state = idle(&runtime, core);
-        assert!(
-            state.update_error.is_some() && !state.running && state.operation.is_none(),
-            "{state:?}"
-        );
-        assert_eq!(fs::read(core.executable(root)).unwrap(), source);
-        drop(locked);
-        let prepared = PreparedUpdate::for_test(
-            core,
-            root,
-            "2.0.0",
-            &[("sing-box.exe", b"late replacement")],
-        );
+        let core = Core::SingBox;
+        let prepared = PreparedUpdate::for_test(core, root, "2.0.0", &[("sing-box.exe", b"late")]);
         runtime.quitting.store(true, Ordering::Release);
         runtime.state.lock().unwrap().sing_box.operation = Some(CoreOperation::Updating);
         runtime.tx.send(Request::Prepared(core, prepared)).unwrap();
         assert!(idle(&runtime, core).update_error.unwrap().contains("取消"));
-        assert_eq!(fs::read(core.executable(root)).unwrap(), source);
+        assert!(
+            !update::version_directory(core, root, "2.0.0")
+                .unwrap()
+                .exists()
+        );
         runtime.shutdown().unwrap();
-        let prepared =
-            PreparedUpdate::for_test(core, root, "2.0.0", &[("sing-box.exe", b"after shutdown")]);
+        let prepared = PreparedUpdate::for_test(core, root, "2.0.0", &[("sing-box.exe", b"late")]);
         assert!(runtime.queue_prepared(core, prepared).is_err());
-        assert_eq!(fs::read(core.executable(root)).unwrap(), source);
+    }
+
+    #[test]
+    fn running_and_version_actions_keep_each_others_errors() {
+        let folder = tempfile::tempdir().unwrap();
+        let runtime = Runtime::open(folder.path().to_owned()).unwrap();
+        let core = Core::Xray;
+        runtime.send(Action::Start(core)).unwrap();
+        let run_error = idle(&runtime, core).run_error.unwrap();
+        assert!(run_error.contains("尚未选择配置"));
+
+        runtime
+            .send(Action::SwitchVersion(core, "1.0.0".into()))
+            .unwrap();
+        let state = idle(&runtime, core);
+        assert_eq!(state.run_error.as_ref(), Some(&run_error));
+        let version_error = state.update_error.unwrap();
+        assert!(version_error.contains("所选版本尚未下载"));
+
+        runtime.send(Action::Stop(core)).unwrap();
+        let state = idle(&runtime, core);
+        assert!(state.run_error.is_none());
+        assert_eq!(state.update_error.as_ref(), Some(&version_error));
+        assert!(runtime.snapshot().sing_box.run_error.is_none());
+        assert!(runtime.snapshot().sing_box.update_error.is_none());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn current_version_probe_finishes_while_another_version_is_downloading() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let _guard = lock_and_install_fixture_cores(root);
+        let core = Core::SingBox;
+        let source = root.join("version_probe.rs");
+        fs::write(
+            &source,
+            r#"
+            fn main() {
+                let exe = std::env::current_exe().unwrap();
+                let dir = exe.parent().unwrap();
+                std::fs::write(dir.join("probe-started"), []).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !dir.join("probe-continue").exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                println!("sing-box version 1.0.0");
+            }
+        "#,
+        )
+        .unwrap();
+        let compiled = Command::new("rustc")
+            .arg(source)
+            .arg("-o")
+            .arg(core.executable(root))
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        let dir = core.executable(root).parent().unwrap().to_owned();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.join("probe-started").exists() {
+            assert!(Instant::now() < deadline, "版本探针没有启动");
+            thread::sleep(Duration::from_millis(10));
+        }
+        runtime.state.lock().unwrap().sing_box.update = Some(UpdateProgress::Downloading {
+            received: 1,
+            total: 10,
+        });
+        fs::write(dir.join("probe-continue"), []).unwrap();
+        while runtime.snapshot().sing_box.version.as_deref() != Some("1.0.0") {
+            assert!(Instant::now() < deadline, "下载期间丢失了当前版本探针结果");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(runtime.snapshot().sing_box.update.is_some());
+        runtime.shutdown().unwrap();
     }
 
     #[test]
     fn manually_installed_and_replaced_executables_refresh_the_displayed_version() {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
-        let runtime = Runtime::open(root.to_owned()).unwrap();
         let _guard = lock_and_install_fixture_cores(root);
+        let runtime = Runtime::open(root.to_owned()).unwrap();
         let core = Core::SingBox;
         let deadline = Instant::now() + Duration::from_secs(10);
         while runtime.snapshot().sing_box.version.as_deref() != Some("1.0.0") {

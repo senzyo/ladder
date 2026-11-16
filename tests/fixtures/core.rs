@@ -25,9 +25,13 @@ fn main() {
     let config = fs::read_to_string(&file).unwrap();
     if config.contains("fixture_tun") {
         let exe = env::current_exe().unwrap();
-        let root = exe.parent().unwrap().parent().unwrap();
+        let root = file.ancestors().nth(3).unwrap();
         let label = exe.file_stem().unwrap().to_str().unwrap();
-        fs::write(root.join(format!("{label}.config-path")), file.to_str().unwrap()).unwrap();
+        fs::write(
+            root.join(format!("{label}.config-path")),
+            file.to_str().unwrap(),
+        )
+        .unwrap();
     }
     if config.contains("fixture_failure") {
         eprintln!("access is denied: PRIVATE_FIXTURE_VALUE");
@@ -38,7 +42,7 @@ fn main() {
         let assets = exe.parent().unwrap().canonicalize().unwrap();
         assert_eq!(
             env::current_dir().unwrap().canonicalize().unwrap(),
-            assets.parent().unwrap()
+            file.ancestors().nth(3).unwrap().canonicalize().unwrap()
         );
         let resource_path = if exe.file_stem().unwrap() == "xray" {
             env::var_os("XRAY_LOCATION_ASSET").unwrap()

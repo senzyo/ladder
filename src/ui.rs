@@ -22,12 +22,22 @@ enum Page {
     Settings,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum FeedbackScope {
+    Config(Core),
+    Versions(Core),
+    Settings,
+    Logs,
+}
+
 #[derive(Clone)]
 enum UiAction {
     Run(Action),
     OpenFolder(Core),
     Edit(Core, String),
-    SetUpdateChannel(Core, UpdateChannel),
+    ShowVersions(Core, bool),
+    ConfirmDelete(Core, String),
+    CancelDelete,
 }
 
 pub(crate) struct MainWindow {
@@ -38,9 +48,12 @@ pub(crate) struct MainWindow {
     config_focus: [HashMap<String, FocusHandle>; 2],
     config_scroll: [ScrollHandle; 2],
     pending_theme: Option<(ThemePreference, Task<()>)>,
-    pending_update_channel: [Option<Task<()>>; 2],
+    show_versions: [bool; 2],
+    version_focus: [HashMap<String, [FocusHandle; 2]>; 2],
+    version_scroll: [ScrollHandle; 2],
+    confirm_delete: Option<(Core, String)>,
     titlebar_dark: Option<bool>,
-    command_error: Option<String>,
+    command_errors: Vec<(FeedbackScope, String)>,
     focus: FocusHandle,
     logs: LogView,
 }
@@ -72,13 +85,22 @@ impl MainWindow {
             config_focus: Default::default(),
             config_scroll: Default::default(),
             pending_theme: None,
-            pending_update_channel: [None, None],
+            show_versions: [false; 2],
+            version_focus: Default::default(),
+            version_scroll: Default::default(),
+            confirm_delete: None,
             titlebar_dark: None,
-            command_error: None,
+            command_errors: Vec::new(),
             focus,
             logs: LogView::new(),
         };
         view.refresh(cx);
+        if view.snapshot.settings_error.is_some()
+            || view.snapshot.dns_recovery_error.is_some()
+            || view.snapshot.dns_task_warning.is_some()
+        {
+            view.page = Page::Settings;
+        }
         view
     }
 
@@ -89,6 +111,20 @@ impl MainWindow {
         let next = self.runtime.snapshot();
         if next != self.snapshot {
             for core in Core::ALL {
+                let handles = &mut self.version_focus[core_index(core)];
+                *handles = next
+                    .core(core)
+                    .versions
+                    .iter()
+                    .map(|version| {
+                        handles.remove_entry(&version.version).unwrap_or_else(|| {
+                            (
+                                version.version.clone(),
+                                std::array::from_fn(|_| cx.focus_handle()),
+                            )
+                        })
+                    })
+                    .collect();
                 let files = &next.core(core).configs;
                 if *files == self.snapshot.core(core).configs {
                     continue;
@@ -116,15 +152,59 @@ impl MainWindow {
     }
 
     fn activate(&mut self, action: UiAction, cx: &mut Context<Self>) {
-        let result = match action {
-            UiAction::SetUpdateChannel(core, channel) => {
-                return self.set_update_channel(core, channel, cx);
+        let scope = match &action {
+            UiAction::Run(
+                Action::Start(core)
+                | Action::Stop(core)
+                | Action::Restart(core)
+                | Action::Use(core, _),
+            )
+            | UiAction::OpenFolder(core)
+            | UiAction::Edit(core, _) => FeedbackScope::Config(*core),
+            UiAction::Run(
+                Action::RefreshVersions(core)
+                | Action::LoadMoreVersions(core)
+                | Action::DownloadVersion(core, _)
+                | Action::SwitchVersion(core, _)
+                | Action::DeleteVersion(core, _),
+            )
+            | UiAction::ShowVersions(core, _)
+            | UiAction::ConfirmDelete(core, _) => FeedbackScope::Versions(*core),
+            UiAction::Run(Action::Set(..)) => FeedbackScope::Settings,
+            UiAction::Run(Action::RetryDns) => FeedbackScope::Settings,
+            UiAction::CancelDelete => {
+                self.confirm_delete = None;
+                cx.notify();
+                return;
             }
-            UiAction::Run(action) => self.runtime.send(action),
+        };
+        let result = match action {
+            UiAction::ShowVersions(core, show) => {
+                self.show_versions[core_index(core)] = show;
+                self.confirm_delete = None;
+                let state = self.snapshot.core(core);
+                if show && !state.versions_loaded && !state.versions_loading {
+                    self.runtime.send(Action::RefreshVersions(core))
+                } else {
+                    cx.notify();
+                    return;
+                }
+            }
+            UiAction::ConfirmDelete(core, version) => {
+                self.confirm_delete = Some((core, version));
+                cx.notify();
+                return;
+            }
+            UiAction::CancelDelete => unreachable!(),
+            UiAction::Run(action) => {
+                self.confirm_delete = None;
+                self.runtime.send(action)
+            }
             UiAction::OpenFolder(core) => {
                 return Self::open_external(
                     self.runtime.config_dir(core),
                     desktop::open_folder,
+                    scope,
                     cx,
                 );
             }
@@ -132,60 +212,32 @@ impl MainWindow {
                 return Self::open_external(
                     self.runtime.config_dir(core).join(name),
                     desktop::edit_config,
+                    scope,
                     cx,
                 );
             }
         };
-        self.command_error = result.err();
-        if let Some(message) = &self.command_error {
-            crate::logging::error("desktop", message);
-        }
+        self.set_command_result(scope, result);
         self.refresh(cx);
         cx.notify();
     }
 
-    fn open_external(path: PathBuf, open: fn(&Path) -> Result<(), String>, cx: &mut Context<Self>) {
+    fn open_external(
+        path: PathBuf,
+        open: fn(&Path) -> Result<(), String>,
+        scope: FeedbackScope,
+        cx: &mut Context<Self>,
+    ) {
         // ShellExecute 会泵 Windows 消息，执行时不能持有 GPUI 的 App 或实体借用。
         cx.spawn(async move |view, cx| {
             let result = open(&path);
-            if let Err(message) = &result {
-                crate::logging::error("desktop", message);
-            }
             let _ = view.update(cx, |view, cx| {
-                view.command_error = result.err();
+                view.set_command_result(scope, result);
                 view.refresh(cx);
                 cx.notify();
             });
         })
         .detach();
-    }
-
-    fn set_update_channel(&mut self, core: Core, channel: UpdateChannel, cx: &mut Context<Self>) {
-        if self.snapshot.settings.update_channel(core) == channel
-            || self.pending_update_channel[core_index(core)].is_some()
-        {
-            return;
-        }
-        match self.runtime.set_update_channel(core, channel) {
-            Ok(saved) => {
-                self.command_error = None;
-                self.pending_update_channel[core_index(core)] =
-                    Some(cx.spawn(async move |view, cx| {
-                        let result = saved.recv().await;
-                        let _ = view.update(cx, |view, cx| {
-                            view.pending_update_channel[core_index(core)] = None;
-                            if result.is_err() {
-                                view.command_error =
-                                    Some("版本通道未保存，管理线程已关闭。".into());
-                            }
-                            view.refresh(cx);
-                            cx.notify();
-                        });
-                    }));
-            }
-            Err(message) => self.command_error = Some(message),
-        }
-        cx.notify();
     }
 
     fn selected_theme(&self) -> ThemePreference {
@@ -194,11 +246,19 @@ impl MainWindow {
             .map_or(self.snapshot.settings.theme, |(theme, _)| *theme)
     }
 
-    fn visible_error(&self) -> Option<&String> {
-        self.command_error
-            .as_ref()
-            .or(self.snapshot.error.as_ref())
-            .or(self.snapshot.dns_task_warning.as_ref())
+    fn command_error(&self, scope: FeedbackScope) -> Option<&String> {
+        self.command_errors
+            .iter()
+            .find(|(source, _)| *source == scope)
+            .map(|(_, message)| message)
+    }
+
+    fn set_command_result(&mut self, scope: FeedbackScope, result: Result<(), String>) {
+        self.command_errors.retain(|(source, _)| *source != scope);
+        if let Err(message) = result {
+            crate::logging::error("desktop", &message);
+            self.command_errors.push((scope, message));
+        }
     }
 
     fn set_theme(&mut self, theme: ThemePreference, cx: &mut Context<Self>) {
@@ -207,13 +267,16 @@ impl MainWindow {
         }
         match self.runtime.set_theme(theme) {
             Ok(saved) => {
-                self.command_error = None;
+                self.set_command_result(FeedbackScope::Settings, Ok(()));
                 let task = cx.spawn(async move |view, cx| {
                     let result = saved.recv().await;
                     let _ = view.update(cx, |view, cx| {
                         view.pending_theme = None;
                         if result.is_err() {
-                            view.command_error = Some("主题设置未保存，管理线程已关闭。".into());
+                            view.set_command_result(
+                                FeedbackScope::Settings,
+                                Err("主题设置未保存，管理线程已关闭。".into()),
+                            );
                         }
                         view.refresh(cx);
                         cx.notify();
@@ -222,7 +285,7 @@ impl MainWindow {
                 // Replacing the task cancels the previous preview's completion handler.
                 self.pending_theme = Some((theme, task));
             }
-            Err(message) => self.command_error = Some(message),
+            Err(message) => self.set_command_result(FeedbackScope::Settings, Err(message)),
         }
         cx.notify();
     }
@@ -250,7 +313,7 @@ impl MainWindow {
                 .child(label)
                 .on_click(cx.listener(move |view, _, _, cx| {
                     view.page = page;
-                    view.command_error = None;
+                    view.confirm_delete = None;
                     view.refresh(cx);
                     cx.notify();
                 }))
@@ -295,47 +358,11 @@ impl MainWindow {
     }
 
     fn core_page(&self, core: Core, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
+        if self.show_versions[core_index(core)] {
+            return self.versions_page(core, colors, cx);
+        }
         let state = self.snapshot.core(core);
         let idle = state.operation.is_none();
-        let channel = self.snapshot.settings.update_channel(core);
-        let can_update = idle
-            && state.update.is_none()
-            && self.pending_update_channel[core_index(core)].is_none();
-        let mut channels = div()
-            .flex()
-            .flex_shrink_0()
-            .gap(px(2.))
-            .p(px(2.))
-            .bg(colors.canvas)
-            .border_1()
-            .border_color(colors.line)
-            .rounded(px(6.));
-        for (index, (option, label)) in [
-            (UpdateChannel::Stable, "稳定版"),
-            (UpdateChannel::Preview, "预览版"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let selected = channel == option;
-            channels = channels.child(
-                action_button(
-                    label,
-                    5 + index as isize,
-                    can_update.then_some(UiAction::SetUpdateChannel(core, option)),
-                    false,
-                    colors,
-                    cx,
-                )
-                .h(px(26.))
-                .min_w(px(0.))
-                .px(px(6.))
-                .border_color(rgba(0))
-                .when(selected, |el| {
-                    el.bg(colors.selection).text_color(colors.accent)
-                }),
-            );
-        }
         let current_exists = state
             .current
             .as_ref()
@@ -347,10 +374,9 @@ impl MainWindow {
             Some(CoreOperation::Stopping) => ("停止中", colors.accent),
             Some(CoreOperation::Switching) => ("切换中", colors.accent),
             Some(CoreOperation::Restarting) => ("重启中", colors.accent),
-            Some(CoreOperation::Updating) => ("替换中", colors.accent),
-            None if state.running => ("运行中", colors.running),
-            None if !state.installed => ("未安装", colors.muted),
-            None => ("已停止", colors.muted),
+            Some(CoreOperation::Updating) | None if state.running => ("运行中", colors.running),
+            Some(CoreOperation::Updating) | None if !state.installed => ("未安装", colors.muted),
+            Some(CoreOperation::Updating) | None => ("已停止", colors.muted),
         };
         let current = state
             .current
@@ -462,7 +488,7 @@ impl MainWindow {
             .on_click(cx.listener(move |view, _, _, cx| {
                 view.selected[core_index(core)] = Some(file.clone());
                 view.config_scroll[core_index(core)].scroll_to_item(index);
-                view.command_error = None;
+                view.set_command_result(FeedbackScope::Config(core), Ok(()));
                 cx.notify();
             }));
             files = files.child(row);
@@ -567,38 +593,19 @@ impl MainWindow {
                                 colors,
                             )),
                     )
-                    .child(channels)
                     .child(action_button(
-                        if state.update_error.is_some() {
-                            "重试更新"
-                        } else if state.installed {
-                            "检查更新"
-                        } else {
-                            "安装核心"
-                        },
+                        "管理版本",
                         7,
-                        can_update.then_some(UiAction::Run(Action::Update(core))),
+                        Some(UiAction::ShowVersions(core, true)),
                         !state.installed,
                         colors,
                         cx,
                     )),
             )
-            .when_some(state.update.as_ref(), |el, progress| {
-                el.child(
-                    caption(update_progress_text(progress, channel), colors)
-                        .flex_shrink_0()
-                        .text_color(colors.accent),
-                )
-            })
-            .when_some(state.update_message.clone(), |el, message| {
-                el.child(caption(message, colors).flex_shrink_0())
-            })
-            .when_some(state.update_error.clone(), |el, message| {
-                el.child(error_message(message, colors))
-            })
-            .when_some(state.version_error.clone(), |el, message| {
-                el.child(error_message(message, colors))
-            })
+            .when_some(
+                self.command_error(FeedbackScope::Config(core)).cloned(),
+                |el, message| el.child(error_message(message, colors)),
+            )
             .child(current_card)
             .when(
                 state.current.is_some() && !current_exists && state.scan_error.is_none(),
@@ -609,7 +616,7 @@ impl MainWindow {
                     ))
                 },
             )
-            .when_some(state.error.clone(), |el, message| {
+            .when_some(state.run_error.clone(), |el, message| {
                 el.child(error_message(message, colors))
             })
             .child(
@@ -639,6 +646,255 @@ impl MainWindow {
                 el.child(error_message(message, colors))
             })
             .child(config_list)
+    }
+
+    fn versions_page(&self, core: Core, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
+        let state = self.snapshot.core(core);
+        let can_manage = state.operation.is_none() && state.update.is_none();
+        let mut rows = div()
+            .id(("version-list", core_index(core)))
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .track_scroll(&self.version_scroll[core_index(core)])
+            .flex()
+            .flex_col();
+        for (index, version) in state.versions.iter().enumerate() {
+            let current = state.selected_version.as_ref() == Some(&version.version);
+            let downloading = state.update.is_some()
+                && state.downloading_version.as_ref() == Some(&version.version);
+            let confirming = self
+                .confirm_delete
+                .as_ref()
+                .is_some_and(|(target, name)| *target == core && name == &version.version);
+            let (label, color) = match version.channel {
+                UpdateChannel::Stable => ("稳定版", colors.running),
+                UpdateChannel::Preview => ("预览版", colors.warning),
+            };
+            let actions = if confirming {
+                vec![
+                    (
+                        "确认删除",
+                        can_manage.then_some(UiAction::Run(Action::DeleteVersion(
+                            core,
+                            version.version.clone(),
+                        ))),
+                    ),
+                    ("取消", Some(UiAction::CancelDelete)),
+                ]
+            } else if version.installed {
+                vec![
+                    (
+                        if current { "当前使用" } else { "切换" },
+                        (can_manage && !current).then_some(UiAction::Run(Action::SwitchVersion(
+                            core,
+                            version.version.clone(),
+                        ))),
+                    ),
+                    (
+                        "删除",
+                        (can_manage && !current)
+                            .then_some(UiAction::ConfirmDelete(core, version.version.clone())),
+                    ),
+                ]
+            } else {
+                vec![(
+                    if downloading { "下载中" } else { "下载" },
+                    (can_manage && version.release_tag.is_some()).then_some(UiAction::Run(
+                        Action::DownloadVersion(core, version.version.clone()),
+                    )),
+                )]
+            };
+            let mut buttons = div().flex().flex_shrink_0().gap(px(8.));
+            for (slot, (label, action)) in actions.into_iter().enumerate() {
+                let tab_index = 8 + (index * 2 + slot) as isize;
+                let focus = self.version_focus[core_index(core)][&version.version][slot]
+                    .clone()
+                    .tab_stop(action.is_some())
+                    .tab_index(tab_index);
+                buttons = buttons.child(
+                    action_button(label, tab_index, action, false, colors, cx)
+                        .id(SharedString::from(format!(
+                            "version-{}-{}-{slot}",
+                            core.label(),
+                            version.version
+                        )))
+                        .track_focus(&focus)
+                        .when(confirming && slot == 0, |el| el.text_color(colors.error)),
+                );
+            }
+            rows = rows.child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .px(px(12.))
+                    .py(px(12.))
+                    .when(index > 0, |el| el.border_t_1().border_color(colors.line))
+                    .when(current, |el| el.bg(colors.selection))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(100.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("v{}", version.version)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(badge(label, color, colors))
+                                    .when(version.installed && !current, |el| {
+                                        el.child(caption("已下载", colors))
+                                    })
+                                    .when(confirming, |el| {
+                                        el.child(
+                                            caption("删除此本地版本？", colors)
+                                                .text_color(colors.error),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(buttons),
+            );
+        }
+        if state.versions.is_empty() {
+            rows = rows.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(px(24.))
+                    .child(caption(
+                        if state.versions_loading {
+                            "正在获取版本列表…"
+                        } else {
+                            "暂无可用版本，请刷新列表。"
+                        },
+                        colors,
+                    )),
+            );
+        }
+        let footer_index = 8 + (state.versions.len() * 2) as isize;
+        div()
+            .id(("versions-content", core_index(core)))
+            .size_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(page_title(if core == Core::Xray {
+                        "Xray 版本"
+                    } else {
+                        "sing-box 版本"
+                    }))
+                    .child(action_button(
+                        "返回配置",
+                        5,
+                        Some(UiAction::ShowVersions(core, false)),
+                        false,
+                        colors,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(caption(
+                        match &state.selected_version {
+                            Some(version) => format!("当前使用 v{version}"),
+                            None => "下载后选择一个版本使用".into(),
+                        },
+                        colors,
+                    ))
+                    .child(action_button(
+                        if state.versions_loading {
+                            "获取中"
+                        } else {
+                            "刷新列表"
+                        },
+                        6,
+                        (!state.versions_loading)
+                            .then_some(UiAction::Run(Action::RefreshVersions(core))),
+                        false,
+                        colors,
+                        cx,
+                    )),
+            )
+            .when_some(state.update.as_ref(), |el, progress| {
+                let version = state.downloading_version.as_deref().unwrap_or("");
+                el.child(
+                    caption(
+                        format!("v{version} · {}", update_progress_text(progress)),
+                        colors,
+                    )
+                    .flex_shrink_0()
+                    .text_color(colors.accent),
+                )
+            })
+            .when_some(state.update_message.clone(), |el, message| {
+                el.child(caption(message, colors).flex_shrink_0())
+            })
+            .when_some(state.update_error.clone(), |el, message| {
+                el.child(error_message(message, colors))
+            })
+            .when_some(
+                self.command_error(FeedbackScope::Versions(core)).cloned(),
+                |el, message| el.child(error_message(message, colors)),
+            )
+            .when_some(
+                state
+                    .versions_error
+                    .as_ref()
+                    .or(state.local_versions_error.as_ref())
+                    .cloned(),
+                |el, message| el.child(error_message(message, colors)),
+            )
+            .when_some(state.version_error.clone(), |el, message| {
+                el.child(error_message(message, colors))
+            })
+            .child(
+                panel(colors)
+                    .flex_1()
+                    .min_h(px(120.))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(rows),
+            )
+            .when(state.versions_has_more, |el| {
+                el.child(action_button(
+                    "加载更多",
+                    footer_index,
+                    (!state.versions_loading)
+                        .then_some(UiAction::Run(Action::LoadMoreVersions(core))),
+                    false,
+                    colors,
+                    cx,
+                ))
+            })
     }
 
     fn settings_page(&self, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
@@ -770,6 +1026,43 @@ impl MainWindow {
             .gap(px(16.))
             .child(page_title("软件设置"))
             .child(caption("设置更改后自动保存", colors))
+            .when_some(
+                self.command_error(FeedbackScope::Settings)
+                    .or(self.snapshot.settings_error.as_ref())
+                    .cloned(),
+                |el, message| el.child(error_message(message, colors)),
+            )
+            .when_some(self.snapshot.dns_recovery_error.clone(), |el, message| {
+                let busy = self.snapshot.dns_recovery_busy;
+                el.child(
+                    div()
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(error_message(message, colors)),
+                        )
+                        .child(action_button(
+                            if busy {
+                                "正在恢复 DNS"
+                            } else {
+                                "重试恢复 DNS"
+                            },
+                            12,
+                            (!busy).then_some(UiAction::Run(Action::RetryDns)),
+                            false,
+                            colors,
+                            cx,
+                        )),
+                )
+            })
+            .when_some(self.snapshot.dns_task_warning.clone(), |el, message| {
+                el.child(error_message(message, colors))
+            })
             .child(rows)
             .child(caption("关闭窗口后，Ladder 将继续在系统托盘运行。", colors))
     }
@@ -806,6 +1099,23 @@ impl Render for MainWindow {
                         window.focus_next();
                     }
                     if let Page::Core(core) = view.page {
+                        if view.show_versions[core_index(core)] {
+                            let handles = &view.version_focus[core_index(core)];
+                            if let Some(index) =
+                                view.snapshot
+                                    .core(core)
+                                    .versions
+                                    .iter()
+                                    .position(|version| {
+                                        handles.get(&version.version).is_some_and(|handles| {
+                                            handles.iter().any(|handle| handle.is_focused(window))
+                                        })
+                                    })
+                            {
+                                view.version_scroll[core_index(core)].scroll_to_item(index);
+                                cx.notify();
+                            }
+                        }
                         let handles = &view.config_focus[core_index(core)];
                         if let Some(index) =
                             view.snapshot.core(core).configs.iter().position(|name| {
@@ -818,6 +1128,10 @@ impl Render for MainWindow {
                             cx.notify();
                         }
                     }
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "escape" && view.confirm_delete.is_some() {
+                    view.confirm_delete = None;
+                    cx.notify();
                     cx.stop_propagation();
                 } else if view.page == Page::Logs && view.logs.scroll_key(&event.keystroke.key) {
                     cx.notify();
@@ -834,37 +1148,6 @@ impl Render for MainWindow {
                     .flex_col()
                     .p(px(20.))
                     .gap(px(10.))
-                    .when_some(self.snapshot.dns_recovery_error.clone(), |el, message| {
-                        let busy = self.snapshot.dns_recovery_busy;
-                        el.child(
-                            div()
-                                .flex()
-                                .flex_shrink_0()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .child(error_message(message, colors)),
-                                )
-                                .child(action_button(
-                                    if busy {
-                                        "正在恢复 DNS"
-                                    } else {
-                                        "重试恢复 DNS"
-                                    },
-                                    0,
-                                    (!busy).then_some(UiAction::Run(Action::RetryDns)),
-                                    false,
-                                    colors,
-                                    cx,
-                                )),
-                        )
-                    })
-                    .when_some(self.visible_error().cloned(), |el, message| {
-                        el.child(error_message(message, colors))
-                    })
                     .child(div().flex_1().min_h(px(0.)).child(page)),
             )
     }
@@ -877,13 +1160,9 @@ fn core_index(core: Core) -> usize {
     }
 }
 
-fn update_progress_text(progress: &UpdateProgress, channel: UpdateChannel) -> String {
+fn update_progress_text(progress: &UpdateProgress) -> String {
     match progress {
-        UpdateProgress::Checking => match channel {
-            UpdateChannel::Stable => "正在检查官方稳定版…",
-            UpdateChannel::Preview => "正在检查官方版本（含预览版）…",
-        }
-        .into(),
+        UpdateProgress::Checking => "正在获取官方版本信息…".into(),
         UpdateProgress::Downloading { received, total } => {
             let downloaded = *received as f64 / 1_048_576.0;
             if *total == 0 {
@@ -896,7 +1175,7 @@ fn update_progress_text(progress: &UpdateProgress, channel: UpdateChannel) -> St
         }
         UpdateProgress::Verifying => "正在校验下载文件…".into(),
         UpdateProgress::Extracting => "正在准备安装文件…".into(),
-        UpdateProgress::Installing => "正在停止目标核心并替换文件…".into(),
+        UpdateProgress::Installing => "正在保存核心版本…".into(),
     }
 }
 
