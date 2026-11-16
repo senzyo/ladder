@@ -71,7 +71,6 @@ pub enum CoreOperation {
     Starting,
     Stopping,
     Switching,
-    Restarting,
     Updating,
 }
 
@@ -138,8 +137,8 @@ pub enum Setting {
 pub enum Action {
     Start(Core),
     Stop(Core),
-    Restart(Core),
-    Use(Core, String),
+    SwitchConfig(Core, String),
+    DeleteConfig(Core, String),
     Set(Setting, bool),
     RetryDns,
     RefreshVersions(Core),
@@ -355,8 +354,9 @@ impl Runtime {
         let target = match &action {
             Action::Start(core) => Some((*core, CoreOperation::Starting)),
             Action::Stop(core) => Some((*core, CoreOperation::Stopping)),
-            Action::Restart(core) => Some((*core, CoreOperation::Restarting)),
-            Action::Use(core, _) => Some((*core, CoreOperation::Switching)),
+            Action::SwitchConfig(core, _) | Action::DeleteConfig(core, _) => {
+                Some((*core, CoreOperation::Switching))
+            }
             Action::SwitchVersion(core, _) | Action::DeleteVersion(core, _) => {
                 if snapshot.core(*core).update.is_some() {
                     return Err("正在下载核心，完成后可切换或删除版本".into());
@@ -746,8 +746,8 @@ impl Worker {
         let operation = match &action {
             Action::Start(core) => Some((*core, "启动")),
             Action::Stop(core) => Some((*core, "停止")),
-            Action::Restart(core) => Some((*core, "重启")),
-            Action::Use(core, _) => Some((*core, "切换配置")),
+            Action::SwitchConfig(core, _) => Some((*core, "切换配置")),
+            Action::DeleteConfig(core, _) => Some((*core, "删除配置")),
             Action::SwitchVersion(core, _) => Some((*core, "切换版本")),
             Action::DeleteVersion(core, _) => Some((*core, "删除版本")),
             _ => None,
@@ -773,7 +773,7 @@ impl Worker {
             Action::Start(core) => {
                 let current = self.saved.current(core).clone();
                 let result = match current {
-                    None => Err("尚未选择配置, 请在配置列表中点击“使用此配置”".into()),
+                    None => Err("尚未选择配置，请在配置列表中点击“切换”".into()),
                     Some(name) if self.children[core as usize].is_none() => self
                         .readable_config(core, &name)
                         .and_then(|config| self.start(core, &config)),
@@ -781,18 +781,8 @@ impl Worker {
                 };
                 (core, result)
             }
-            Action::Restart(core) => {
-                let current = self.saved.current(core).clone();
-                let result = match current {
-                    None => Err("尚未选择配置, 请在配置列表中点击“使用此配置”".into()),
-                    Some(name) => self.readable_config(core, &name).and_then(|config| {
-                        self.stop(core)?;
-                        self.start(core, &config)
-                    }),
-                };
-                (core, result)
-            }
-            Action::Use(core, name) => (core, self.use_config(core, &name)),
+            Action::SwitchConfig(core, name) => (core, self.switch_config(core, &name)),
+            Action::DeleteConfig(core, name) => (core, self.delete_config(core, &name)),
             Action::SwitchVersion(core, version) => (core, self.switch_version(core, &version)),
             Action::DeleteVersion(core, version) => (core, self.delete_version(core, &version)),
             Action::RefreshVersions(_)
@@ -871,7 +861,7 @@ impl Worker {
         Ok(())
     }
 
-    fn use_config(&mut self, core: Core, name: &str) -> Result<(), String> {
+    fn switch_config(&mut self, core: Core, name: &str) -> Result<(), String> {
         let config = self.readable_config(core, name)?;
         let mut next = self.saved.clone();
         match core {
@@ -880,10 +870,27 @@ impl Worker {
         }
         next.store(&self.root)
             .map_err(|e| format!("保存当前配置失败: {e}"))?;
+        if let Err(error) = self.stop(core) {
+            if let Err(save_error) = self.saved.store(&self.root) {
+                return Err(format!("{error}；恢复配置选择失败: {save_error}"));
+            }
+            return Err(error);
+        }
         self.saved = next;
         self.state.lock().unwrap().core_mut(core).current = Some(name.into());
-        self.stop(core)?;
         self.start(core, &config)
+    }
+
+    fn delete_config(&mut self, core: Core, name: &str) -> Result<(), String> {
+        let config = self.readable_config(core, name)?;
+        if self.saved.current(core).as_ref().is_some_and(|current| {
+            current == name
+                || same_file::is_same_file(&config, core.config_dir(&self.root).join(current))
+                    .unwrap_or(false)
+        }) {
+            return Err("当前使用的配置无法删除，请先切换到其他配置".into());
+        }
+        fs::remove_file(config).map_err(|error| format!("删除配置文件失败: {error}"))
     }
 
     fn refresh(&mut self) {
@@ -988,6 +995,7 @@ impl Worker {
         let name_path = Path::new(name);
         if !matches!(name_path.components().next(), Some(Component::Normal(_)))
             || name_path.file_name() != Some(OsStr::new(name))
+            || name.contains(':')
             || !is_json(name_path)
             || is_runtime_config(name_path)
         {
@@ -1227,6 +1235,16 @@ mod tests {
         }
     }
 
+    fn stop_and_start(runtime: &Runtime, core: Core) {
+        runtime.send(Action::Stop(core)).unwrap();
+        let stopped = idle(runtime, core);
+        assert!(
+            !stopped.running && stopped.run_error.is_none(),
+            "{stopped:?}"
+        );
+        runtime.send(Action::Start(core)).unwrap();
+    }
+
     fn next_pid(path: &Path, previous: u32) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -1295,7 +1313,7 @@ mod tests {
 
     // 真实子进程验证 Windows 句柄归属、带空格的路径和启动失败, 不操作网络接口。
     #[test]
-    fn selection_survives_start_failure_retry_and_restart_without_affecting_other_processes() {
+    fn selection_survives_start_failure_retry_and_reconnect_without_affecting_other_processes() {
         let folder = tempfile::Builder::new()
             .prefix("梯子 runtime ")
             .tempdir()
@@ -1317,7 +1335,9 @@ mod tests {
         for core in Core::ALL {
             assert_eq!(runtime.snapshot().core(core).configs.len(), 2);
             assert!(runtime.snapshot().core(core).installed);
-            runtime.send(Action::Use(core, "日常.JSON".into())).unwrap();
+            runtime
+                .send(Action::SwitchConfig(core, "日常.JSON".into()))
+                .unwrap();
             let state = idle(&runtime, core);
             assert!(state.running, "{state:?}");
             assert_eq!(state.current.as_deref(), Some("日常.JSON"));
@@ -1328,7 +1348,7 @@ mod tests {
         fs::create_dir(&blocked_save).unwrap();
         let saved_before_restart = fs::read(root.join("ladder-state.json")).unwrap();
         for core in Core::ALL {
-            runtime.send(Action::Restart(core)).unwrap();
+            stop_and_start(&runtime, core);
             let restarted = idle(&runtime, core);
             assert!(restarted.running, "{restarted:?}");
             assert!(restarted.run_error.is_none(), "{restarted:?}");
@@ -1351,7 +1371,7 @@ mod tests {
             saved_before_restart
         );
         runtime
-            .send(Action::Use(Core::SingBox, "失败.json".into()))
+            .send(Action::SwitchConfig(Core::SingBox, "失败.json".into()))
             .unwrap();
         let unchanged = idle(&runtime, Core::SingBox);
         assert!(unchanged.running);
@@ -1364,7 +1384,7 @@ mod tests {
         fs::remove_dir(blocked_save).unwrap();
 
         runtime
-            .send(Action::Use(Core::SingBox, "失败.json".into()))
+            .send(Action::SwitchConfig(Core::SingBox, "失败.json".into()))
             .unwrap();
         let stopped = failed(&runtime, Core::SingBox);
         assert!(!stopped.running);
@@ -1394,10 +1414,8 @@ mod tests {
         let xray_dir = Core::Xray.config_dir(root);
         let moved_dir = root.join("移走的配置目录");
         fs::rename(&xray_dir, &moved_dir).unwrap();
-        runtime.send(Action::Restart(Core::Xray)).unwrap();
-        let restart_without_file = idle(&runtime, Core::Xray);
         runtime
-            .send(Action::Use(Core::Xray, "失败.json".into()))
+            .send(Action::SwitchConfig(Core::Xray, "失败.json".into()))
             .unwrap();
         let switch_without_file = idle(&runtime, Core::Xray);
         fs::rename(&moved_dir, &xray_dir).unwrap();
@@ -1440,11 +1458,9 @@ mod tests {
         assert!(!reopened.snapshot().xray.running);
         assert!(reopened.snapshot().settings.minimize_to_tray);
         reopened.shutdown().unwrap();
-        for state in [restart_without_file, switch_without_file] {
-            assert!(state.running, "{state:?}");
-            assert!(state.run_error.is_some());
-            assert_eq!(state.current.as_deref(), Some("日常.JSON"));
-        }
+        assert!(switch_without_file.running, "{switch_without_file:?}");
+        assert!(switch_without_file.run_error.is_some());
+        assert_eq!(switch_without_file.current.as_deref(), Some("日常.JSON"));
         assert_eq!(
             Saved::load(root).unwrap().xray.as_deref(),
             Some("日常.JSON")
@@ -1495,7 +1511,9 @@ mod tests {
                     .exists()
             );
             assert_eq!(state.configs.len(), 3);
-            runtime.send(Action::Use(core, source_name.into())).unwrap();
+            runtime
+                .send(Action::SwitchConfig(core, source_name.into()))
+                .unwrap();
             assert!(idle(&runtime, core).running);
             let copy = copy_path(core, Path::new(""));
             assert!(is_runtime_config(&copy));
@@ -1511,7 +1529,7 @@ mod tests {
         let xray_before = fs::read(&copies[1]).unwrap();
         let sing_before: serde_json::Value =
             serde_json::from_slice(&fs::read(&copies[0]).unwrap()).unwrap();
-        runtime.send(Action::Restart(Core::SingBox)).unwrap();
+        stop_and_start(&runtime, Core::SingBox);
         assert!(idle(&runtime, Core::SingBox).running);
         let restarted = copy_path(Core::SingBox, &copies[0]);
         let sing_after: serde_json::Value =
@@ -1534,7 +1552,7 @@ mod tests {
         )
         .unwrap();
         runtime
-            .send(Action::Use(Core::SingBox, "失败TUN.json".into()))
+            .send(Action::SwitchConfig(Core::SingBox, "失败TUN.json".into()))
             .unwrap();
         failed(&runtime, Core::SingBox);
         assert!(
@@ -1840,7 +1858,7 @@ mod tests {
         fs::write(root.join("dns-recovery.json"), b"[false]").unwrap();
         let runtime = Runtime::open(root.to_owned()).unwrap();
         runtime
-            .send(Action::Use(Core::Xray, "日常.JSON".into()))
+            .send(Action::SwitchConfig(Core::Xray, "日常.JSON".into()))
             .unwrap();
         let state = idle(&runtime, Core::Xray);
         assert!(state.running, "{state:?}");
@@ -1865,12 +1883,12 @@ mod tests {
             Some(error)
         );
         runtime
-            .send(Action::Use(Core::Xray, "日常.JSON".into()))
+            .send(Action::SwitchConfig(Core::Xray, "日常.JSON".into()))
             .unwrap();
         assert!(idle(&runtime, Core::Xray).running);
         runtime.send(Action::Set(Setting::HijackDns, true)).unwrap();
         runtime
-            .send(Action::Use(Core::SingBox, "日常.JSON".into()))
+            .send(Action::SwitchConfig(Core::SingBox, "日常.JSON".into()))
             .unwrap();
         let refused = idle(&runtime, Core::SingBox);
         assert!(!refused.running && refused.run_error.is_some());
@@ -1975,7 +1993,9 @@ mod tests {
         let journal = root.join("dns-recovery.json");
         runtime.send(Action::Set(Setting::HijackDns, true)).unwrap();
         for core in Core::ALL {
-            runtime.send(Action::Use(core, "日常.JSON".into())).unwrap();
+            runtime
+                .send(Action::SwitchConfig(core, "日常.JSON".into()))
+                .unwrap();
             let state = idle(&runtime, core);
             assert!(state.running && state.run_error.is_none(), "{state:?}");
             assert!(journal.is_file(), "{} 启动后缺少 DNS 原值", core.label());
@@ -1993,7 +2013,7 @@ mod tests {
         assert!(!journal.exists());
 
         runtime.send(Action::Set(Setting::HijackDns, true)).unwrap();
-        runtime.send(Action::Restart(Core::Xray)).unwrap();
+        stop_and_start(&runtime, Core::Xray);
         assert!(idle(&runtime, Core::Xray).running);
         assert!(journal.exists());
         fs::write(Core::SingBox.config_dir(root).join("日常.exit"), []).unwrap();
@@ -2076,10 +2096,13 @@ mod tests {
             (Action::Start(core), CoreOperation::Starting),
             (Action::Stop(core), CoreOperation::Stopping),
             (
-                Action::Use(core, "选中.json".into()),
+                Action::SwitchConfig(core, "选中.json".into()),
                 CoreOperation::Switching,
             ),
-            (Action::Restart(core), CoreOperation::Restarting),
+            (
+                Action::DeleteConfig(core, "删除.json".into()),
+                CoreOperation::Switching,
+            ),
         ] {
             runtime.send(action).unwrap();
             assert!(runtime.send(Action::Stop(core)).is_err());
@@ -2208,7 +2231,9 @@ mod tests {
             PreparedUpdate::for_test(core, root, "0.9.0", &[("sing-box.exe", &source)]);
         prepared.install().unwrap();
         let runtime = Runtime::open(root.to_owned()).unwrap();
-        runtime.send(Action::Use(core, "日常.JSON".into())).unwrap();
+        runtime
+            .send(Action::SwitchConfig(core, "日常.JSON".into()))
+            .unwrap();
         assert!(idle(&runtime, core).running);
         fs::create_dir(root.join("ladder-state.json.tmp")).unwrap();
         runtime
@@ -2308,25 +2333,122 @@ mod tests {
     }
 
     #[test]
-    fn selection_is_saved_even_when_the_core_is_missing() {
+    fn config_selection_survives_start_failure_when_the_core_is_uninstalled() {
         let folder = tempfile::tempdir().unwrap();
         let runtime = Runtime::open(folder.path().to_owned()).unwrap();
-        fs::write(
-            runtime.config_dir(Core::SingBox).join("选中的配置.json"),
-            "{}",
-        )
-        .unwrap();
-        assert!(!runtime.snapshot().sing_box.installed);
-        runtime
-            .send(Action::Use(Core::SingBox, "选中的配置.json".into()))
-            .unwrap();
-        let state = failed(&runtime, Core::SingBox);
-        assert_eq!(state.current.as_deref(), Some("选中的配置.json"));
-        assert!(state.run_error.unwrap().contains("未找到核心程序"));
-        assert_eq!(
-            Saved::load(folder.path()).unwrap().sing_box.as_deref(),
-            Some("选中的配置.json")
-        );
+        for core in Core::ALL {
+            fs::write(runtime.config_dir(core).join("选中的配置.json"), "{}").unwrap();
+            assert!(!runtime.snapshot().core(core).installed);
+            runtime
+                .send(Action::SwitchConfig(core, "选中的配置.json".into()))
+                .unwrap();
+            let state = failed(&runtime, core);
+            assert_eq!(state.current.as_deref(), Some("选中的配置.json"));
+            assert!(!state.running);
+            assert!(state.run_error.unwrap().contains("未找到核心程序"));
+            assert_eq!(
+                Saved::load(folder.path()).unwrap().current(core).as_deref(),
+                Some("选中的配置.json")
+            );
+            runtime.send(Action::Start(core)).unwrap();
+            let retry = failed(&runtime, core);
+            assert_eq!(retry.current.as_deref(), Some("选中的配置.json"));
+            assert!(retry.run_error.unwrap().contains("未找到核心程序"));
+        }
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn config_selection_save_failure_keeps_the_previous_choice() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        for core in Core::ALL {
+            for name in ["当前.json", "其他.json"] {
+                fs::write(runtime.config_dir(core).join(name), "{}").unwrap();
+            }
+            runtime
+                .send(Action::SwitchConfig(core, "当前.json".into()))
+                .unwrap();
+            assert_eq!(failed(&runtime, core).current.as_deref(), Some("当前.json"));
+            let saved = fs::read(root.join("ladder-state.json")).unwrap();
+            fs::create_dir(root.join("ladder-state.json.tmp")).unwrap();
+            runtime
+                .send(Action::SwitchConfig(core, "其他.json".into()))
+                .unwrap();
+            let unchanged = idle(&runtime, core);
+            assert_eq!(unchanged.current.as_deref(), Some("当前.json"));
+            assert!(!unchanged.running);
+            assert!(unchanged.run_error.unwrap().contains("保存当前配置失败"));
+            assert_eq!(fs::read(root.join("ladder-state.json")).unwrap(), saved);
+            fs::remove_dir(root.join("ladder-state.json.tmp")).unwrap();
+        }
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn config_deletion_protects_current_files_and_stays_inside_its_directory() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        let outside = root.join("outside.json");
+        fs::write(&outside, "outside").unwrap();
+        for core in Core::ALL {
+            let dir = runtime.config_dir(core);
+            fs::write(dir.join("current.json"), "current").unwrap();
+            fs::write(dir.join("other.JSON"), "other").unwrap();
+            fs::write(dir.join("notes.txt"), "notes").unwrap();
+            fs::write(dir.join(".ladder-tun-active.json"), "runtime").unwrap();
+            fs::create_dir(dir.join("directory.json")).unwrap();
+            fs::hard_link(dir.join("current.json"), dir.join("alias.json")).unwrap();
+            runtime
+                .send(Action::SwitchConfig(core, "current.json".into()))
+                .unwrap();
+            assert_eq!(
+                failed(&runtime, core).current.as_deref(),
+                Some("current.json")
+            );
+            let saved = fs::read(root.join("ladder-state.json")).unwrap();
+            for name in [
+                "current.json",
+                "CURRENT.JSON",
+                "alias.json",
+                "../outside.json",
+                "..\\outside.json",
+                "notes.txt",
+                ".ladder-tun-active.json",
+                "directory.json",
+                "missing.json",
+                "current.json:stream.json",
+                outside.to_str().unwrap(),
+            ] {
+                runtime
+                    .send(Action::DeleteConfig(core, name.into()))
+                    .unwrap();
+                let rejected = idle(&runtime, core);
+                assert!(rejected.run_error.is_some(), "应拒绝删除 {name}");
+                assert_eq!(rejected.current.as_deref(), Some("current.json"));
+                assert!(!rejected.running);
+            }
+            runtime
+                .send(Action::DeleteConfig(core, "other.JSON".into()))
+                .unwrap();
+            let deleted = idle(&runtime, core);
+            assert!(deleted.run_error.is_none(), "{deleted:?}");
+            assert!(!deleted.configs.iter().any(|name| name == "other.JSON"));
+            assert!(!dir.join("other.JSON").exists());
+            assert_eq!(
+                fs::read_to_string(dir.join("current.json")).unwrap(),
+                "current"
+            );
+            assert_eq!(
+                fs::read_to_string(dir.join("alias.json")).unwrap(),
+                "current"
+            );
+            assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "notes");
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+            assert_eq!(fs::read(root.join("ladder-state.json")).unwrap(), saved);
+        }
         runtime.shutdown().unwrap();
     }
 
@@ -2381,7 +2503,9 @@ mod tests {
         let _guard = lock_and_install_fixture_cores(root);
         let runtime = Runtime::open(root.to_owned()).unwrap();
         for core in Core::ALL {
-            runtime.send(Action::Use(core, "日常.JSON".into())).unwrap();
+            runtime
+                .send(Action::SwitchConfig(core, "日常.JSON".into()))
+                .unwrap();
             assert!(idle(&runtime, core).running);
         }
         let core = Core::SingBox;

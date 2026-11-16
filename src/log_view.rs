@@ -1,6 +1,6 @@
 use super::{
-    Colors, FeedbackScope, MainWindow, caption, control, error_message, page_title, panel,
-    scroll_area,
+    Colors, FeedbackScope, MainWindow, TEXT_PRIMARY, caption, control, error_message, page_title,
+    panel, scroll_area,
 };
 use crate::{desktop, logging};
 use gpui::{ClipboardItem, Context, Div, ScrollHandle, Stateful, div, prelude::*, px};
@@ -67,7 +67,7 @@ fn button(label: &'static str, id: &'static str, index: isize, colors: Colors) -
         .min_w(px(82.))
         .justify_center()
         .px(px(12.))
-        .text_size(px(13.))
+        .text_size(px(TEXT_PRIMARY))
         .border_color(colors.line)
         .bg(colors.panel)
         .child(label)
@@ -139,7 +139,7 @@ impl MainWindow {
                         })),
                     )
                     .child(
-                        button("打开目录", "open-log-folder", 7, colors).on_click(cx.listener(
+                        button("打开日志目录", "open-log-folder", 7, colors).on_click(cx.listener(
                             |view, _, _, cx| {
                                 if let Some(path) = logging::path()
                                     .and_then(|path| path.parent().map(std::path::Path::to_owned))
@@ -187,7 +187,7 @@ impl MainWindow {
                             .flex_col()
                             .p(px(12.))
                             .gap(px(6.))
-                            .text_size(px(12.))
+                            .text_size(px(TEXT_PRIMARY))
                             .when(self.logs.lines.is_empty(), |el| {
                                 el.child(caption("暂无应用日志", colors))
                             })

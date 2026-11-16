@@ -82,12 +82,13 @@ fn open_main(
     runtime: &Runtime,
     events: &Sender<TrayAction>,
 ) -> Result<WindowHandle<MainWindow>> {
-    let bounds = Bounds::centered(None, size(px(820.), px(510.)), cx);
+    let window_size = size(px(900.), px(600.));
+    let bounds = Bounds::centered(None, window_size, cx);
     let close = events.clone();
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(660.), px(440.))),
+            window_min_size: Some(window_size),
             titlebar: Some(TitlebarOptions {
                 title: Some("Ladder".into()),
                 ..Default::default()

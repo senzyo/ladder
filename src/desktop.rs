@@ -5,10 +5,13 @@ use std::ptr;
 
 use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{GetLastError, HWND};
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-use windows_sys::Win32::UI::Shell::{SE_ERR_ASSOCINCOMPLETE, SE_ERR_NOASSOC, ShellExecuteW};
+use windows_sys::Win32::UI::Shell::{
+    SE_ERR_ASSOCINCOMPLETE, SE_ERR_NOASSOC, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW,
+    ShellExecuteExW, ShellExecuteW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetForegroundWindow, SW_SHOWNORMAL, WM_NCACTIVATE,
 };
@@ -78,26 +81,19 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
         return Err("只能编辑 JSON 配置文件".into());
     }
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // 只请求编辑动词, 避免默认打开关联将配置交给解释器执行。
-    let result = unsafe {
-        ShellExecuteW(
-            ptr::null_mut(),
-            w!("edit"),
-            wide_path.as_ptr(),
-            ptr::null(),
-            ptr::null(),
-            SW_SHOWNORMAL,
-        )
-    } as isize;
-    if result > 32 {
-        return Ok(());
-    }
-    if result != SE_ERR_NOASSOC as isize && result != SE_ERR_ASSOCINCOMPLETE as isize {
-        return Err(format!("无法打开配置编辑器 (Windows 错误码 {result})"));
+    // 部分编辑器仅注册 open；让 Shell 解析用户关联，不自行拼接注册表命令。
+    for verb in [w!("edit"), w!("open")] {
+        match launch_editor(verb, &wide_path, None) {
+            Ok(()) => return Ok(()),
+            Err((SE_ERR_NOASSOC | SE_ERR_ASSOCINCOMPLETE, _)) => {}
+            Err((_, error)) => {
+                return Err(format!("无法打开配置编辑器 (Windows 错误码 {error})"));
+            }
+        }
     }
 
     let mut directory = [0u16; 260];
-    // 系统只写入给定容量内, 返回的字符数不包含末尾 NUL。
+    // 系统只写入给定容量内，返回的字符数不包含末尾 NUL。
     let length = unsafe { GetSystemDirectoryW(directory.as_mut_ptr(), directory.len() as u32) };
     if length == 0 {
         return Err(format!(
@@ -116,20 +112,29 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
         .chain(path.as_os_str().encode_wide())
         .chain([b'"' as u16, 0])
         .collect();
-    let result = unsafe {
-        ShellExecuteW(
-            ptr::null_mut(),
-            w!("open"),
-            notepad.as_ptr(),
-            quoted_path.as_ptr(),
-            ptr::null(),
-            SW_SHOWNORMAL,
-        )
-    } as isize;
-    if result > 32 {
+    launch_editor(w!("open"), &notepad, Some(&quoted_path))
+        .map_err(|(_, error)| format!("无法启动系统记事本 (Windows 错误码 {error})"))
+}
+
+fn launch_editor(
+    verb: *const u16,
+    file: &[u16],
+    parameters: Option<&[u16]>,
+) -> Result<(), (u32, u32)> {
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_FLAG_NO_UI,
+        lpVerb: verb,
+        lpFile: file.as_ptr(),
+        lpParameters: parameters.map_or(ptr::null(), |value| value.as_ptr()),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
+    };
+    // GPUI 主线程已初始化 OLE；缓冲区在调用期间有效。无关联时禁用系统错误弹窗以继续回退。
+    if unsafe { ShellExecuteExW(&mut info) } != 0 {
         Ok(())
     } else {
-        Err(format!("无法启动系统记事本 (Windows 错误码 {result})"))
+        Err((info.hInstApp as usize as u32, unsafe { GetLastError() }))
     }
 }
 

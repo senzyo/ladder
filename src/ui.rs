@@ -2,9 +2,9 @@ use crate::desktop;
 use crate::runtime::{Action, Core, CoreOperation, Runtime, Setting, Snapshot, ThemePreference};
 use crate::update::{UpdateChannel, UpdateProgress};
 use gpui::{
-    App, Context, Div, ElementId, FocusHandle, FontWeight, PathBuilder, Rgba, ScrollHandle,
-    SharedString, Stateful, Task, Timer, Window, WindowAppearance, canvas, div, point, prelude::*,
-    px, rgb, rgba,
+    Animation, AnimationExt, App, Context, Div, ElementId, FocusHandle, FontWeight, PathBuilder,
+    Rgba, ScrollHandle, SharedString, Stateful, Task, Timer, Window, WindowAppearance, canvas, div,
+    point, prelude::*, px, rgb, rgba,
 };
 use std::{
     collections::HashMap,
@@ -19,6 +19,9 @@ use log_view::LogView;
 #[path = "scrollbar.rs"]
 mod scrollbar;
 use scrollbar::scrollbar;
+
+const TEXT_PRIMARY: f32 = 14.;
+const TEXT_SECONDARY: f32 = 12.;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -35,6 +38,12 @@ enum FeedbackScope {
     Logs,
 }
 
+#[derive(Clone, PartialEq)]
+enum DeleteTarget {
+    Config(Core, String),
+    Version(Core, String),
+}
+
 #[derive(Clone)]
 enum UiAction {
     Run(Action),
@@ -43,25 +52,25 @@ enum UiAction {
     Edit(Core, String),
     ShowVersions(Core, bool),
     SetDownloadedOnly(Core, bool),
-    ConfirmDelete(Core, String),
+    ConfirmDelete(DeleteTarget),
 }
 
 pub(crate) struct MainWindow {
     runtime: Runtime,
     snapshot: Snapshot,
     page: Page,
-    selected: [Option<String>; 2],
-    config_focus: [HashMap<String, FocusHandle>; 2],
+    config_focus: [HashMap<String, [FocusHandle; 3]>; 2],
     config_scroll: [ScrollHandle; 2],
     core_page_scroll: [ScrollHandle; 2],
     pending_theme: Option<(ThemePreference, Task<()>)>,
     show_versions: [bool; 2],
+    versions_auto_requested: [bool; 2],
     downloaded_only: [bool; 2],
     version_focus: [HashMap<String, [FocusHandle; 2]>; 2],
     version_scroll: [ScrollHandle; 2],
     version_page_scroll: [ScrollHandle; 2],
     settings_scroll: ScrollHandle,
-    confirm_delete: Option<(Core, String)>,
+    confirm_delete: Option<DeleteTarget>,
     titlebar_dark: Option<bool>,
     command_errors: Vec<(FeedbackScope, String)>,
     focus: FocusHandle,
@@ -91,13 +100,13 @@ impl MainWindow {
             runtime,
             snapshot: Snapshot::default(),
             page: Page::Core(Core::SingBox),
-            selected: [None, None],
             config_focus: Default::default(),
             config_scroll: Default::default(),
             core_page_scroll: Default::default(),
             pending_theme: None,
             show_versions: [false; 2],
-            downloaded_only: [true; 2],
+            versions_auto_requested: [false; 2],
+            downloaded_only: [false; 2],
             version_focus: Default::default(),
             version_scroll: Default::default(),
             version_page_scroll: Default::default(),
@@ -147,18 +156,11 @@ impl MainWindow {
                 *handles = files
                     .iter()
                     .map(|name| {
-                        handles
-                            .remove_entry(name)
-                            .unwrap_or_else(|| (name.clone(), cx.focus_handle()))
+                        handles.remove_entry(name).unwrap_or_else(|| {
+                            (name.clone(), std::array::from_fn(|_| cx.focus_handle()))
+                        })
                     })
                     .collect();
-                let selected = &mut self.selected[core_index(core)];
-                if selected
-                    .as_ref()
-                    .is_some_and(|name| !handles.contains_key(name))
-                {
-                    *selected = None;
-                }
             }
             self.snapshot = next;
             cx.notify();
@@ -170,11 +172,14 @@ impl MainWindow {
             UiAction::Run(
                 Action::Start(core)
                 | Action::Stop(core)
-                | Action::Restart(core)
-                | Action::Use(core, _),
+                | Action::SwitchConfig(core, _)
+                | Action::DeleteConfig(core, _),
             )
             | UiAction::OpenFolder(core)
-            | UiAction::Edit(core, _) => FeedbackScope::Config(*core),
+            | UiAction::Edit(core, _)
+            | UiAction::ConfirmDelete(DeleteTarget::Config(core, _)) => {
+                FeedbackScope::Config(*core)
+            }
             UiAction::Run(
                 Action::RefreshVersions(core)
                 | Action::LoadMoreVersions(core)
@@ -185,16 +190,28 @@ impl MainWindow {
             | UiAction::ShowVersions(core, _)
             | UiAction::OpenCoreFolder(core)
             | UiAction::SetDownloadedOnly(core, _)
-            | UiAction::ConfirmDelete(core, _) => FeedbackScope::Versions(*core),
+            | UiAction::ConfirmDelete(DeleteTarget::Version(core, _)) => {
+                FeedbackScope::Versions(*core)
+            }
             UiAction::Run(Action::Set(..)) => FeedbackScope::Settings,
             UiAction::Run(Action::RetryDns) => FeedbackScope::Settings,
         };
         let result = match action {
             UiAction::ShowVersions(core, show) => {
-                self.show_versions[core_index(core)] = show;
+                let index = core_index(core);
+                self.show_versions[index] = show;
                 self.confirm_delete = None;
-                cx.notify();
-                return;
+                if !show || self.versions_auto_requested[index] {
+                    self.refresh(cx);
+                    cx.notify();
+                    return;
+                }
+                self.versions_auto_requested[index] = true;
+                if !self.snapshot.core(core).versions_loading {
+                    self.runtime.send(Action::RefreshVersions(core))
+                } else {
+                    Ok(())
+                }
             }
             UiAction::SetDownloadedOnly(core, downloaded_only) => {
                 let index = core_index(core);
@@ -207,8 +224,8 @@ impl MainWindow {
                 cx.notify();
                 return;
             }
-            UiAction::ConfirmDelete(core, version) => {
-                self.confirm_delete = Some((core, version));
+            UiAction::ConfirmDelete(target) => {
+                self.confirm_delete = Some(target);
                 cx.notify();
                 return;
             }
@@ -233,6 +250,7 @@ impl MainWindow {
                 );
             }
             UiAction::Edit(core, name) => {
+                self.confirm_delete = None;
                 return Self::open_external(
                     self.runtime.config_dir(core).join(name),
                     desktop::edit_config,
@@ -346,9 +364,16 @@ impl MainWindow {
                     )
                 })
                 .on_click(cx.listener(move |view, _, _, cx| {
+                    let entering = view.page != page;
                     view.page = page;
                     view.confirm_delete = None;
                     view.refresh(cx);
+                    if let Page::Core(core) = page
+                        && entering
+                        && view.show_versions[core_index(core)]
+                    {
+                        view.activate(UiAction::ShowVersions(core, true), cx);
+                    }
                     cx.notify();
                 }))
         };
@@ -369,7 +394,7 @@ impl MainWindow {
                     .px(px(12.))
                     .mb(px(20.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_size(px(20.))
+                    .text_size(px(TEXT_PRIMARY))
                     .child("Ladder"),
             )
             .child(item(Page::Core(Core::SingBox), "sing-box", 1))
@@ -391,198 +416,134 @@ impl MainWindow {
             .is_some_and(|name| state.configs.contains(name));
         let can_use_config = idle && state.scan_error.is_none();
         let can_run = can_use_config && state.installed && current_exists;
-        let (status, status_color) = match state.operation {
-            Some(CoreOperation::Starting) => ("启动中", colors.accent),
-            Some(CoreOperation::Stopping) => ("停止中", colors.accent),
-            Some(CoreOperation::Switching) => ("切换中", colors.accent),
-            Some(CoreOperation::Restarting) => ("重启中", colors.accent),
-            Some(CoreOperation::Updating) | None if state.running => ("运行中", colors.running),
-            Some(CoreOperation::Updating) | None if !state.installed => ("未安装", colors.muted),
-            Some(CoreOperation::Updating) | None => ("已停止", colors.muted),
+        let connection_label = match state.operation {
+            Some(CoreOperation::Starting) => "启动中",
+            Some(CoreOperation::Stopping) => "停止中",
+            Some(CoreOperation::Switching) => "切换中",
+            _ if state.running => "停止核心",
+            _ => "启动核心",
         };
-        let current = state
-            .current
-            .clone()
-            .unwrap_or_else(|| "尚未选择配置".into());
-        let current_card = panel(colors)
-            .flex_shrink_0()
-            .p(px(14.))
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .justify_between()
-                    .gap(px(12.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.))
-                            .child(caption("当前配置", colors))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(16.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(current),
-                            ),
-                    )
-                    .child(badge(status, status_color, colors)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.))
-                    .child(action_button(
-                        "启动",
-                        8,
-                        (can_run && !state.running).then_some(UiAction::Run(Action::Start(core))),
-                        true,
-                        colors,
-                        cx,
-                    ))
-                    .child(action_button(
-                        "停止",
-                        9,
-                        (idle && state.running).then_some(UiAction::Run(Action::Stop(core))),
-                        false,
-                        colors,
-                        cx,
-                    ))
-                    .child(action_button(
-                        "重启",
-                        10,
-                        (can_run && state.running).then_some(UiAction::Run(Action::Restart(core))),
-                        false,
-                        colors,
-                        cx,
-                    )),
-            );
+        let connection_action = if state.running {
+            idle.then_some(UiAction::Run(Action::Stop(core)))
+        } else {
+            can_run.then_some(UiAction::Run(Action::Start(core)))
+        };
+        let connection_colors = if state.running {
+            Colors {
+                accent_fill: colors.stop_fill,
+                accent_hover: colors.stop_hover,
+                ..colors
+            }
+        } else {
+            colors
+        };
 
         let mut files = div()
             .id(("files", core_index(core)))
             .flex_1()
             .min_h(px(0.))
             .flex()
-            .flex_col()
-            .p(px(4.))
-            .gap(px(2.));
-        let selected = self.selected[core_index(core)].as_deref();
-        for (index, name) in state.configs.iter().enumerate() {
+            .flex_col();
+        let mut configs: Vec<_> = state.configs.iter().collect();
+        configs.sort_by_key(|name| state.current.as_ref() != Some(*name));
+        for (index, name) in configs.iter().copied().enumerate() {
             let current = state.current.as_ref() == Some(name);
-            let highlighted = selected == Some(name.as_str());
-            let file = name.clone();
-            let tab_index = 13 + index as isize;
-            // GPUI uses the tracked handle's tab order when a control supplies its own handle.
-            let focus = self.config_focus[core_index(core)][name]
-                .clone()
-                .tab_stop(true)
-                .tab_index(tab_index);
-            let row = control(
-                SharedString::from(format!("file-{}-{name}", core.label())),
-                tab_index,
-                colors,
-                false,
-            )
-            .track_focus(&focus)
-            .w_full()
-            .min_h(px(36.))
-            .flex_shrink_0()
-            .px(px(10.))
-            .py(px(6.))
-            .gap(px(8.))
-            .when(highlighted, |el| el.bg(colors.selection))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .when(!highlighted, |el| el.truncate())
-                    .child(name.clone()),
-            )
-            .when(current, |el| el.child(badge("当前", colors.accent, colors)))
-            .on_click(cx.listener(move |view, _, _, cx| {
-                view.selected[core_index(core)] = Some(file.clone());
-                view.config_scroll[core_index(core)].scroll_to_item(index);
-                view.set_command_result(FeedbackScope::Config(core), Ok(()));
-                cx.notify();
-            }));
-            files = files.child(row);
-        }
-        if state.configs.is_empty() {
-            files = files.child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .items_center()
-                    .gap(px(6.))
-                    .p(px(16.))
-                    .child("还没有配置文件")
-                    .child(caption("打开目录，放入你的 JSON 配置。", colors)),
-            );
-        }
-
-        let footer_index = 13 + state.configs.len() as isize;
-        let edit = selected.map(|name| UiAction::Edit(core, name.to_owned()));
-        let apply = selected
-            .filter(|name| can_use_config && state.current.as_deref() != Some(*name))
-            .map(|name| UiAction::Run(Action::Use(core, name.to_owned())));
-        let selection_hint = match selected {
-            Some(name) if state.current.as_deref() == Some(name) => {
-                if state.running {
-                    "当前配置 · 编辑后重启生效"
-                } else {
-                    "当前配置 · 编辑后启动生效"
+            let target = DeleteTarget::Config(core, name.clone());
+            let confirming = self.confirm_delete.as_ref() == Some(&target);
+            let mut buttons = div().flex().items_center().flex_shrink_0().gap(px(8.));
+            if current {
+                buttons = buttons.child(div().child("当前使用"));
+            } else {
+                let actions = [
+                    (
+                        "切换",
+                        can_use_config
+                            .then(|| UiAction::Run(Action::SwitchConfig(core, name.clone()))),
+                    ),
+                    ("编辑", Some(UiAction::Edit(core, name.clone()))),
+                    (
+                        if confirming { "确认删除" } else { "删除" },
+                        can_use_config.then(|| {
+                            if confirming {
+                                UiAction::Run(Action::DeleteConfig(core, name.clone()))
+                            } else {
+                                UiAction::ConfirmDelete(target.clone())
+                            }
+                        }),
+                    ),
+                ];
+                for (slot, (label, action)) in actions.into_iter().enumerate() {
+                    let enabled = action.is_some();
+                    let tab_index = 8 + (index * 3 + slot) as isize;
+                    let focus = self.config_focus[core_index(core)][name][slot]
+                        .clone()
+                        .tab_stop(action.is_some())
+                        .tab_index(tab_index);
+                    buttons = buttons.child(
+                        action_button(label, tab_index, action, false, colors, cx)
+                            .id(SharedString::from(format!(
+                                "config-{}-{name}-{slot}",
+                                core.label()
+                            )))
+                            .track_focus(&focus)
+                            .when(enabled, |el| {
+                                el.text_color(match slot {
+                                    1 => colors.version_preview,
+                                    2 => colors.error,
+                                    _ => colors.accent,
+                                })
+                            })
+                            .when(confirming && slot == 2, |el| {
+                                el.on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                                    view.confirm_delete = None;
+                                    cx.notify();
+                                }))
+                            }),
+                    );
                 }
             }
-            Some(_) => "已选中 · 使用后启动此配置",
-            None => "选择配置后可编辑或使用",
-        };
-        let config_list = panel(colors)
-            .flex_1()
-            .min_h(px(120.))
-            .flex()
-            .flex_col()
-            .child(
-                scroll_area(
-                    "config-scroll",
-                    files,
-                    &self.config_scroll[core_index(core)],
-                    colors,
-                )
-                .flex_1(),
-            )
-            .child(
+            files = files.child(
                 div()
                     .flex_shrink_0()
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .justify_between()
-                    .gap(px(8.))
-                    .p(px(10.))
-                    .border_t_1()
-                    .border_color(colors.line)
-                    .child(caption(selection_hint, colors))
+                    .gap(px(12.))
+                    .pl(px(12.))
+                    .pr(px(28.))
+                    .py(px(12.))
+                    .when(index > 0, |el| el.border_t_1().border_color(colors.line))
+                    .when(current, |el| el.bg(colors.selection))
+                    .child(div().flex_1().min_w(px(100.)).child(name.clone()))
+                    .child(buttons),
+            );
+        }
+        let config_list = panel(colors)
+            .flex_1()
+            .min_h(px(120.))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("config-scroll")
+                    .relative()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
                     .child(
-                        div()
-                            .flex()
-                            .gap(px(8.))
-                            .child(action_button("编辑", footer_index, edit, false, colors, cx))
-                            .child(action_button(
-                                "使用此配置",
-                                footer_index + 1,
-                                apply,
-                                false,
-                                colors,
-                                cx,
-                            )),
+                        files
+                            .min_w(px(0.))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.config_scroll[core_index(core)]),
+                    )
+                    .child(
+                        scrollbar("scrollbar", &self.config_scroll[core_index(core)], colors)
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .bottom_0(),
                     ),
             );
 
@@ -599,32 +560,35 @@ impl MainWindow {
                     .items_center()
                     .justify_between()
                     .gap(px(12.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(page_title(if core == Core::Xray {
-                                "Xray"
-                            } else {
-                                "sing-box"
-                            }))
-                            .child(caption(
-                                match &state.version {
-                                    Some(version) => format!("当前版本 v{version}"),
-                                    None if !state.installed => "尚未安装核心".into(),
-                                    None => "当前版本未知".into(),
-                                },
-                                colors,
-                            )),
-                    )
+                    .when(!state.installed, |el| {
+                        el.child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_size(px(TEXT_PRIMARY))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(colors.error)
+                                .child("点击右侧“管理版本”安装核心 -->"),
+                        )
+                    })
+                    .when(state.installed, |el| {
+                        el.child(
+                            action_button("", 5, connection_action, true, connection_colors, cx)
+                                .id("core-power")
+                                .gap(px(6.))
+                                .bg(connection_colors.accent_fill)
+                                .border_color(connection_colors.accent_fill)
+                                .text_color(colors.on_accent)
+                                .child(power_icon(colors.on_accent))
+                                .child(connection_label)
+                                .when(!idle, |el| el.opacity(0.65)),
+                        )
+                    })
                     .child(action_button(
                         "管理版本",
-                        7,
+                        6,
                         Some(UiAction::ShowVersions(core, true)),
-                        !state.installed,
+                        true,
                         colors,
                         cx,
                     )),
@@ -633,7 +597,6 @@ impl MainWindow {
                 self.command_error(FeedbackScope::Config(core)).cloned(),
                 |el, message| el.child(error_message(message, colors)),
             )
-            .child(current_card)
             .when(
                 state.current.is_some() && !current_exists && state.scan_error.is_none(),
                 |el| {
@@ -661,8 +624,8 @@ impl MainWindow {
                             .child(caption(format!("{} 个", state.configs.len()), colors)),
                     )
                     .child(action_button(
-                        "打开目录",
-                        11,
+                        "打开配置目录",
+                        7,
                         Some(UiAction::OpenFolder(core)),
                         false,
                         colors,
@@ -704,10 +667,8 @@ impl MainWindow {
                 .update
                 .as_ref()
                 .filter(|_| state.downloading_version.as_ref() == Some(&version.version));
-            let confirming = self
-                .confirm_delete
-                .as_ref()
-                .is_some_and(|(target, name)| *target == core && name == &version.version);
+            let confirming = self.confirm_delete.as_ref()
+                == Some(&DeleteTarget::Version(core, version.version.clone()));
             let (label, color) = match version.channel {
                 UpdateChannel::Stable => ("稳定版", colors.version_stable),
                 UpdateChannel::Preview => ("预览版", colors.version_preview),
@@ -729,7 +690,10 @@ impl MainWindow {
                             if confirming {
                                 UiAction::Run(Action::DeleteVersion(core, version.version.clone()))
                             } else {
-                                UiAction::ConfirmDelete(core, version.version.clone())
+                                UiAction::ConfirmDelete(DeleteTarget::Version(
+                                    core,
+                                    version.version.clone(),
+                                ))
                             }
                         }),
                     ),
@@ -748,7 +712,7 @@ impl MainWindow {
             };
             let mut buttons = div().flex().items_center().flex_shrink_0().gap(px(8.));
             if current {
-                buttons = buttons.child(div().font_weight(FontWeight::BOLD).child("当前使用"));
+                buttons = buttons.child(div().child("当前使用"));
             }
             for (slot, (label, action)) in actions.into_iter().enumerate() {
                 let tab_index = 10 + (index * 2 + slot) as isize;
@@ -784,7 +748,7 @@ impl MainWindow {
                 div()
                     .flex_shrink_0()
                     .flex()
-                    .flex_wrap()
+                    .whitespace_nowrap()
                     .items_center()
                     .justify_between()
                     .gap(px(12.))
@@ -796,33 +760,25 @@ impl MainWindow {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(100.))
+                            .min_w(px(0.))
                             .flex()
-                            .flex_col()
+                            .items_center()
                             .gap(px(6.))
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(format!("v{}", version.version)),
                             )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .child(badge(label, color, colors).bg(colors.version_badge))
-                                    .when(version.installed && !current, |el| {
-                                        el.child(caption("已下载", colors))
-                                    })
-                                    .when_some(progress, |el, progress| {
-                                        el.child(
-                                            caption(update_progress_text(progress), colors)
-                                                .whitespace_nowrap()
-                                                .flex_shrink_0()
-                                                .text_color(colors.accent),
-                                        )
-                                    }),
-                            ),
+                            .child(badge(label, color, colors).bg(colors.version_badge))
+                            .when_some(progress, |el, progress| {
+                                el.child(
+                                    caption(update_progress_text(progress), colors)
+                                        .whitespace_nowrap()
+                                        .flex_shrink_0()
+                                        .text_color(colors.accent),
+                                )
+                            }),
                     )
                     .child(buttons),
             );
@@ -843,8 +799,14 @@ impl MainWindow {
         .px(px(0.))
         .bg(colors.accent_fill)
         .border_color(colors.accent_fill)
-        .when(loading, |el| el.opacity(0.55))
-        .child(refresh_icon(colors.on_accent))
+        .when(loading, |el| {
+            el.child(refresh_icon(colors.on_accent, 0.).with_animation(
+                "refresh-spin",
+                Animation::new(Duration::from_secs(1)).repeat(),
+                move |_, delta| refresh_icon(colors.on_accent, delta * std::f32::consts::TAU),
+            ))
+        })
+        .when(!loading, |el| el.child(refresh_icon(colors.on_accent, 0.)))
         .tooltip(move |_, cx| cx.new(|_| RefreshTooltip { loading, colors }).into());
         let mut filter = div()
             .flex()
@@ -864,7 +826,7 @@ impl MainWindow {
                     .min_w(px(60.))
                     .px(px(8.))
                     .justify_center()
-                    .text_size(px(13.))
+                    .text_size(px(TEXT_PRIMARY))
                     .when(downloaded_only == only_downloaded, |el| {
                         el.bg(colors.selection).text_color(colors.accent)
                     })
@@ -909,7 +871,7 @@ impl MainWindow {
                             .items_center()
                             .gap(px(8.))
                             .child(action_button(
-                                "打开目录",
+                                "打开核心目录",
                                 8,
                                 Some(UiAction::OpenCoreFolder(core)),
                                 false,
@@ -1191,7 +1153,7 @@ impl Render for MainWindow {
             .size_full()
             .flex()
             .font_family("Microsoft YaHei UI")
-            .text_size(px(14.))
+            .text_size(px(TEXT_PRIMARY))
             .text_color(colors.text)
             .bg(colors.canvas)
             .on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, window, cx| {
@@ -1221,17 +1183,19 @@ impl Render for MainWindow {
                                 view.version_scroll[core_index(core)].scroll_to_item(index);
                                 cx.notify();
                             }
-                        }
-                        let handles = &view.config_focus[core_index(core)];
-                        if let Some(index) =
-                            view.snapshot.core(core).configs.iter().position(|name| {
-                                handles
-                                    .get(name)
-                                    .is_some_and(|handle| handle.is_focused(window))
-                            })
-                        {
-                            view.config_scroll[core_index(core)].scroll_to_item(index);
-                            cx.notify();
+                        } else {
+                            let state = view.snapshot.core(core);
+                            let mut configs: Vec<_> = state.configs.iter().collect();
+                            configs.sort_by_key(|name| state.current.as_ref() != Some(*name));
+                            let handles = &view.config_focus[core_index(core)];
+                            if let Some(index) = configs.iter().position(|name| {
+                                handles.get(*name).is_some_and(|handles| {
+                                    handles.iter().any(|handle| handle.is_focused(window))
+                                })
+                            }) {
+                                view.config_scroll[core_index(core)].scroll_to_item(index);
+                                cx.notify();
+                            }
                         }
                     }
                     cx.stop_propagation();
@@ -1285,12 +1249,43 @@ fn update_progress_text(progress: &UpdateProgress) -> String {
     }
 }
 
-fn refresh_icon(color: Rgba) -> impl IntoElement {
+fn power_icon(color: Rgba) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
             let scale = bounds.size.width / px(18.);
             let p = |x, y| bounds.origin + point(px(x) * scale, px(y) * scale);
+            let mut path = PathBuilder::stroke(px(1.6) * scale);
+            path.move_to(p(9., 2.));
+            path.line_to(p(9., 9.));
+            path.move_to(p(4.4, 4.4));
+            path.cubic_bezier_to(p(2.5, 9.), p(3.1, 5.6), p(2.5, 7.2));
+            path.cubic_bezier_to(p(9., 15.5), p(2.5, 12.6), p(5.4, 15.5));
+            path.cubic_bezier_to(p(15.5, 9.), p(12.6, 15.5), p(15.5, 12.6));
+            path.cubic_bezier_to(p(13.6, 4.4), p(15.5, 7.2), p(14.9, 5.6));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .size(px(16.))
+    .flex_shrink_0()
+}
+
+fn refresh_icon(color: Rgba, angle: f32) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let scale = bounds.size.width / px(18.);
+            let (sin, cos) = angle.sin_cos();
+            let p = |x: f32, y: f32| {
+                let (x, y) = (x - 9., y - 9.);
+                bounds.origin
+                    + point(
+                        px(9. + x * cos - y * sin) * scale,
+                        px(9. + x * sin + y * cos) * scale,
+                    )
+            };
             let mut path = PathBuilder::stroke(px(1.6) * scale);
             path.move_to(p(3., 7.));
             path.cubic_bezier_to(p(14., 5.), p(4., 1.), p(11., 1.));
@@ -1322,7 +1317,7 @@ impl Render for RefreshTooltip {
         panel(self.colors)
             .px(px(8.))
             .py(px(4.))
-            .text_size(px(12.))
+            .text_size(px(TEXT_SECONDARY))
             .text_color(self.colors.text)
             .child(if self.loading {
                 "正在获取版本列表…"
@@ -1335,14 +1330,14 @@ impl Render for RefreshTooltip {
 fn page_title(label: &'static str) -> Div {
     div()
         .flex_shrink_0()
-        .text_size(px(22.))
+        .text_size(px(TEXT_PRIMARY))
         .font_weight(FontWeight::SEMIBOLD)
         .child(label)
 }
 
 fn caption(text: impl Into<SharedString>, colors: Colors) -> Div {
     div()
-        .text_size(px(12.))
+        .text_size(px(TEXT_SECONDARY))
         .text_color(colors.muted)
         .child(text.into())
 }
@@ -1363,7 +1358,7 @@ fn badge(label: &'static str, color: Rgba, colors: Colors) -> Div {
         .rounded(px(4.))
         .bg(colors.canvas)
         .text_color(color)
-        .text_size(px(12.))
+        .text_size(px(TEXT_SECONDARY))
         .child(label)
 }
 
@@ -1423,7 +1418,7 @@ impl RenderOnce for ErrorMessage {
         .border_color(self.colors.error)
         .bg(self.colors.error_bg)
         .text_color(self.colors.error)
-        .text_size(px(12.))
+        .text_size(px(TEXT_SECONDARY))
     }
 }
 
@@ -1475,7 +1470,7 @@ fn action_button(
         .h(px(30.))
         .min_w(px(58.))
         .px(px(12.))
-        .text_size(px(13.))
+        .text_size(px(TEXT_PRIMARY))
         .border_color(colors.line)
         .text_color(if enabled {
             colors.text
@@ -1488,13 +1483,17 @@ fn action_button(
                 .border_color(colors.accent_fill)
                 .text_color(colors.on_accent)
         })
-        .child(label)
+        .when(!label.is_empty(), |el| el.child(label))
         .when_some(action, |el, action| {
             el.on_click(cx.listener(move |view, _, window, cx| {
                 if matches!(
                     &action,
-                    UiAction::Run(Action::SwitchVersion(..) | Action::DeleteVersion(..))
-                        | UiAction::ShowVersions(..)
+                    UiAction::Run(
+                        Action::SwitchVersion(..)
+                            | Action::DeleteVersion(..)
+                            | Action::SwitchConfig(..)
+                            | Action::DeleteConfig(..)
+                    ) | UiAction::ShowVersions(..)
                 ) {
                     window.focus(&view.focus);
                 }
@@ -1515,7 +1514,8 @@ struct Colors {
     accent_fill: Rgba,
     accent_hover: Rgba,
     on_accent: Rgba,
-    running: Rgba,
+    stop_fill: Rgba,
+    stop_hover: Rgba,
     running_dot: Rgba,
     version_stable: Rgba,
     version_preview: Rgba,
@@ -1556,7 +1556,8 @@ impl Colors {
             accent_fill: tone(0x245fba, 0x2865bd),
             accent_hover: tone(0x1c4e9d, 0x2256a3),
             on_accent: rgb(0xffffff),
-            running: tone(0x18704a, 0x83d9b1),
+            stop_fill: tone(0xb52f3d, 0xb83240),
+            stop_hover: tone(0x942633, 0x9d2935),
             running_dot: tone(0x3fb950, 0x3fb950),
             version_stable: tone(0x3fb950, 0x3fb950),
             version_preview: tone(0xd29922, 0xd29922),
