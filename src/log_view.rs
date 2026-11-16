@@ -1,6 +1,10 @@
 use super::{Colors, MainWindow, caption, control, error_message, page_title, panel};
 use crate::{desktop, logging};
-use gpui::{ClipboardItem, Context, Div, ScrollHandle, Stateful, div, prelude::*, px};
+use gpui::{
+    Bounds, ClipboardItem, Context, Div, HitboxBehavior, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, ScrollHandle, Stateful, canvas, div, fill, point,
+    prelude::*, px, size,
+};
 
 pub(super) struct LogView {
     lines: Vec<String>,
@@ -8,6 +12,7 @@ pub(super) struct LogView {
     paused: bool,
     copied: bool,
     scroll: ScrollHandle,
+    drag_offset: Option<Pixels>,
 }
 
 impl LogView {
@@ -20,6 +25,7 @@ impl LogView {
             paused: false,
             copied: false,
             scroll,
+            drag_offset: None,
         }
     }
 
@@ -71,6 +77,108 @@ fn button(label: &'static str, id: &'static str, index: isize, colors: Colors) -
 }
 
 impl MainWindow {
+    fn log_scrollbar(&self, colors: Colors, cx: &Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |track, hitbox, window, cx| {
+                // ScrollHandle metrics are current only after the log content's prepaint.
+                let logs = &view.read(cx).logs;
+                let scroll = logs.scroll.clone();
+                let max_offset = scroll.max_offset().height;
+                if max_offset <= px(0.) || track.size.height <= px(0.) {
+                    view.update(cx, |view, _| view.logs.drag_offset = None);
+                    return;
+                }
+                let viewport = scroll.bounds().size.height;
+                let thumb_height = (track.size.height * (viewport / (viewport + max_offset)))
+                    .max(px(28.))
+                    .min(track.size.height);
+                let travel = track.size.height - thumb_height;
+                let thumb = Bounds::new(
+                    point(
+                        track.left(),
+                        track.top() + travel * (-scroll.offset().y / max_offset).clamp(0., 1.),
+                    ),
+                    size(track.size.width, thumb_height),
+                );
+                let hovered = hitbox.is_hovered(window);
+                let active = hovered || logs.drag_offset.is_some();
+                window.paint_quad(fill(track, colors.line).corner_radii(px(4.)));
+                window.paint_quad(
+                    fill(thumb, if active { colors.accent } else { colors.muted })
+                        .corner_radii(px(4.)),
+                );
+                window.on_mouse_event({
+                    let view = view.clone();
+                    let hitbox = hitbox.clone();
+                    move |event: &MouseDownEvent, phase, window, cx| {
+                        if phase.bubble()
+                            && event.button == MouseButton::Left
+                            && hitbox.is_hovered(window)
+                        {
+                            view.update(cx, |view, cx| {
+                                if thumb.contains(&event.position) {
+                                    view.logs.drag_offset = Some(event.position.y - thumb.top());
+                                } else {
+                                    let direction = if event.position.y < thumb.top() {
+                                        1.
+                                    } else {
+                                        -1.
+                                    };
+                                    let mut offset = view.logs.scroll.offset();
+                                    offset.y = (offset.y + viewport * 0.9 * direction)
+                                        .clamp(-max_offset, px(0.));
+                                    view.logs.scroll.set_offset(offset);
+                                }
+                                cx.notify();
+                            });
+                            cx.stop_propagation();
+                        }
+                    }
+                });
+                window.on_mouse_event({
+                    let view = view.clone();
+                    move |event: &MouseMoveEvent, phase, window, cx| {
+                        if !phase.capture() {
+                            return;
+                        }
+                        view.update(cx, |view, cx| {
+                            if !event.dragging() {
+                                if view.logs.drag_offset.take().is_some() {
+                                    cx.notify();
+                                }
+                            } else if let Some(grab) = view.logs.drag_offset
+                                && travel > px(0.)
+                            {
+                                let fraction = ((event.position.y - track.top() - grab) / travel)
+                                    .clamp(0., 1.);
+                                let mut offset = view.logs.scroll.offset();
+                                offset.y = -max_offset * fraction;
+                                view.logs.scroll.set_offset(offset);
+                                cx.notify();
+                                cx.stop_propagation();
+                            }
+                            if hovered != hitbox.is_hovered(window) {
+                                cx.notify();
+                            }
+                        });
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase.capture() && event.button == MouseButton::Left {
+                        view.update(cx, |view, cx| {
+                            if view.logs.drag_offset.take().is_some() {
+                                cx.notify();
+                            }
+                        });
+                    }
+                });
+            },
+        )
+        .size_full()
+    }
+
     pub(super) fn logs_page(&self, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
         div()
             .id("application-logs")
@@ -160,37 +268,51 @@ impl MainWindow {
             )
             .child(
                 panel(colors)
-                    .id("log-lines")
                     .flex_1()
                     .min_h(px(0.))
-                    .w_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.logs.scroll)
                     .flex()
-                    .flex_col()
-                    .p(px(12.))
-                    .gap(px(6.))
-                    .text_size(px(12.))
-                    .when(self.logs.lines.is_empty(), |el| {
-                        el.child(caption("暂无应用日志", colors))
-                    })
-                    .children(self.logs.lines.iter().enumerate().map(|(index, line)| {
-                        let level = line
-                            .split_once(" [")
-                            .and_then(|(_, rest)| rest.split_once(']'))
-                            .map(|(level, _)| level);
+                    .child(
                         div()
-                            .id(index)
-                            .flex_shrink_0()
-                            .w_full()
-                            .whitespace_normal()
-                            .text_color(match level {
-                                Some("ERROR") => colors.error,
-                                Some("WARN") => colors.warning,
-                                _ => colors.text,
+                            .id("log-lines")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .min_h(px(0.))
+                            .h_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.logs.scroll)
+                            .flex()
+                            .flex_col()
+                            .p(px(12.))
+                            .gap(px(6.))
+                            .text_size(px(12.))
+                            .when(self.logs.lines.is_empty(), |el| {
+                                el.child(caption("暂无应用日志", colors))
                             })
-                            .child(line.clone())
-                    })),
+                            .children(self.logs.lines.iter().enumerate().map(|(index, line)| {
+                                let level = line
+                                    .split_once(" [")
+                                    .and_then(|(_, rest)| rest.split_once(']'))
+                                    .map(|(level, _)| level);
+                                div()
+                                    .id(index)
+                                    .flex_shrink_0()
+                                    .w_full()
+                                    .whitespace_normal()
+                                    .text_color(match level {
+                                        Some("ERROR") => colors.error,
+                                        Some("WARN") => colors.warning,
+                                        _ => colors.text,
+                                    })
+                                    .child(line.clone())
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .flex_shrink_0()
+                            .p(px(4.))
+                            .child(self.log_scrollbar(colors, cx)),
+                    ),
             )
     }
 }
