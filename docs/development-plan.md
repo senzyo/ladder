@@ -349,6 +349,14 @@ Windows GUI 验收使用独立 package/lib/bin、实例锁和状态目录，`asI
 
 规范与需求两项独立复审均无未解决问题。格式检查、Clippy、Debug 构建及三项精确过滤的纯逻辑测试（发布列表解析、分页合并、当前版本置顶与版本号排序）通过。纯 UI 隔离窗口验证了[缺失版本的下载入口](../target/version-ui-check/evidence/missing-current-download.png)、[点击后的模拟进度](../target/version-ui-check/evidence/missing-current-downloading.png)及[模拟下载完成后的当前版本](../target/version-ui-check/evidence/missing-current-restored.png)。窗口已关闭，未运行真实核心、联网下载或会修改本机网络的测试。
 
+### 核心安装保留归档内容 · 2026-11-16
+
+下载后的 ZIP 改为保留全部文件、子目录和空目录，不再按 EXE、DLL 和数据文件白名单筛选。按用户确认，只去掉统一的一层外包装目录，核心 EXE 仍直接位于版本目录下；配置示例、说明和许可证等随该版本一起保存。暂存版本探测与安装使用同一内容目录，已有版本和用户源配置保持不变。
+
+1 GiB 解压限额改为累计全部文件。保留路径穿越与符号链接校验，拒绝 Windows 特殊路径、大小写重名和文件/目录冲突；允许普通空文件，核心 EXE 必须非空。归档中的 `.ladder-version.json` 若与应用版本记录冲突，安装报错，不覆盖归档文件。下载重试、超时与大小参数保持原值，并补充到 README。
+
+`cargo fmt --check`、`cargo clippy --locked --offline --all-targets -- -D warnings`、`cargo test --locked --offline update::tests:: -- --test-threads=1`（19 项通过，2 项官方联网安装验收忽略）、`cargo build --locked --offline` 和独立增量复核通过。回归覆盖 sing-box 包装目录、Xray 根目录、附带文件与空目录、同名文件、路径和元数据冲突及全文件大小限额。本轮未运行完整测试集、真实联网安装、GUI 或 Release 验收，未启动真实核心或修改本机网络。
+
 ## 后续开发注意点
 
 - **配置编辑器权限（暂缓）**。当前 Ladder 以管理员身份调用外部编辑器。标准用户若用另一管理员账户通过 UAC，Windows 可能按该管理员的文件关联和权限打开配置。2026-11-12 决定暂缓修改现有入口，后续开发内置编辑器时一并复核。

@@ -109,10 +109,10 @@ fn asset_name(core: Core, version: &str) -> String {
     }
 }
 
-fn artifacts(core: Core) -> &'static [&'static str] {
+fn executable_name(core: Core) -> &'static str {
     match core {
-        Core::SingBox => &["sing-box.exe", "libcronet.dll"],
-        Core::Xray => &["xray.exe", "wintun.dll", "geoip.dat", "geosite.dat"],
+        Core::SingBox => "sing-box.exe",
+        Core::Xray => "xray.exe",
     }
 }
 
@@ -511,11 +511,7 @@ pub fn prepare_version(
     check_cancelled(cancelled)?;
     progress(UpdateProgress::Extracting);
     prepared.extract(core, &archive, cancelled)?;
-    let staged_executable = prepared
-        .directory
-        .path()
-        .join("new")
-        .join(artifacts(core)[0]);
+    let staged_executable = prepared.staged.join(executable_name(core));
     let staged_version = read_version(core, &staged_executable, VERSION_TIMEOUT)
         .map_err(|message| format!("安装包验证失败：{message}；现有核心未修改"))?;
     if staged_version != prepared.version {
@@ -596,7 +592,7 @@ pub struct PreparedUpdate {
     core: Core,
     root: PathBuf,
     directory: TempDir,
-    files: Vec<&'static str>,
+    staged: PathBuf,
     installed: bool,
 }
 
@@ -607,8 +603,8 @@ impl PreparedUpdate {
             .prefix(&format!(".ladder-download-{}-", core.label()))
             .tempdir_in(root)
             .map_err(|e| format!("创建下载暂存目录失败: {e}"))?;
-        fs::create_dir(directory.path().join("new"))
-            .map_err(|e| format!("创建下载暂存目录失败: {e}"))?;
+        let staged = directory.path().join("new");
+        fs::create_dir(&staged).map_err(|e| format!("创建下载暂存目录失败: {e}"))?;
         let channel = if version_parts(&version).unwrap().1.is_some() {
             UpdateChannel::Preview
         } else {
@@ -621,7 +617,7 @@ impl PreparedUpdate {
             core,
             root: root.into(),
             directory,
-            files: Vec::new(),
+            staged,
             installed: false,
         })
     }
@@ -644,39 +640,51 @@ impl PreparedUpdate {
                     .components()
                     .any(|part| !matches!(part, Component::Normal(_)))
                 || name.contains(':')
-                || name.split(['/', '\\']).any(|part| part == "..")
+                || name.split(['/', '\\']).any(|part| {
+                    let stem = part.split('.').next().unwrap().to_ascii_uppercase();
+                    part.ends_with([' ', '.'])
+                        || matches!(
+                            stem.as_str(),
+                            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+                        )
+                        || stem
+                            .strip_prefix("COM")
+                            .or_else(|| stem.strip_prefix("LPT"))
+                            .is_some_and(|suffix| {
+                                matches!(
+                                    suffix,
+                                    "1" | "2"
+                                        | "3"
+                                        | "4"
+                                        | "5"
+                                        | "6"
+                                        | "7"
+                                        | "8"
+                                        | "9"
+                                        | "¹"
+                                        | "²"
+                                        | "³"
+                                )
+                            })
+                })
                 || entry.is_symlink()
             {
                 return Err("安装包包含不安全路径或符号链接".into());
             }
+            let path = self.staged.join(name.as_ref());
             if entry.is_dir() {
+                fs::create_dir_all(&path).map_err(|e| format!("创建暂存目录失败: {e}"))?;
                 continue;
-            }
-            let Some(name) = Path::new(name.as_ref())
-                .file_name()
-                .and_then(|value| value.to_str())
-            else {
-                return Err("安装包包含无效文件名".into());
-            };
-            let Some(&name) = artifacts(core)
-                .iter()
-                .find(|allowed| allowed.eq_ignore_ascii_case(name))
-            else {
-                continue;
-            };
-            if self.files.contains(&name) {
-                return Err(format!("安装包包含重复的 {name}"));
             }
             let size = entry.size();
             total = total
                 .checked_add(size)
                 .filter(|size| *size <= MAX_EXTRACTED_SIZE)
                 .ok_or("安装包解压大小超出限制")?;
-            if size == 0 {
-                return Err(format!("安装包中的 {name} 为空"));
-            }
-            let mut output = File::create(self.directory.path().join("new").join(name))
-                .map_err(|e| format!("创建暂存文件失败: {e}"))?;
+            fs::create_dir_all(path.parent().unwrap())
+                .map_err(|e| format!("创建暂存目录失败: {e}"))?;
+            let mut output =
+                File::create_new(&path).map_err(|e| format!("创建暂存文件失败: {e}"))?;
             let mut written = 0;
             let mut buffer = [0; 64 * 1024];
             loop {
@@ -701,11 +709,26 @@ impl PreparedUpdate {
             output
                 .sync_all()
                 .map_err(|e| format!("保存暂存文件失败: {e}"))?;
-            self.files.push(name);
         }
-        let executable = artifacts(core)[0];
-        if !self.files.contains(&executable) {
+        let executable = executable_name(core);
+        if !self.staged.join(executable).is_file() {
+            let entries = fs::read_dir(&self.staged)
+                .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+                .map_err(|e| format!("读取暂存目录失败: {e}"))?;
+            if entries.len() == 1 && entries[0].path().is_dir() {
+                self.staged = entries[0].path();
+            }
+        }
+        let path = self.staged.join(executable);
+        if !path.is_file() {
             return Err(format!("安装包缺少 {executable}"));
+        }
+        if fs::metadata(&path)
+            .map_err(|e| format!("读取暂存核心信息失败: {e}"))?
+            .len()
+            == 0
+        {
+            return Err(format!("安装包中的 {executable} 为空"));
         }
         Ok(())
     }
@@ -718,13 +741,18 @@ impl PreparedUpdate {
         if target.exists() {
             return Err("该版本已存在于本地，请先删除后再下载".into());
         }
-        let staged = self.directory.path().join("new");
         let record = VersionRecord {
             channel: self.channel,
             release_tag: self.release_tag.clone(),
         };
-        let mut file = File::create(staged.join(".ladder-version.json"))
-            .map_err(|error| format!("创建版本记录失败: {error}"))?;
+        let mut file =
+            File::create_new(self.staged.join(".ladder-version.json")).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    "安装包包含与版本记录冲突的 .ladder-version.json".into()
+                } else {
+                    format!("创建版本记录失败: {error}")
+                }
+            })?;
         serde_json::to_writer(&mut file, &record)
             .map_err(|error| format!("保存版本记录失败: {error}"))?;
         file.sync_all()
@@ -733,7 +761,7 @@ impl PreparedUpdate {
         fs::create_dir_all(target.parent().unwrap())
             .map_err(|error| format!("创建核心版本目录失败: {error}"))?;
         version_directory(self.core, &self.root, &self.version)?;
-        fs::rename(&staged, &target)
+        fs::rename(&self.staged, &target)
             .map_err(|error| format!("保存核心版本失败，现有版本未修改: {error}"))?;
         self.installed = true;
         Ok(())
@@ -746,15 +774,11 @@ impl PreparedUpdate {
         version: &str,
         files: &[(&str, &[u8])],
     ) -> Self {
-        let mut prepared = Self::new(core, root, version.into()).unwrap();
+        let prepared = Self::new(core, root, version.into()).unwrap();
         for (name, contents) in files {
-            let name = artifacts(core)
-                .iter()
-                .copied()
-                .find(|allowed| allowed == name)
-                .unwrap();
-            fs::write(prepared.directory.path().join("new").join(name), contents).unwrap();
-            prepared.files.push(name);
+            let path = prepared.staged.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
         }
         prepared
     }
@@ -1033,6 +1057,12 @@ mod tests {
         let path = root.join("test.zip");
         let mut writer = zip::ZipWriter::new(File::create(&path).unwrap());
         for (name, contents) in files {
+            if name.ends_with('/') {
+                writer
+                    .add_directory(*name, SimpleFileOptions::default())
+                    .unwrap();
+                continue;
+            }
             writer
                 .start_file(*name, SimpleFileOptions::default())
                 .unwrap();
@@ -1059,8 +1089,16 @@ mod tests {
                 ("sing-box-1.2.3-windows-amd64/libcronet.dll", b"dll"),
                 (
                     "sing-box-1.2.3-windows-amd64/config.json",
-                    b"do not install",
+                    b"bundled config",
                 ),
+                ("sing-box-1.2.3-windows-amd64/LICENSE", b"license"),
+                ("sing-box-1.2.3-windows-amd64/docs/README.md", b"docs"),
+                (
+                    "sing-box-1.2.3-windows-amd64/examples/README.md",
+                    b"examples",
+                ),
+                ("sing-box-1.2.3-windows-amd64/empty.txt", b""),
+                ("sing-box-1.2.3-windows-amd64/empty-dir/", b""),
             ],
         );
         let target = version_directory(core, root.path(), "1.2.3").unwrap();
@@ -1073,13 +1111,99 @@ mod tests {
         drop(prepared);
         assert_eq!(fs::read(target.join("sing-box.exe")).unwrap(), b"new");
         assert_eq!(fs::read(target.join("libcronet.dll")).unwrap(), b"dll");
-        assert!(!target.join("config.json").exists());
+        assert_eq!(
+            fs::read(target.join("config.json")).unwrap(),
+            b"bundled config"
+        );
+        assert_eq!(fs::read(target.join("LICENSE")).unwrap(), b"license");
+        assert_eq!(fs::read(target.join("docs/README.md")).unwrap(), b"docs");
+        assert_eq!(
+            fs::read(target.join("examples/README.md")).unwrap(),
+            b"examples"
+        );
+        assert_eq!(fs::read(target.join("empty.txt")).unwrap(), b"");
+        assert!(target.join("empty-dir").is_dir());
+        assert!(!target.join("sing-box-1.2.3-windows-amd64").exists());
         assert_eq!(fs::read(first.join("sing-box.exe")).unwrap(), b"old");
         assert_eq!(
             fs::read(configs.join("user.json")).unwrap(),
             b"private config"
         );
         assert_eq!(installed_versions(core, root.path()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn flat_archives_preserve_all_files_and_nested_executables() {
+        let root = tempfile::tempdir().unwrap();
+        let files: &[(&str, &[u8])] = &[
+            ("XRAY.EXE", b"exe"),
+            ("geoip.dat", b"geoip"),
+            ("geosite.dat", b"geosite"),
+            ("config.json", b"bundled config"),
+            ("LICENSE", b"license"),
+            ("examples/xray.exe", b"nested exe"),
+            ("examples/config.json", b"example config"),
+            ("empty.txt", b""),
+        ];
+        let archive = zip_file(root.path(), files);
+        let mut prepared = PreparedUpdate::new(Core::Xray, root.path(), "1.2.3".into()).unwrap();
+        prepared
+            .extract(Core::Xray, &archive, &AtomicBool::new(false))
+            .unwrap();
+        prepared.install().unwrap();
+        let target = version_directory(Core::Xray, root.path(), "1.2.3").unwrap();
+        for (name, contents) in files {
+            assert_eq!(fs::read(target.join(name)).unwrap(), *contents);
+        }
+    }
+
+    #[test]
+    fn archive_metadata_conflicts_do_not_overwrite_bundled_files() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = zip_file(
+            root.path(),
+            &[
+                ("xray.exe", b"exe"),
+                (".ladder-version.json", b"bundled metadata"),
+            ],
+        );
+        let mut prepared = PreparedUpdate::new(Core::Xray, root.path(), "1.2.3".into()).unwrap();
+        prepared
+            .extract(Core::Xray, &archive, &AtomicBool::new(false))
+            .unwrap();
+        assert!(prepared.install().unwrap_err().contains("冲突"));
+        assert_eq!(
+            fs::read(prepared.staged.join(".ladder-version.json")).unwrap(),
+            b"bundled metadata"
+        );
+        assert!(
+            !version_directory(Core::Xray, root.path(), "1.2.3")
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[test]
+    fn extraction_limit_includes_bundled_files() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = zip_file(
+            root.path(),
+            &[("xray.exe", b"exe"), ("LICENSE", b"license")],
+        );
+        let mut bytes = fs::read(&archive).unwrap();
+        let header = bytes
+            .windows(4)
+            .rposition(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        bytes[header + 24..header + 28].copy_from_slice(&(MAX_EXTRACTED_SIZE as u32).to_le_bytes());
+        fs::write(&archive, bytes).unwrap();
+        let mut prepared = PreparedUpdate::new(Core::Xray, root.path(), "1.2.3".into()).unwrap();
+        assert!(
+            prepared
+                .extract(Core::Xray, &archive, &AtomicBool::new(false))
+                .unwrap_err()
+                .contains("超出限制")
+        );
     }
 
     #[test]
@@ -1091,7 +1215,7 @@ mod tests {
                     core,
                     root.path(),
                     version,
-                    &[(artifacts(core)[0], version.as_bytes())],
+                    &[(executable_name(core), version.as_bytes())],
                 );
                 if version == "2.0.0" {
                     prepared.channel = UpdateChannel::Preview;
@@ -1162,7 +1286,7 @@ mod tests {
         for core in Core::ALL {
             let archive = zip_file(
                 root.path(),
-                &[(artifacts(core)[0], b"historical executable")],
+                &[(executable_name(core), b"historical executable")],
             );
             let mut prepared = PreparedUpdate::new(core, root.path(), "1.0.0".into()).unwrap();
             prepared
@@ -1176,7 +1300,7 @@ mod tests {
             assert!(versions[0].installed);
             assert_eq!(versions[0].channel, UpdateChannel::Stable);
             assert_eq!(versions[0].release_tag, None);
-            fs::remove_file(target.join(artifacts(core)[0])).unwrap();
+            fs::remove_file(target.join(executable_name(core))).unwrap();
             let incomplete = installed_versions(core, root.path()).unwrap();
             assert_eq!(incomplete.len(), 1);
             assert!(incomplete[0].installed);
@@ -1230,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_executables_unsafe_paths_and_duplicate_artifacts_abort_before_installing() {
+    fn invalid_archive_layouts_and_unsafe_paths_abort_before_installing() {
         let root = tempfile::tempdir().unwrap();
         let cases: &[&[(&str, &[u8])]] = &[
             &[("libcronet.dll", b"dll")],
@@ -1247,9 +1371,34 @@ mod tests {
             &[
                 ("sing-box.exe", b"exe"),
                 ("libcronet.dll", b"dll"),
-                ("a/SING-BOX.EXE", b"duplicate"),
+                ("SING-BOX.EXE", b"duplicate"),
             ],
             &[("sing-box.exe", b""), ("libcronet.dll", b"dll")],
+            &[
+                ("package/sing-box.exe", b"exe"),
+                ("LICENSE", b"outside wrapper"),
+            ],
+            &[
+                ("sing-box.exe", b"exe"),
+                ("docs/readme", b"one"),
+                ("docs/README", b"two"),
+            ],
+            &[
+                ("sing-box.exe", b"exe"),
+                ("docs", b"file"),
+                ("docs/README", b"nested"),
+            ],
+            &[
+                ("sing-box.exe", b"exe"),
+                ("docs/README", b"nested"),
+                ("docs", b"file"),
+            ],
+            &[("sing-box.exe", b"exe"), (".. /outside.txt", b"unsafe")],
+            &[("sing-box.exe", b"exe"), ("docs./README", b"unsafe")],
+            &[("sing-box.exe", b"exe"), ("docs/readme:stream", b"unsafe")],
+            &[("sing-box.exe", b"exe"), ("docs/NUL.txt", b"unsafe")],
+            &[("sing-box.exe", b"exe"), ("COM1", b"unsafe")],
+            &[("sing-box.exe", b"exe"), ("LPT¹.txt", b"unsafe")],
         ];
         for files in cases {
             let archive = zip_file(root.path(), files);
@@ -1661,7 +1810,7 @@ fn main() {
             assert!(!target.exists());
             prepared.install().unwrap();
             assert_eq!(
-                read_version_for(core, &target.join(artifacts(core)[0])).unwrap(),
+                read_version_for(core, &target.join(executable_name(core))).unwrap(),
                 release.version
             );
             assert!(prepare_version(core, root.path(), &release, &cancelled, |_| {}).is_err());
