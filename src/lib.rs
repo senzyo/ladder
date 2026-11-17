@@ -6,6 +6,7 @@ mod desktop;
 mod dns;
 mod emergency;
 mod github;
+mod i18n;
 mod logging;
 mod managed_child;
 mod panic_helper;
@@ -40,6 +41,7 @@ use windows_sys::Win32::{
 use windows_sys::w;
 
 use app_updater::AppUpdater;
+use i18n::{Language, app as t};
 use runtime::Runtime;
 use ui::MainWindow;
 
@@ -50,13 +52,14 @@ enum TrayAction {
     Exit,
     OpenDirectory,
     InstallUpdate,
+    LanguageChanged,
 }
 
 fn tray_menu() -> Result<Menu> {
     let menu = Menu::new();
-    menu.append(&MenuItem::with_id("open", "打开 Ladder", true, None))?;
-    menu.append(&MenuItem::with_id("directory", "打开程序目录", true, None))?;
-    menu.append(&MenuItem::with_id("exit", "退出并终止", true, None))?;
+    menu.append(&MenuItem::with_id("open", t::open(), true, None))?;
+    menu.append(&MenuItem::with_id("directory", t::directory(), true, None))?;
+    menu.append(&MenuItem::with_id("exit", t::exit(), true, None))?;
     Ok(menu)
 }
 
@@ -133,11 +136,11 @@ fn show_main(cx: &mut App, handle: WindowHandle<MainWindow>, show: bool) -> Resu
     let hwnd = handle.update(cx, |_, window, _| {
         match window
             .window_handle()
-            .map_err(|e| anyhow::anyhow!("读取主窗口句柄失败: {e}"))?
+            .map_err(|e| anyhow::anyhow!(t::window_handle(e)))?
             .as_raw()
         {
             RawWindowHandle::Win32(handle) => Ok(handle.hwnd.get() as HWND),
-            _ => anyhow::bail!("无法获取主窗口的 Windows 句柄"),
+            _ => anyhow::bail!(t::missing_handle()),
         }
     })??;
     // GPUI owns this HWND, and this function runs on its Windows message thread.
@@ -173,9 +176,13 @@ fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Res
         window = Some(open_main(cx, &runtime, &updater, &events)?);
     }
     cx.spawn(async move |cx| {
-        let _tray = tray;
+        let tray = tray;
         while let Ok(action) = incoming.recv().await {
             match action {
+                TrayAction::LanguageChanged => match tray_menu() {
+                    Ok(menu) => tray.set_menu(Some(Box::new(menu))),
+                    Err(error) => report(&t::tray_update(error)),
+                },
                 TrayAction::InstallUpdate => {
                     let prepared = match updater.take_prepared() {
                         Ok(prepared) => prepared,
@@ -217,7 +224,7 @@ fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Res
                                 drop(helper);
                                 report_dns_on_exit(&message);
                             } else if let Err(error) = helper.commit() {
-                                report(&format!("{error}。更新已取消, 请重新打开 Ladder 后重试。"));
+                                report(&t::update_cancelled(error));
                             }
                             let _ = cx.update(|cx| cx.quit());
                             break;
@@ -230,11 +237,12 @@ fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Res
                     }
                 }
                 TrayAction::OpenDirectory => {
-                    let result = std::env::current_exe()
-                        .map_err(|error| format!("读取程序目录失败: {error}"))
-                        .and_then(|exe| {
-                            desktop::open_folder(exe.parent().ok_or("无法定位程序目录")?)
-                        });
+                    let result =
+                        std::env::current_exe()
+                            .map_err(t::read_directory)
+                            .and_then(|exe| {
+                                desktop::open_folder(exe.parent().ok_or(t::missing_directory())?)
+                            });
                     if let Err(error) = result {
                         report(&error);
                     }
@@ -272,7 +280,7 @@ fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Res
                         }
                     });
                     if let Err(error) = result.and_then(|r| r) {
-                        report(&format!("窗口操作失败: {error}"));
+                        report(&t::window_operation(error));
                     }
                 }
             }
@@ -304,7 +312,8 @@ fn run() -> Result<()> {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
-    let base = exe.parent().context("无法定位 Ladder 程序目录")?.to_owned();
+    let base = exe.parent().context(t::missing_directory())?.to_owned();
+    i18n::set_current(runtime::saved_language(&base));
     // 日志失败不能阻止核心管理或 DNS 恢复；界面通过 warning 展示故障。
     let _ = logging::init(&base.join("app.log"));
     logging::info(
@@ -323,7 +332,7 @@ fn run() -> Result<()> {
     let desktop_runtime = runtime.clone();
     Application::new().run(move |cx| {
         if let Err(error) = start_desktop(cx, desktop_runtime, clean_on_quit) {
-            report(&format!("无法启动 Ladder 界面: {error}"));
+            report(&t::start_ui(error));
             cx.quit();
         }
     });
@@ -343,10 +352,7 @@ fn report(message: &str) {
 
 fn report_dns_on_exit(message: &str) {
     logging::warn("dns", message);
-    message_box(
-        &format!("核心已停止, DNS 尚未恢复。下次打开 Ladder 时会再次尝试恢复。\n\n{message}"),
-        MB_ICONWARNING,
-    );
+    message_box(&t::exit_dns_warning(message), MB_ICONWARNING);
 }
 
 fn message_box(message: &str, icon: u32) {
@@ -362,6 +368,7 @@ fn message_box(message: &str, icon: u32) {
 }
 
 pub fn launch() -> ExitCode {
+    i18n::set_current(Language::system());
     logging::install_panic_hook();
     if std::env::args_os().nth(1).as_deref() == Some(emergency::ARGUMENT.as_ref()) {
         return match emergency::restore_after_panic() {

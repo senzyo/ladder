@@ -15,6 +15,13 @@
 | `dns.rs` / `scheduler.rs` / `emergency.rs` / `panic_helper.rs` | DNS 快照及正常/开机/panic 恢复                         |
 | `tun_config.rs` / `tun_cleanup.rs`                             | TUN 运行副本和受保护的残留清理                         |
 | `logging.rs` / `core_output.rs`                                | 有界日志、核心输出与终端控制序列清理                   |
+| `i18n.rs` / `i18n/*.rs`                                       | 系统语言匹配、语言选择和中英俄词条                     |
+
+## 国际化
+
+设置页支持 `zh-Hans`、`en-US` 和 `ru-RU`。未手动选择语言时读取 Windows 用户首选显示语言；简体中文、英语和俄语映射到上述语言, 其余语言（含繁体中文）使用 `en-US`。手动选择成功保存到 `ladder-state.json` 后立即更新界面和托盘, 重启后保留选择。旧配置缺少 `language` 字段时继续匹配系统语言, 读取配置不会补写文件。
+
+词条按界面、运行时、更新、系统操作和应用入口存放在 `src/i18n/`。新增词条需同时提供中英俄文本；动态消息使用命名参数, 三种语言的格式字符串都会参与编译检查。错误和操作提示在生成时翻译, 已产生的提示不会在切换语言后重新翻译。已记录的诊断日志、第三方核心原始输出及系统错误详情保留原文。
 
 ## 构建环境
 
@@ -41,6 +48,7 @@ cargo test --locked --lib validation_command
 cargo test --locked --lib validation_failures_for_locked_configs
 cargo test --locked --lib app_update_preparation_recovers_after_dns_failure_and_cancellation
 cargo test --locked --lib runtime::tests::startup_
+cargo test --locked --lib runtime::tests::language_
 cargo test --locked --lib runtime::tests::github_proxy_
 cargo test --locked --lib scheduler::tests::boot_leaves_an_active_session_alone_and_retries_after_exit -- --exact
 ```

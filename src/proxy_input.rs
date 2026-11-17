@@ -22,7 +22,7 @@ pub(super) struct ProxyInput {
 impl ProxyInput {
     pub(super) fn new(text: String, window: &mut Window, cx: &mut Context<MainWindow>) -> Self {
         let cursor = text.len();
-        let focus = cx.focus_handle().tab_index(18).tab_stop(true);
+        let focus = cx.focus_handle().tab_index(21).tab_stop(true);
         cx.on_blur(&focus, window, |view, _, cx| view.save_github_proxy(cx))
             .detach();
         Self {
@@ -105,7 +105,7 @@ impl ProxyInput {
         div()
             .id("github-proxy-input")
             .track_focus(&self.focus)
-            .tab_index(18)
+            .tab_index(21)
             .flex_1()
             .min_w(px(100.))
             .h(px(30.))

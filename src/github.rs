@@ -1,3 +1,5 @@
+use crate::i18n::updates as t;
+
 use ureq::http::Uri;
 
 pub(crate) const DEFAULT_PROXY: &str = "https://axisnow.gh-proxy.org/";
@@ -7,8 +9,7 @@ pub(crate) fn normalized_prefix(prefix: &str) -> Result<String, String> {
     if prefix.is_empty() {
         return Ok(String::new());
     }
-    let invalid =
-        || "GitHub 加速链接前缀须为 HTTPS 地址, 不能包含账号、密码、查询参数或片段".to_owned();
+    let invalid = || t::invalid_proxy_prefix().to_owned();
     let uri: Uri = prefix.parse().map_err(|_| invalid())?;
     if uri.scheme_str() != Some("https")
         || uri.host().is_none_or(str::is_empty)
@@ -27,7 +28,7 @@ pub(crate) fn normalized_prefix(prefix: &str) -> Result<String, String> {
 pub(crate) fn url(prefix: &str, official_url: &str) -> Result<String, String> {
     let uri: Uri = official_url
         .parse()
-        .map_err(|_| "GitHub 资源地址无效".to_owned())?;
+        .map_err(|_| t::invalid_github_url().to_owned())?;
     if uri.scheme_str() != Some("https")
         || !matches!(uri.host(), Some("api.github.com" | "github.com"))
         || uri
@@ -35,7 +36,7 @@ pub(crate) fn url(prefix: &str, official_url: &str) -> Result<String, String> {
             .is_none_or(|value| value.as_str().contains('@'))
         || uri.port().is_some()
     {
-        return Err("GitHub 资源地址无效".into());
+        return Err(t::invalid_github_url().into());
     }
     Ok(format!("{}{official_url}", normalized_prefix(prefix)?))
 }

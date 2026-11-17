@@ -1,5 +1,7 @@
 //! panic 后由独立进程恢复 DNS, 避免重入出错线程或与仍在运行的 DNS 写入竞争。
 
+use crate::i18n::system as t;
+
 use std::ffi::OsString;
 use std::io;
 use std::os::windows::io::AsRawHandle;
@@ -83,14 +85,14 @@ fn wait_for_parent() -> io::Result<()> {
     if pid == 0 || pid == std::process::id() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "缺少有效的父进程句柄",
+            t::parent_handle_missing(),
         ));
     }
     // panic 进程应立即退出；无效调用不能留下无限等待的助手。
     if unsafe { WaitForSingleObject(parent, 30_000) } != WAIT_OBJECT_0 {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            "等待异常进程退出失败",
+            t::parent_wait_failed(),
         ));
     }
     Ok(())
@@ -101,12 +103,12 @@ pub(crate) fn restore_after_panic() -> anyhow::Result<()> {
     let directory = arguments
         .next()
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("缺少 DNS 恢复目录"))?;
+        .ok_or_else(|| anyhow::anyhow!(t::dns_recovery_directory_missing()))?;
     let legacy = arguments.next().map(PathBuf::from);
-    anyhow::ensure!(arguments.next().is_none(), "DNS 恢复参数过多");
+    anyhow::ensure!(arguments.next().is_none(), t::dns_recovery_arguments());
     anyhow::ensure!(
         directory.is_absolute() && legacy.as_ref().is_none_or(|p| p.is_absolute()),
-        "DNS 恢复目录必须是绝对路径"
+        t::dns_recovery_absolute_path()
     );
     wait_for_parent()?;
     scheduler::restore_after_panic(&directory, legacy.as_deref())

@@ -1,6 +1,7 @@
 use crate::app_updater::{AppUpdateState, AppUpdater};
 use crate::core::Core;
 use crate::desktop;
+use crate::i18n::{self, Language, ui as t};
 use crate::runtime::{
     Action, ConfigValidation, CoreOperation, CoreState, Runtime, Setting, Snapshot, ThemePreference,
 };
@@ -77,6 +78,7 @@ pub(crate) struct MainWindow {
     config_scroll: [ScrollHandle; 3],
     core_page_scroll: [ScrollHandle; 3],
     pending_theme: Option<(ThemePreference, Task<()>)>,
+    pending_language: Option<Task<()>>,
     pending_startup_core: Option<(Core, Task<()>)>,
     show_versions: [bool; 3],
     versions_auto_requested: [bool; 3],
@@ -133,6 +135,7 @@ impl MainWindow {
             config_scroll: Default::default(),
             core_page_scroll: Default::default(),
             pending_theme: None,
+            pending_language: None,
             pending_startup_core: None,
             show_versions: [false; 3],
             versions_auto_requested: [false; 3],
@@ -176,6 +179,12 @@ impl MainWindow {
             cx.notify();
         }
         let next = self.runtime.snapshot();
+        let language = next.settings.effective_language();
+        if language != i18n::current() {
+            i18n::set_current(language);
+            let _ = self.events.try_send(crate::TrayAction::LanguageChanged);
+            cx.notify();
+        }
         if next != self.snapshot {
             for core in Core::ALL {
                 let handles = &mut self.version_focus[core_index(core)];
@@ -257,7 +266,7 @@ impl MainWindow {
             UiAction::InstallAppUpdate => self
                 .events
                 .try_send(crate::TrayAction::InstallUpdate)
-                .map_err(|_| "无法开始软件更新, 托盘管理线程已关闭。".into()),
+                .map_err(|_| t::update_thread_closed().into()),
             UiAction::ShowVersions(core, show) => {
                 let index = core_index(core);
                 self.show_versions[index] = show;
@@ -369,7 +378,7 @@ impl MainWindow {
                         if result.is_err() {
                             view.set_command_result(
                                 FeedbackScope::Settings,
-                                Err("启动界面未保存, 管理线程已关闭。".into()),
+                                Err(t::startup_save_thread_closed().into()),
                             );
                         }
                         view.refresh(cx);
@@ -412,7 +421,7 @@ impl MainWindow {
                         if result.is_err() {
                             view.set_command_result(
                                 FeedbackScope::Settings,
-                                Err("主题设置未保存, 管理线程已关闭。".into()),
+                                Err(t::theme_save_thread_closed().into()),
                             );
                         }
                         view.refresh(cx);
@@ -421,6 +430,33 @@ impl MainWindow {
                 });
                 // Replacing the task cancels the previous preview's completion handler.
                 self.pending_theme = Some((theme, task));
+            }
+            Err(message) => self.set_command_result(FeedbackScope::Settings, Err(message)),
+        }
+        cx.notify();
+    }
+
+    fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        if self.pending_language.is_some() || self.snapshot.settings.language == Some(language) {
+            return;
+        }
+        match self.runtime.set_language(language) {
+            Ok(saved) => {
+                self.set_command_result(FeedbackScope::Settings, Ok(()));
+                self.pending_language = Some(cx.spawn(async move |view, cx| {
+                    let result = saved.recv().await;
+                    let _ = view.update(cx, |view, cx| {
+                        view.pending_language = None;
+                        if result.is_err() {
+                            view.set_command_result(
+                                FeedbackScope::Settings,
+                                Err(t::language_save_thread_closed().into()),
+                            );
+                        }
+                        view.refresh(cx);
+                        cx.notify();
+                    });
+                }));
             }
             Err(message) => self.set_command_result(FeedbackScope::Settings, Err(message)),
         }
@@ -456,7 +492,7 @@ impl MainWindow {
                         if result.is_err() {
                             view.set_command_result(
                                 scope,
-                                Err("GitHub 加速链接前缀未保存, 管理线程已关闭。".into()),
+                                Err(t::proxy_save_thread_closed().into()),
                             );
                         }
                         view.refresh(cx);
@@ -480,7 +516,7 @@ impl MainWindow {
         let item = |page, label: &'static str, index| {
             let selected = self.page == page;
             let running = matches!(page, Page::Core(core) if self.snapshot.core(core).running);
-            control(label, index, colors, false)
+            control(("navigation", index as usize), index, colors, false)
                 .w_full()
                 .h(px(38.))
                 .px(px(10.))
@@ -549,8 +585,8 @@ impl MainWindow {
             .child(item(Page::Core(Core::SingBox), "sing-box", 2))
             .child(item(Page::Core(Core::Xray), "Xray", 3))
             .child(div().flex_1())
-            .child(item(Page::Logs, "日志", 4))
-            .child(item(Page::Settings, "设置", 5))
+            .child(item(Page::Logs, t::logs(), 4))
+            .child(item(Page::Settings, t::settings(), 5))
     }
 
     fn core_page(&self, core: Core, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
@@ -566,9 +602,9 @@ impl MainWindow {
         let can_use_config = idle && state.scan_error.is_none();
         let can_run = can_use_config && state.installed && current_exists;
         let connection_label = match state.operation {
-            Some(CoreOperation::Switching) => "切换中",
-            _ if state.running => "停止核心",
-            _ => "启动核心",
+            Some(CoreOperation::Switching) => t::switching(),
+            _ if state.running => t::stop_core(),
+            _ => t::start_core(),
         };
         let connection_action = if state.running {
             idle.then_some(UiAction::Run(Action::Stop(core)))
@@ -596,28 +632,37 @@ impl MainWindow {
             let current = state.current.as_ref() == Some(name);
             let target = DeleteTarget::Config(core, name.clone());
             let confirming = self.confirm_delete.as_ref() == Some(&target);
-            let mut buttons = div().flex().items_center().flex_shrink_0().gap(px(8.));
+            let mut buttons = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .max_w_full()
+                .gap(px(8.));
             let validation = state.validation(name);
             let checking = matches!(validation, Some(ConfigValidation::Checking));
             if matches!(validation, Some(ConfigValidation::Valid)) {
-                buttons = buttons.child(badge("配置合法", colors.version_stable, colors));
+                buttons = buttons.child(badge(t::config_valid(), colors.version_stable, colors));
             }
             let validate = (
-                if checking { "验证中" } else { "验证" },
+                if checking {
+                    t::validating()
+                } else {
+                    t::validate()
+                },
                 (!state.validation_busy && state.installed && state.scan_error.is_none())
                     .then(|| UiAction::Run(Action::ValidateConfig(core, name.clone()))),
             );
-            let edit = (2, ("编辑", Some(UiAction::Edit(core, name.clone()))));
+            let edit = (2, (t::edit(), Some(UiAction::Edit(core, name.clone()))));
             let actions;
             if current {
-                buttons = buttons.child(div().child("当前使用"));
+                buttons = buttons.child(div().child(t::current()));
                 actions = vec![(1, validate), edit];
             } else {
                 actions = vec![
                     (
                         0,
                         (
-                            "切换",
+                            t::switch(),
                             can_use_config
                                 .then(|| UiAction::Run(Action::SwitchConfig(core, name.clone()))),
                         ),
@@ -627,7 +672,11 @@ impl MainWindow {
                     (
                         3,
                         (
-                            if confirming { "确认删除" } else { "删除" },
+                            if confirming {
+                                t::confirm_delete()
+                            } else {
+                                t::delete()
+                            },
                             can_use_config.then(|| {
                                 if confirming {
                                     UiAction::Run(Action::DeleteConfig(core, name.clone()))
@@ -736,6 +785,7 @@ impl MainWindow {
                 div()
                     .flex_shrink_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap(px(12.))
@@ -747,7 +797,7 @@ impl MainWindow {
                                 .text_size(px(TEXT_PRIMARY))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(colors.error)
-                                .child("点击右侧“管理核心版本”安装核心 -->"),
+                                .child(t::install_core_hint()),
                         )
                     })
                     .when(state.installed, |el| {
@@ -764,7 +814,7 @@ impl MainWindow {
                         )
                     })
                     .child(action_button(
-                        "管理核心版本",
+                        t::manage_versions(),
                         7,
                         Some(UiAction::ShowVersions(core, true)),
                         true,
@@ -778,12 +828,7 @@ impl MainWindow {
             )
             .when(
                 state.current.is_some() && !current_exists && state.scan_error.is_none(),
-                |el| {
-                    el.child(error_message(
-                        "当前配置文件已移走, 请重新选择配置。".into(),
-                        colors,
-                    ))
-                },
+                |el| el.child(error_message(t::config_moved().into(), colors)),
             )
             .when_some(state.run_error.clone(), |el, message| {
                 el.child(error_message(message, colors))
@@ -795,15 +840,21 @@ impl MainWindow {
                 div()
                     .flex_shrink_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
+                    .gap(px(8.))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(8.))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child("配置文件"))
-                            .child(caption(format!("{} 个", state.configs.len()), colors)),
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(t::config_files()),
+                            )
+                            .child(caption(t::config_count(state.configs.len()), colors)),
                     )
                     .child(
                         div()
@@ -811,7 +862,7 @@ impl MainWindow {
                             .items_center()
                             .gap(px(8.))
                             .child(action_button(
-                                "验证全部",
+                                t::validate_all(),
                                 8,
                                 (state.installed
                                     && !state.configs.is_empty()
@@ -823,7 +874,7 @@ impl MainWindow {
                                 cx,
                             ))
                             .child(action_button(
-                                "打开配置目录",
+                                t::open_config_folder(),
                                 9,
                                 Some(UiAction::OpenFolder(core)),
                                 false,
@@ -866,22 +917,26 @@ impl MainWindow {
             let confirming = self.confirm_delete.as_ref()
                 == Some(&DeleteTarget::Version(core, version.version.clone()));
             let (label, color) = match version.channel {
-                UpdateChannel::Stable => ("稳定版", colors.version_stable),
-                UpdateChannel::Preview => ("预览版", colors.version_preview),
+                UpdateChannel::Stable => (t::stable(), colors.version_stable),
+                UpdateChannel::Preview => (t::preview(), colors.version_preview),
             };
             let actions = if current {
                 vec![]
             } else if version.installed {
                 vec![
                     (
-                        "切换",
+                        t::switch(),
                         can_manage.then_some(UiAction::Run(Action::SwitchVersion(
                             core,
                             version.version.clone(),
                         ))),
                     ),
                     (
-                        if confirming { "确认删除" } else { "删除" },
+                        if confirming {
+                            t::confirm_delete()
+                        } else {
+                            t::delete()
+                        },
                         can_manage.then(|| {
                             if confirming {
                                 UiAction::Run(Action::DeleteVersion(core, version.version.clone()))
@@ -897,18 +952,23 @@ impl MainWindow {
             } else {
                 vec![(
                     if progress.is_some() {
-                        "下载中"
+                        t::downloading()
                     } else {
-                        "下载"
+                        t::download()
                     },
                     (can_manage && version.release_tag.is_some()).then_some(UiAction::Run(
                         Action::DownloadVersion(core, version.version.clone()),
                     )),
                 )]
             };
-            let mut buttons = div().flex().items_center().flex_shrink_0().gap(px(8.));
+            let mut buttons = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .max_w_full()
+                .gap(px(8.));
             if current {
-                buttons = buttons.child(div().child("当前使用"));
+                buttons = buttons.child(div().child(t::current()));
             }
             for (slot, (label, action)) in actions.into_iter().enumerate() {
                 let tab_index = 14 + (index * 2 + slot) as isize;
@@ -944,7 +1004,7 @@ impl MainWindow {
                 div()
                     .flex_shrink_0()
                     .flex()
-                    .whitespace_nowrap()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap(px(12.))
@@ -958,6 +1018,7 @@ impl MainWindow {
                             .flex_1()
                             .min_w(px(0.))
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(6.))
                             .child(
@@ -974,8 +1035,7 @@ impl MainWindow {
                             .when_some(progress, |el, progress| {
                                 el.child(
                                     caption(update_progress_text(progress), colors)
-                                        .whitespace_nowrap()
-                                        .flex_shrink_0()
+                                        .whitespace_normal()
                                         .text_color(colors.accent),
                                 )
                             }),
@@ -1017,11 +1077,12 @@ impl MainWindow {
             .border_1()
             .border_color(colors.line)
             .rounded(px(6.));
-        for (index, (label, only_downloaded)) in
-            [("已下载", true), ("全部", false)].into_iter().enumerate()
+        for (index, (label, only_downloaded)) in [(t::downloaded(), true), (t::all(), false)]
+            .into_iter()
+            .enumerate()
         {
             filter = filter.child(
-                control(label, 7 + index as isize, colors, false)
+                control(("version-filter", index), 7 + index as isize, colors, false)
                     .h(px(26.))
                     .min_w(px(60.))
                     .px(px(8.))
@@ -1049,9 +1110,9 @@ impl MainWindow {
                     .items_center()
                     .gap(px(12.))
                     .child(page_title(match core {
-                        Core::SingBox => "sing-box 版本",
-                        Core::Xray => "Xray 版本",
-                        Core::Mihomo => "mihomo 版本",
+                        Core::SingBox => t::sing_box_versions(),
+                        Core::Xray => t::xray_versions(),
+                        Core::Mihomo => t::mihomo_versions(),
                     }))
                     .child(refresh),
             )
@@ -1071,7 +1132,7 @@ impl MainWindow {
                             .items_center()
                             .gap(px(8.))
                             .child(action_button(
-                                "打开核心目录",
+                                t::open_core_folder(),
                                 9,
                                 Some(UiAction::OpenCoreFolder(core)),
                                 false,
@@ -1080,7 +1141,7 @@ impl MainWindow {
                             ))
                             .child(
                                 action_button(
-                                    "返回配置页面",
+                                    t::back_to_configs(),
                                     10,
                                     Some(UiAction::ShowVersions(core, false)),
                                     true,
@@ -1147,7 +1208,7 @@ impl MainWindow {
             )
             .when(!downloaded_only && state.versions_has_more, |el| {
                 el.child(action_button(
-                    "加载更多",
+                    t::load_more(),
                     footer_index,
                     (!state.versions_loading)
                         .then_some(UiAction::Run(Action::LoadMoreVersions(core))),
@@ -1169,6 +1230,7 @@ impl MainWindow {
         let settings = &self.snapshot.settings;
         let mut choices = div()
             .flex()
+            .flex_shrink_0()
             .gap(px(2.))
             .p(px(2.))
             .bg(colors.canvas)
@@ -1176,16 +1238,16 @@ impl MainWindow {
             .border_color(colors.line)
             .rounded(px(6.));
         for (index, (theme, label)) in [
-            (ThemePreference::System, "跟随系统"),
-            (ThemePreference::Light, "浅色"),
-            (ThemePreference::Dark, "深色"),
+            (ThemePreference::System, t::system_theme()),
+            (ThemePreference::Light, t::light_theme()),
+            (ThemePreference::Dark, t::dark_theme()),
         ]
         .into_iter()
         .enumerate()
         {
             let selected = self.selected_theme() == theme;
             choices = choices.child(
-                control(label, 6 + index as isize, colors, false)
+                control(("theme", index), 6 + index as isize, colors, false)
                     .h(px(28.))
                     .px(px(8.))
                     .when(selected, |el| {
@@ -1195,8 +1257,32 @@ impl MainWindow {
                     .on_click(cx.listener(move |view, _, _, cx| view.set_theme(theme, cx))),
             );
         }
+        let mut languages = div()
+            .flex()
+            .flex_shrink_0()
+            .gap(px(2.))
+            .p(px(2.))
+            .bg(colors.canvas)
+            .border_1()
+            .border_color(colors.line)
+            .rounded(px(6.));
+        for (index, language) in Language::ALL.into_iter().enumerate() {
+            languages = languages.child(
+                control(("language", index), 9 + index as isize, colors, false)
+                    .h(px(28.))
+                    .px(px(8.))
+                    .whitespace_nowrap()
+                    .when(settings.effective_language() == language, |el| {
+                        el.bg(colors.selection).text_color(colors.accent)
+                    })
+                    .when(self.pending_language.is_some(), |el| el.opacity(0.65))
+                    .child(language.native_name())
+                    .on_click(cx.listener(move |view, _, _, cx| view.set_language(language, cx))),
+            );
+        }
         let mut startup_choices = div()
             .flex()
+            .flex_shrink_0()
             .gap(px(2.))
             .p(px(2.))
             .bg(colors.canvas)
@@ -1212,7 +1298,7 @@ impl MainWindow {
         .enumerate()
         {
             startup_choices = startup_choices.child(
-                control(("startup-core", index), 9 + index as isize, colors, false)
+                control(("startup-core", index), 12 + index as isize, colors, false)
                     .h(px(28.))
                     .px(px(8.))
                     .when(self.selected_startup_core() == core, |el| {
@@ -1235,8 +1321,21 @@ impl MainWindow {
                     .gap(px(12.))
                     .items_center()
                     .justify_between()
-                    .child("主题")
+                    .child(t::theme())
                     .child(choices),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .min_h(px(52.))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .gap(px(12.))
+                    .items_center()
+                    .justify_between()
+                    .child(t::language())
+                    .child(languages),
             )
             .child(
                 div()
@@ -1246,43 +1345,43 @@ impl MainWindow {
                     .gap(px(12.))
                     .items_center()
                     .justify_between()
-                    .child("启动界面")
+                    .child(t::startup_page())
                     .child(startup_choices),
             );
         for (index, (label, description, key, value)) in [
             (
-                "启动时隐藏主窗口",
-                "从系统托盘打开 Ladder",
+                t::hide_on_startup(),
+                t::open_from_tray(),
                 Setting::MinimizeToTray,
                 settings.minimize_to_tray,
             ),
             (
-                "随 Ladder 启动 mihomo",
-                "使用上次选择的 mihomo 配置",
+                t::auto_mihomo(),
+                t::last_mihomo_config(),
                 Setting::AutoMihomo,
                 settings.auto_mihomo,
             ),
             (
-                "随 Ladder 启动 sing-box",
-                "使用上次选择的 sing-box 配置",
+                t::auto_sing_box(),
+                t::last_sing_box_config(),
                 Setting::AutoSingBox,
                 settings.auto_sing_box,
             ),
             (
-                "随 Ladder 启动 Xray",
-                "使用上次选择的 Xray 配置",
+                t::auto_xray(),
+                t::last_xray_config(),
                 Setting::AutoXray,
                 settings.auto_xray,
             ),
             (
-                "劫持DNS到本地回环",
-                "下次启动任一核心时, 将物理网卡 DNS 设为 127.0.0.1 和 ::1。不要和 mihomo 的 strict-route、sing-box 的 strict_route、Xray 的 autoSystemWfpBlockLeak 同时开启。",
+                t::hijack_dns(),
+                t::hijack_dns_description(),
                 Setting::HijackDns,
                 settings.hijack_dns,
             ),
             (
-                "GitHub 加速",
-                "用于核心和软件的版本检查与下载",
+                t::github_proxy(),
+                t::github_proxy_description(),
                 Setting::GithubProxyEnabled,
                 settings.github_proxy_enabled,
             ),
@@ -1311,7 +1410,7 @@ impl MainWindow {
                         .bg(colors.on_accent),
                 );
             rows = rows.child(
-                control(label, 12 + index as isize, colors, false)
+                control(("setting", index), 15 + index as isize, colors, false)
                     .flex_shrink_0()
                     .min_h(px(68.))
                     .px(px(12.))
@@ -1335,7 +1434,10 @@ impl MainWindow {
                             .flex()
                             .items_center()
                             .gap(px(10.))
-                            .child(caption(if value { "开启" } else { "关闭" }, colors))
+                            .child(caption(
+                                if value { t::enabled() } else { t::disabled() },
+                                colors,
+                            ))
                             .child(track),
                     )
                     .on_click(cx.listener(move |view, _, _, cx| {
@@ -1352,19 +1454,19 @@ impl MainWindow {
                     .px(px(12.))
                     .gap(px(8.))
                     .items_center()
-                    .child(div().flex_shrink_0().child("加速链接前缀"))
+                    .child(div().flex_shrink_0().child(t::proxy_prefix()))
                     .child(self.github_proxy.render(colors, cx))
                     .child(
                         action_button(
-                            "保存",
-                            19,
+                            t::save(),
+                            22,
                             self.github_proxy_changed()
                                 .then_some(UiAction::SaveGithubProxy),
                             true,
                             colors,
                             cx,
                         )
-                        .tab_index(19)
+                        .tab_index(22)
                         .tab_stop(self.github_proxy_changed()),
                     ),
             )
@@ -1384,18 +1486,20 @@ impl MainWindow {
             | AppUpdateState::Checking
             | AppUpdateState::Installing
             | AppUpdateState::Failed(_) => None,
-            AppUpdateState::Latest => Some("已是最新版本".into()),
-            AppUpdateState::Available(version) => Some(format!("新版本 {version}")),
+            AppUpdateState::Latest => Some(t::latest_version().into()),
+            AppUpdateState::Available(version) => Some(t::new_version(version)),
             AppUpdateState::Downloading(progress) => Some(update_progress_text(progress)),
-            AppUpdateState::Ready(version) => Some(format!("{version} 已准备好")),
+            AppUpdateState::Ready(version) => Some(t::version_ready(version)),
         };
         let (update_label, update_action) = match self.app_update {
-            AppUpdateState::Checking => ("检查中…", None),
-            AppUpdateState::Downloading(_) => ("下载中…", None),
-            AppUpdateState::Installing => ("重启中…", None),
-            AppUpdateState::Available(_) => ("下载更新", Some(UiAction::DownloadAppUpdate)),
-            AppUpdateState::Ready(_) => ("重启以更新", Some(UiAction::InstallAppUpdate)),
-            _ => ("检查更新", Some(UiAction::CheckAppUpdate)),
+            AppUpdateState::Checking => (t::checking_update(), None),
+            AppUpdateState::Downloading(_) => (t::downloading_update(), None),
+            AppUpdateState::Installing => (t::restarting(), None),
+            AppUpdateState::Available(_) => {
+                (t::download_update(), Some(UiAction::DownloadAppUpdate))
+            }
+            AppUpdateState::Ready(_) => (t::restart_to_update(), Some(UiAction::InstallAppUpdate)),
+            _ => (t::check_update(), Some(UiAction::CheckAppUpdate)),
         };
         let content = div()
             .id("settings-content")
@@ -1425,11 +1529,11 @@ impl MainWindow {
                         )
                         .child(action_button(
                             if busy {
-                                "正在恢复 DNS"
+                                t::restoring_dns()
                             } else {
-                                "重试恢复 DNS"
+                                t::retry_dns()
                             },
-                            20,
+                            23,
                             (!busy).then_some(UiAction::Run(Action::RetryDns)),
                             false,
                             colors,
@@ -1448,10 +1552,11 @@ impl MainWindow {
                     .flex()
                     .flex_col()
                     .gap(px(12.))
-                    .child(page_title("关于"))
+                    .child(page_title(t::about()))
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(10.))
                             .child(img(self.icon.clone()).size(px(36.)).flex_shrink_0())
@@ -1472,10 +1577,10 @@ impl MainWindow {
                                             .child(repository_link(
                                                 format!("Ladder {}", env!("CARGO_PKG_VERSION")),
                                                 "https://github.com/senzyo/ladder",
-                                                21,
+                                                24,
                                                 colors,
                                             ))
-                                            .child(caption("MIT License", colors)),
+                                            .child(caption(t::mit_license(), colors)),
                                     )
                                     .child(
                                         div().flex().flex_wrap().gap(px(8.)).children(
@@ -1494,7 +1599,7 @@ impl MainWindow {
                                                     repository_link(
                                                         label,
                                                         url,
-                                                        22 + index as isize,
+                                                        25 + index as isize,
                                                         colors,
                                                     )
                                                 },
@@ -1503,7 +1608,7 @@ impl MainWindow {
                                     ),
                             )
                             .child(
-                                div().flex_1().min_w(px(0.)).text_right().when_some(
+                                div().flex_1().min_w(px(140.)).text_right().when_some(
                                     update_status,
                                     |el, status| {
                                         el.child(caption(status, colors).whitespace_normal())
@@ -1513,7 +1618,7 @@ impl MainWindow {
                             .child(
                                 action_button(
                                     update_label,
-                                    25,
+                                    28,
                                     update_action,
                                     matches!(
                                         self.app_update,
@@ -1528,7 +1633,7 @@ impl MainWindow {
                     )
                     .when(matches!(self.app_update, AppUpdateState::Ready(_)), |el| {
                         el.child(
-                            caption("更新时将停止所有核心, 完成后重新打开 Ladder。", colors)
+                            caption(t::update_restart_hint(), colors)
                                 .w_full()
                                 .whitespace_normal(),
                         )
@@ -1564,7 +1669,11 @@ impl Render for MainWindow {
             .tab_group()
             .size_full()
             .flex()
-            .font_family("Microsoft YaHei UI")
+            .font_family(if i18n::current() == Language::ZhHans {
+                "Microsoft YaHei UI"
+            } else {
+                "Segoe UI"
+            })
             .text_size(px(TEXT_PRIMARY))
             .text_color(colors.text)
             .bg(colors.canvas)
@@ -1654,20 +1763,20 @@ fn core_index(core: Core) -> usize {
 
 fn update_progress_text(progress: &UpdateProgress) -> String {
     match progress {
-        UpdateProgress::Checking => "正在获取官方版本信息…".into(),
+        UpdateProgress::Checking => t::fetching_release().into(),
         UpdateProgress::Downloading { received, total } => {
             let downloaded = *received as f64 / 1_048_576.0;
             if *total == 0 {
-                format!("正在下载 · {downloaded:.1} MiB")
+                t::download_size(downloaded)
             } else {
                 let percent = (*received as f64 / *total as f64 * 100.0).min(100.0);
                 let size = *total as f64 / 1_048_576.0;
-                format!("正在下载 · {percent:.0}% · {downloaded:.1} / {size:.1} MiB")
+                t::download_progress(percent, downloaded, size)
             }
         }
-        UpdateProgress::Verifying => "正在校验下载文件…".into(),
-        UpdateProgress::Extracting => "正在准备安装文件…".into(),
-        UpdateProgress::Installing => "正在保存核心版本…".into(),
+        UpdateProgress::Verifying => t::verifying_download().into(),
+        UpdateProgress::Extracting => t::preparing_install().into(),
+        UpdateProgress::Installing => t::saving_core().into(),
     }
 }
 
@@ -1742,9 +1851,9 @@ impl Render for RefreshTooltip {
             .text_size(px(TEXT_SECONDARY))
             .text_color(self.colors.text)
             .child(if self.loading {
-                "正在获取版本列表…"
+                t::fetching_versions()
             } else {
-                "获取版本列表"
+                t::fetch_versions()
             })
     }
 }
@@ -1890,10 +1999,10 @@ fn action_button(
 ) -> Stateful<Div> {
     let enabled = action.is_some();
     let base = if enabled {
-        control(label, index, colors, primary)
+        control(("action", index as usize), index, colors, primary)
     } else {
         div()
-            .id(label)
+            .id(("action", index as usize))
             .flex()
             .items_center()
             .rounded(px(5.))

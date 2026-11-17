@@ -1,3 +1,5 @@
+use crate::i18n::updates as t;
+
 use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -53,19 +55,19 @@ fn architecture() -> &'static str {
 
 fn parse_release(data: &[u8], current: &str) -> Result<Option<AppRelease>, String> {
     let release: Release =
-        serde_json::from_slice(data).map_err(|_| "GitHub 返回了无效的软件发布信息".to_string())?;
+        serde_json::from_slice(data).map_err(|_| t::invalid_app_release().to_string())?;
     let version = release
         .tag_name
         .strip_prefix('v')
-        .ok_or("软件发布版本号无效")?;
+        .ok_or(t::invalid_app_version())?;
     let version_without_build = version.split('+').next().unwrap();
     if release.draft || release.prerelease || version_without_build.contains('-') {
-        return Err("软件更新只接受正式发布版本".into());
+        return Err(t::app_stable_only().into());
     }
     match compare_versions(version, current) {
         Some(Ordering::Greater) => {}
         Some(_) => return Ok(None),
-        None => return Err("无法比较软件版本号".into()),
+        None => return Err(t::cannot_compare_app_versions().into()),
     }
     let expected = format!("ladder-{}-v{version}.zip", architecture());
     let official_url = format!(
@@ -76,24 +78,22 @@ fn parse_release(data: &[u8], current: &str) -> Result<Option<AppRelease>, Strin
         .assets
         .into_iter()
         .filter(|asset| asset.name == expected);
-    let asset = assets
-        .next()
-        .ok_or("该版本没有适用于当前架构的软件安装包")?;
+    let asset = assets.next().ok_or(t::missing_app_architecture())?;
     if assets.next().is_some()
         || asset.browser_download_url != official_url
         || asset.size == 0
         || asset.size > MAX_SIZE
     {
-        return Err("软件安装包发布信息无效".into());
+        return Err(t::invalid_app_package_info().into());
     }
     let digest = asset
         .digest
         .as_deref()
         .and_then(|value| value.strip_prefix("sha256:"))
-        .ok_or("软件安装包缺少 GitHub SHA-256 校验信息")?;
+        .ok_or(t::missing_app_digest())?;
     let mut sha256 = [0; 32];
     if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("软件安装包 SHA-256 校验信息无效".into());
+        return Err(t::invalid_app_digest().into());
     }
     for (index, byte) in sha256.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16).unwrap();
@@ -120,7 +120,7 @@ pub fn check_latest(prefix: &str) -> Result<Option<AppRelease>, String> {
         .header("Accept", "application/vnd.github+json")
         .call();
     let mut response = match result {
-        Err(ureq::Error::StatusCode(404)) => return Err("尚无可用的 Ladder 正式发行版".into()),
+        Err(ureq::Error::StatusCode(404)) => return Err(t::no_app_release().into()),
         other => other.map_err(network_error)?,
     };
     let data = response
@@ -134,11 +134,9 @@ pub fn check_latest(prefix: &str) -> Result<Option<AppRelease>, String> {
 
 fn network_error(error: ureq::Error) -> String {
     match error {
-        ureq::Error::StatusCode(403 | 429) => {
-            "GitHub 请求受限, 请稍后重试或更换加速链接前缀".into()
-        }
-        ureq::Error::StatusCode(404) => "软件安装包已不存在, 请重新检查更新".into(),
-        _ => "软件更新请求失败或超时, 请检查网络后重试".into(),
+        ureq::Error::StatusCode(403 | 429) => t::app_request_limited().into(),
+        ureq::Error::StatusCode(404) => t::app_package_gone().into(),
+        _ => t::app_request_failed().into(),
     }
 }
 
@@ -153,7 +151,7 @@ pub fn download(
     prefix: &str,
     progress: impl FnMut(UpdateProgress),
 ) -> Result<PreparedAppUpdate, String> {
-    let target = std::env::current_exe().map_err(|_| "无法定位软件程序")?;
+    let target = std::env::current_exe().map_err(|_| t::cannot_locate_app())?;
     let url = crate::github::url(prefix, &release.url)?;
     download_to(
         release,
@@ -184,35 +182,36 @@ fn download_to<R: Read>(
     open: impl FnOnce() -> Result<R, String>,
     mut progress: impl FnMut(UpdateProgress),
 ) -> Result<PreparedAppUpdate, String> {
-    let root = target.parent().ok_or("无法定位程序目录")?;
+    let root = target.parent().ok_or(t::cannot_locate_app_directory())?;
     let stage = tempfile::Builder::new()
         .prefix(".ladder-app-update-")
         .tempdir_in(root)
-        .map_err(|_| "无法创建软件更新目录, 请检查程序目录权限")?;
+        .map_err(|_| t::cannot_create_app_update_directory())?;
     progress(UpdateProgress::Downloading {
         received: 0,
         total: release.size,
     });
     let mut reader = open()?;
     let archive_path = stage.path().join("release.zip");
-    let mut archive_file = File::create(&archive_path).map_err(|_| "无法保存软件安装包")?;
+    let mut archive_file =
+        File::create(&archive_path).map_err(|_| t::cannot_create_app_package())?;
     let mut hasher = Sha256::new();
     let mut received = 0;
     let mut buffer = [0; 64 * 1024];
     loop {
         let count = reader
             .read(&mut buffer)
-            .map_err(|_| "软件安装包下载中断或超时")?;
+            .map_err(|_| t::app_download_interrupted())?;
         if count == 0 {
             break;
         }
         received += count as u64;
         if received > release.size {
-            return Err("软件安装包大小与发布信息不符".into());
+            return Err(t::app_size_mismatch().into());
         }
         archive_file
             .write_all(&buffer[..count])
-            .map_err(|_| "保存软件安装包失败")?;
+            .map_err(|_| t::cannot_save_app_package())?;
         hasher.update(&buffer[..count]);
         progress(UpdateProgress::Downloading {
             received,
@@ -222,9 +221,11 @@ fn download_to<R: Read>(
     progress(UpdateProgress::Verifying);
     let digest: [u8; 32] = hasher.finalize().into();
     if received != release.size || digest != release.sha256 {
-        return Err("软件安装包大小或 SHA-256 校验失败, 当前软件未修改".into());
+        return Err(t::app_verification_failed().into());
     }
-    archive_file.sync_all().map_err(|_| "保存软件安装包失败")?;
+    archive_file
+        .sync_all()
+        .map_err(|_| t::cannot_save_app_package())?;
     drop(archive_file);
     progress(UpdateProgress::Extracting);
     let executable = stage.path().join("ladder.exe");
@@ -239,48 +240,50 @@ fn download_to<R: Read>(
 }
 
 fn extract_executable(archive_path: &Path, executable: &Path) -> Result<(), String> {
-    let archive_file = File::open(archive_path).map_err(|_| "无法读取软件安装包")?;
-    let mut archive = ZipArchive::new(archive_file).map_err(|_| "软件安装包不是有效的 ZIP")?;
+    let archive_file = File::open(archive_path).map_err(|_| t::cannot_read_app_package())?;
+    let mut archive = ZipArchive::new(archive_file).map_err(|_| t::invalid_app_zip())?;
     let mut found = false;
     let mut total = 0u64;
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(|_| "软件安装包损坏")?;
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|_| t::corrupt_app_package())?;
         let name = entry
             .name()
-            .map_err(|_| "软件安装包文件名无效")?
+            .map_err(|_| t::invalid_app_filename())?
             .into_owned();
         total = total
             .checked_add(entry.size())
-            .ok_or("软件安装包内容过大")?;
+            .ok_or(t::app_contents_too_large())?;
         if total > MAX_SIZE
             || entry.is_symlink()
             || !matches!(name.as_str(), "ladder.exe" | "README.md" | "LICENSE")
         {
-            return Err("软件安装包含不支持的文件或内容过大".into());
+            return Err(t::unsupported_app_contents().into());
         }
         if name != "ladder.exe" {
             continue;
         }
         if found || entry.is_dir() || entry.size() == 0 {
-            return Err("软件安装包的程序文件无效".into());
+            return Err(t::invalid_app_executable().into());
         }
         found = true;
-        let mut output = File::create(executable).map_err(|_| "无法暂存新版程序")?;
+        let mut output = File::create(executable).map_err(|_| t::cannot_stage_app())?;
         let copied = std::io::copy(&mut entry.by_ref().take(MAX_SIZE + 1), &mut output)
-            .map_err(|_| "解压软件安装包失败")?;
+            .map_err(|_| t::cannot_extract_app())?;
         if copied > MAX_SIZE || copied != entry.size() {
-            return Err("新版程序大小无效".into());
+            return Err(t::invalid_new_app_size().into());
         }
-        output.sync_all().map_err(|_| "保存新版程序失败")?;
+        output.sync_all().map_err(|_| t::cannot_save_new_app())?;
     }
     if !found {
-        return Err("软件安装包缺少 ladder.exe".into());
+        return Err(t::missing_ladder_exe().into());
     }
     Ok(())
 }
 
 fn validate_executable(path: &Path) -> Result<(), String> {
-    let invalid = || "新版程序不是适用于当前架构的 Windows 程序".to_string();
+    let invalid = || t::invalid_new_app_architecture().to_string();
     let mut file = File::open(path).map_err(|_| invalid())?;
     let length = file.metadata().map_err(|_| invalid())?.len();
     let mut dos = [0; 64];
@@ -310,11 +313,13 @@ fn validate_executable(path: &Path) -> Result<(), String> {
 }
 
 fn file_hash(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|_| "无法读取新版程序")?;
+    let mut file = File::open(path).map_err(|_| t::cannot_read_new_app())?;
     let mut hasher = Sha256::new();
     let mut buffer = [0; 64 * 1024];
     loop {
-        let count = file.read(&mut buffer).map_err(|_| "无法校验新版程序")?;
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| t::cannot_verify_new_app())?;
         if count == 0 {
             break;
         }
@@ -344,14 +349,14 @@ impl UpdateHelper {
         if self
             .process
             .try_wait()
-            .map_err(|_| "无法检查软件更新助手")?
+            .map_err(|_| t::cannot_check_update_helper())?
             .is_some()
         {
-            return Err("软件更新助手已退出, 当前软件未修改".into());
+            return Err(t::update_helper_exited().into());
         }
         let stage = self.stage.as_ref().unwrap();
         fs::write(stage.path().join("commit"), b"commit")
-            .map_err(|_| "无法确认软件更新, 当前软件未修改")?;
+            .map_err(|_| t::cannot_commit_app_update())?;
         let _ = self.stage.take().unwrap().keep();
         Ok(())
     }
@@ -373,19 +378,19 @@ impl PreparedAppUpdate {
             .target
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or("程序文件名无效")?;
+            .ok_or(t::invalid_executable_name())?;
         let plan = UpdatePlan {
             target: name,
             sha256: &self.sha256,
             parent: std::process::id(),
         };
-        let data = serde_json::to_vec(&plan).map_err(|_| "无法生成软件更新计划")?;
+        let data = serde_json::to_vec(&plan).map_err(|_| t::cannot_create_update_plan())?;
         fs::write(self.stage.path().join("update.json"), data)
-            .map_err(|_| "无法保存软件更新计划")?;
+            .map_err(|_| t::cannot_save_update_plan())?;
         let script = self.stage.path().join("apply-update.ps1");
         fs::write(&script, include_bytes!("../scripts/apply-update.ps1"))
-            .map_err(|_| "无法准备软件更新助手")?;
-        let windows = std::env::var_os("SystemRoot").ok_or("无法定位 Windows 系统目录")?;
+            .map_err(|_| t::cannot_prepare_update_helper())?;
+        let windows = std::env::var_os("SystemRoot").ok_or(t::cannot_locate_windows())?;
         let powershell = Path::new(&windows).join("System32/WindowsPowerShell/v1.0/powershell.exe");
         let process = Command::new(powershell)
             .args([
@@ -401,7 +406,7 @@ impl PreparedAppUpdate {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|_| "无法启动软件更新助手, 当前软件未修改")?;
+            .map_err(|_| t::cannot_start_update_helper())?;
         let mut helper = UpdateHelper {
             process,
             stage: Some(self.stage),
@@ -418,13 +423,13 @@ impl PreparedAppUpdate {
             if helper
                 .process
                 .try_wait()
-                .map_err(|_| "无法检查软件更新助手")?
+                .map_err(|_| t::cannot_check_update_helper())?
                 .is_some()
             {
-                return Err("软件更新助手启动失败, 当前软件未修改".into());
+                return Err(t::update_helper_start_failed().into());
             }
             if Instant::now() >= deadline {
-                return Err("软件更新助手未能及时就绪, 当前软件未修改".into());
+                return Err(t::update_helper_timeout().into());
             }
             std::thread::sleep(Duration::from_millis(25));
         }

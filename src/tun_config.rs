@@ -1,3 +1,5 @@
+use crate::i18n::system as t;
+
 use std::collections::hash_map::RandomState;
 use std::fs;
 use std::hash::{BuildHasher, Hasher};
@@ -32,7 +34,7 @@ impl PreparedConfig {
 }
 
 pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, String> {
-    let text = fs::read(source).map_err(|e| format!("读取核心配置失败: {e}"))?;
+    let text = fs::read(source).map_err(t::core_config_read)?;
     if core == Core::Mihomo {
         return prepare_mihomo(source, &text);
     }
@@ -41,13 +43,8 @@ pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, Strin
     } else {
         text
     };
-    let mut config: Value = serde_json_lenient::from_slice(&text).map_err(|e| {
-        format!(
-            "核心配置格式无效 (第 {} 行, 第 {} 列)",
-            e.line(),
-            e.column()
-        )
-    })?;
+    let mut config: Value = serde_json_lenient::from_slice(&text)
+        .map_err(|e| t::core_config_invalid(e.line(), e.column()))?;
     let mut names = Vec::new();
     let inbounds_key = config_key(core, &config, "inbounds");
     if let Some(inbounds) = config.get_mut(&inbounds_key).and_then(Value::as_array_mut) {
@@ -82,13 +79,13 @@ pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, Strin
                     let name_key = config_key(core, settings, "name");
                     let settings = settings
                         .as_object_mut()
-                        .ok_or("Xray 的 TUN settings 必须是对象")?;
+                        .ok_or(t::xray_tun_settings_object())?;
                     (settings, name_key)
                 }
                 Core::Mihomo => unreachable!(),
             };
             if settings.get(&key).is_some_and(|value| !value.is_string()) {
-                return Err(format!("TUN 的 {key} 必须是字符串"));
+                return Err(t::tun_field_string(key));
             }
             let name = random_name();
             settings.insert(key, Value::String(name.clone()));
@@ -98,16 +95,15 @@ pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, Strin
     let temporary = if names.is_empty() {
         None
     } else {
-        let directory = source.parent().ok_or("无法定位核心配置目录")?;
+        let directory = source.parent().ok_or(t::core_config_directory())?;
         let mut file = tempfile::Builder::new()
             .prefix(RUNTIME_PREFIX)
             .suffix(".json")
             .tempfile_in(directory)
-            .map_err(|e| format!("创建 TUN 运行配置失败: {e}"))?;
+            .map_err(t::tun_config_create)?;
         serde_json::to_writer(file.as_file_mut(), &config)
-            .map_err(|_| "写入 TUN 运行配置失败".to_owned())?;
-        file.flush()
-            .map_err(|e| format!("写入 TUN 运行配置失败: {e}"))?;
+            .map_err(|_| t::tun_config_write().to_owned())?;
+        file.flush().map_err(t::tun_config_write_error)?;
         Some(file)
     };
     Ok(PreparedConfig {
@@ -120,19 +116,13 @@ pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, Strin
 fn prepare_mihomo(source: &Path, text: &[u8]) -> Result<PreparedConfig, String> {
     let mut config: serde_yaml_ng::Value = serde_yaml_ng::from_slice(text).map_err(|error| {
         error.location().map_or_else(
-            || "核心配置 YAML 格式无效".into(),
-            |at| {
-                format!(
-                    "核心配置 YAML 格式无效 (第 {} 行, 第 {} 列)",
-                    at.line(),
-                    at.column()
-                )
-            },
+            || t::core_yaml_invalid().into(),
+            |at| t::core_yaml_invalid_at(at.line(), at.column()),
         )
     })?;
     config
         .apply_merge()
-        .map_err(|_| "核心配置 YAML 合并字段无效")?;
+        .map_err(|_| t::core_yaml_merge_invalid())?;
     let mut names = Vec::new();
     if let Some(tun) = config
         .get_mut("tun")
@@ -140,7 +130,7 @@ fn prepare_mihomo(source: &Path, text: &[u8]) -> Result<PreparedConfig, String> 
         && tun.get("enable").and_then(serde_yaml_ng::Value::as_bool) == Some(true)
     {
         if tun.get("device").is_some_and(|value| !value.is_string()) {
-            return Err("TUN 的 device 必须是字符串".into());
+            return Err(t::tun_field_string("device"));
         }
         let name = random_name();
         tun.insert("device".into(), name.clone().into());
@@ -152,12 +142,10 @@ fn prepare_mihomo(source: &Path, text: &[u8]) -> Result<PreparedConfig, String> 
         let mut file = tempfile::Builder::new()
             .prefix(RUNTIME_PREFIX)
             .suffix(".yaml")
-            .tempfile_in(source.parent().ok_or("无法定位核心配置目录")?)
-            .map_err(|error| format!("创建 TUN 运行配置失败: {error}"))?;
-        serde_yaml_ng::to_writer(file.as_file_mut(), &config)
-            .map_err(|_| "写入 TUN 运行配置失败")?;
-        file.flush()
-            .map_err(|error| format!("写入 TUN 运行配置失败: {error}"))?;
+            .tempfile_in(source.parent().ok_or(t::core_config_directory())?)
+            .map_err(t::tun_config_create)?;
+        serde_yaml_ng::to_writer(file.as_file_mut(), &config).map_err(|_| t::tun_config_write())?;
+        file.flush().map_err(t::tun_config_write_error)?;
         Some(file)
     };
     Ok(PreparedConfig {

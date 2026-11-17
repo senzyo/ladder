@@ -1,3 +1,5 @@
+use crate::i18n::updates as t;
+
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -43,11 +45,9 @@ pub(crate) fn set_titlebar_dark(window: &Window, dark: bool) {
 }
 
 pub(crate) fn open_folder(path: &Path) -> Result<(), String> {
-    let metadata = path
-        .metadata()
-        .map_err(|error| format!("无法访问目录: {error}"))?;
+    let metadata = path.metadata().map_err(t::cannot_access_directory)?;
     if !metadata.is_dir() {
-        return Err("所选路径不是目录".into());
+        return Err(t::not_a_directory().into());
     }
     let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     // 路径以 NUL 结尾, 缓冲区在同步调用期间有效。
@@ -64,16 +64,14 @@ pub(crate) fn open_folder(path: &Path) -> Result<(), String> {
     if result > 32 {
         Ok(())
     } else {
-        Err(format!("无法打开目录 (Windows 错误码 {result})"))
+        Err(t::cannot_open_directory(result))
     }
 }
 
 pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
-    let metadata = path
-        .metadata()
-        .map_err(|error| format!("无法访问配置文件: {error}"))?;
+    let metadata = path.metadata().map_err(t::cannot_access_config)?;
     if !metadata.is_file() {
-        return Err("所选路径不是配置文件".into());
+        return Err(t::not_a_config_file().into());
     }
     let extension = path
         .extension()
@@ -82,7 +80,7 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
                 .iter()
                 .any(|kind| extension.eq_ignore_ascii_case(kind))
         })
-        .ok_or_else(|| "只能编辑 JSON 或 YAML 配置文件".to_string())?;
+        .ok_or_else(|| t::unsupported_config_type().to_string())?;
     let wide_extension: Vec<u16> = Some(b'.' as u16)
         .into_iter()
         .chain(extension.encode_wide())
@@ -98,7 +96,7 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
             Ok(()) => return Ok(()),
             Err((SE_ERR_NOASSOC | SE_ERR_ASSOCINCOMPLETE, _)) => {}
             Err((_, error)) => {
-                return Err(format!("无法打开配置编辑器 (Windows 错误码 {error})"));
+                return Err(t::cannot_open_editor(error));
             }
         }
     }
@@ -107,13 +105,10 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
     // 系统只写入给定容量内, 返回的字符数不包含末尾 NUL。
     let length = unsafe { GetSystemDirectoryW(directory.as_mut_ptr(), directory.len() as u32) };
     if length == 0 {
-        return Err(format!(
-            "无法定位系统记事本: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(t::cannot_locate_notepad(std::io::Error::last_os_error()));
     }
     if length as usize >= directory.len() {
-        return Err("无法定位系统记事本: 系统目录路径过长".into());
+        return Err(t::notepad_path_too_long().into());
     }
     let notepad =
         PathBuf::from(OsString::from_wide(&directory[..length as usize])).join("notepad.exe");
@@ -124,7 +119,7 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
         .chain([b'"' as u16, 0])
         .collect();
     launch_editor(w!("open"), &notepad, Some(&quoted_path))
-        .map_err(|(_, error)| format!("无法启动系统记事本 (Windows 错误码 {error})"))
+        .map_err(|(_, error)| t::cannot_start_notepad(error))
 }
 
 fn has_editor_association(extension: &[u16], verb: *const u16) -> bool {

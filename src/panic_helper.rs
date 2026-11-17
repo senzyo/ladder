@@ -1,5 +1,7 @@
 //! panic 路径直接启动恢复助手, 避开 std::process::Command 的全局创建锁。
 
+use crate::i18n::system as t;
+
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -53,7 +55,7 @@ fn append_argument(command: &mut Vec<u16>, argument: &OsStr) -> io::Result<()> {
             0 => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "恢复助手参数包含 NUL",
+                    t::recovery_argument_nul(),
                 ));
             }
             value if value == b'\\' as u16 => slashes += 1,
@@ -87,7 +89,7 @@ impl PanicHelper {
         if command.len() > 32767 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "恢复助手命令行过长",
+                t::recovery_command_too_long(),
             ));
         }
 

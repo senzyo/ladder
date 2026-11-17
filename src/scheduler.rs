@@ -1,5 +1,7 @@
 //! 机器级 DNS 恢复。SYSTEM 只访问 Program Files 下的程序和快照。
 
+use crate::i18n::system as t;
+
 use std::ffi::OsString;
 use std::fs::{self, File, TryLockError};
 use std::io::{self, Write};
@@ -34,7 +36,7 @@ fn system_folder(id: u32) -> Result<PathBuf> {
         )
     };
     if status < 0 {
-        bail!("无法读取 Windows 系统目录 (HRESULT {status:#x})");
+        bail!(t::system_folder_failed(status));
     }
     let length = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
     Ok(OsString::from_wide(&buffer[..length]).into())
@@ -59,18 +61,15 @@ fn check_directory(directory: &Path, script: &str) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .context("无法验证机器级 DNS 恢复目录")?;
+        .context(t::recovery_directory_verify())?;
     let reason = match status.code() {
         Some(0) => return Ok(()),
-        Some(2) => "目录是重解析点",
-        Some(3) => "目录权限不符合 SYSTEM 任务要求",
-        Some(4) => "恢复目录包含非预期文件、子目录或重解析点",
-        Some(5) => "恢复文件权限不符合 SYSTEM 任务要求",
-        Some(_) => bail!(
-            "无法创建或检查 {}, 请检查目录权限和占用情况",
-            directory.display()
-        ),
-        None => bail!("检查 {} 的助手异常结束, 请重试", directory.display()),
+        Some(2) => t::directory_reparse_point(),
+        Some(3) => t::directory_permissions(),
+        Some(4) => t::directory_unexpected_contents(),
+        Some(5) => t::recovery_file_permissions(),
+        Some(_) => bail!(t::recovery_directory_check(directory.display())),
+        None => bail!(t::recovery_check_interrupted(directory.display())),
     };
     bail!("{}: {reason}", directory.display())
 }
@@ -93,13 +92,13 @@ fn lock_desktop_session(session: &File) -> Result<()> {
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(error) => return Err(anyhow::anyhow!("无法取得 DNS 恢复锁: {error}")),
+            Err(error) => return Err(anyhow::anyhow!(t::dns_acquire_lock(error))),
         }
     }
 }
 
 fn portable_dns(directory: &Path) -> Result<DnsLease> {
-    let session = session_file(directory).context("无法打开便携 DNS 恢复锁")?;
+    let session = session_file(directory).context(t::dns_open_portable_lock())?;
     lock_desktop_session(&session)?;
     Ok(DnsLease::new(directory).with_session(session))
 }
@@ -135,9 +134,7 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
     let unavailable = |error: anyhow::Error| {
         logging::warn("dns", format_args!("机器级 DNS 恢复不可用: {error:#}"));
         (
-            DesktopDns::Unavailable(format!(
-                "无法安全访问机器级 DNS 恢复记录。请检查恢复目录, 或等待占用结束后重试: {error:#}"
-            )),
+            DesktopDns::Unavailable(t::dns_machine_unavailable(error)),
             None,
         )
     };
@@ -154,15 +151,13 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
             logging::warn("dns", format_args!("使用便携 DNS 恢复记录: {error:#}"));
             (
                 DesktopDns::Portable(lease),
-                Some(format!(
-                    "本次使用便携 DNS 恢复记录, 只能由 Ladder 恢复。{error:#}"
-                )),
+                Some(t::dns_portable_warning(error)),
             )
         } else {
             unavailable(error)
         };
     }
-    let session = match session_file(&directory).context("无法打开 DNS 恢复锁") {
+    let session = match session_file(&directory).context(t::dns_open_lock()) {
         Ok(file) => file,
         Err(error) => return unavailable(error),
     };
@@ -171,7 +166,7 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
     }
     let warning = ensure_boot_dns_reset_task(&directory)
         .err()
-        .map(|error| format!("更新开机 DNS 恢复任务失败: {error:#}"));
+        .map(t::dns_boot_task_update);
     if let Some(message) = &warning {
         logging::warn("dns", message);
     } else {
@@ -254,10 +249,10 @@ fn install_recovery_helper(directory: &Path) -> Result<PathBuf> {
     {
         let mut dest = File::create(&staged)?;
         dest.write_all(RECOVERY_EXECUTABLE)
-            .context("写入开机 DNS 恢复程序失败")?;
+            .context(t::recovery_helper_write())?;
         dest.sync_all()?;
     }
-    fs::rename(&staged, &helper).context("更新开机 DNS 恢复程序失败")?;
+    fs::rename(&staged, &helper).context(t::recovery_helper_update())?;
     Ok(helper)
 }
 
@@ -282,9 +277,9 @@ fn ensure_boot_dns_reset_task(directory: &Path) -> Result<()> {
         .stderr(Stdio::null())
         .status();
     let _ = fs::remove_file(xml);
-    let status = status.context("无法启动 Windows 任务计划工具")?;
+    let status = status.context(t::task_scheduler_start())?;
     if !status.success() {
-        bail!("无法注册开机 DNS 恢复任务, 请检查管理员权限和 Windows 任务计划程序服务");
+        bail!(t::dns_task_register());
     }
     Ok(())
 }

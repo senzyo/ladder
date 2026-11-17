@@ -1,3 +1,5 @@
+use crate::i18n::updates as t;
+
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -48,9 +50,7 @@ impl Default for AppUpdater {
             })
             .unwrap_or(false)
         {
-            state.status = AppUpdateState::Failed(
-                "上次软件更新未完成, 配置已保留。请重试更新, 或退出后手动替换 ladder.exe。".into(),
-            );
+            state.status = AppUpdateState::Failed(t::previous_update_incomplete().into());
         }
         Self(Arc::new(Mutex::new(state)))
     }
@@ -72,7 +72,7 @@ impl AppUpdater {
         {
             let mut state = self.0.lock().unwrap();
             if state.status.busy() {
-                return Err("正在处理软件更新".into());
+                return Err(t::app_update_busy().into());
             }
             state.status = AppUpdateState::Checking;
             state.release = None;
@@ -94,7 +94,7 @@ impl AppUpdater {
             })
             .map(|_| ())
             .map_err(|error| {
-                let error = format!("无法创建软件更新检查线程: {error}");
+                let error = t::cannot_start_app_check(error);
                 self.fail(error.clone());
                 error
             })
@@ -118,9 +118,9 @@ impl AppUpdater {
         let release = {
             let mut state = self.0.lock().unwrap();
             if state.status.busy() {
-                return Err("正在处理软件更新".into());
+                return Err(t::app_update_busy().into());
             }
-            let release = state.release.clone().ok_or("请先检查软件更新")?;
+            let release = state.release.clone().ok_or(t::check_app_updates_first())?;
             state.status = AppUpdateState::Downloading(UpdateProgress::Checking);
             release
         };
@@ -143,7 +143,7 @@ impl AppUpdater {
             })
             .map(|_| ())
             .map_err(|error| {
-                let error = format!("无法创建软件下载线程: {error}");
+                let error = t::cannot_start_app_download(error);
                 self.fail(error.clone());
                 error
             })
@@ -152,12 +152,9 @@ impl AppUpdater {
     pub(crate) fn take_prepared(&self) -> Result<PreparedAppUpdate, String> {
         let mut state = self.0.lock().unwrap();
         if !matches!(state.status, AppUpdateState::Ready(_)) {
-            return Err("软件更新尚未准备好".into());
+            return Err(t::app_update_not_ready().into());
         }
-        let prepared = state
-            .prepared
-            .take()
-            .ok_or("软件更新文件不可用, 请重新下载")?;
+        let prepared = state.prepared.take().ok_or(t::app_update_unavailable())?;
         state.status = AppUpdateState::Installing;
         Ok(prepared)
     }

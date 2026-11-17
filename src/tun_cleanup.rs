@@ -35,6 +35,7 @@ fn removable_device(name: Option<&str>, protected: &[String], result: u32, statu
 #[cfg(not(test))]
 mod system {
     use super::{removable_device, unprotected_name};
+    use crate::i18n::system as t;
     use crate::logging;
     use std::ffi::OsString;
     use std::io;
@@ -95,7 +96,7 @@ mod system {
             return Err(io::Error::from_raw_os_error(result as i32));
         }
         if table.is_null() {
-            return Err(io::Error::other("系统未返回网络接口表"));
+            return Err(io::Error::other(t::network_interface_table_missing()));
         }
         let rows = unsafe {
             std::slice::from_raw_parts(
@@ -276,15 +277,16 @@ mod system {
                 return if status.success() {
                     Ok(())
                 } else {
-                    Err(io::Error::other(
-                        "无法清理残留 TUN 设备, 请检查管理员权限及设备是否被占用",
-                    ))
+                    Err(io::Error::other(t::tun_cleanup_failed()))
                 };
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "等待 pnputil 超时"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    t::pnputil_timeout(),
+                ));
             }
             std::thread::sleep(Duration::from_millis(50));
         }

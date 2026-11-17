@@ -1,3 +1,5 @@
+use crate::i18n::system as t;
+
 use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -44,11 +46,11 @@ impl CoreOutput {
         let stdout = self
             .stdout
             .join()
-            .unwrap_or(Some("核心输出读取线程异常退出"));
+            .unwrap_or(Some(t::core_output_thread_failed()));
         let stderr = self
             .stderr
             .join()
-            .unwrap_or(Some("核心输出读取线程异常退出"));
+            .unwrap_or(Some(t::core_output_thread_failed()));
         let error = self
             .error
             .lock()
@@ -87,7 +89,7 @@ fn capture_reason(
                     error.raw_os_error()
                 ),
             );
-            Some("读取核心输出失败, 诊断可能不完整")
+            Some(t::core_output_read_failed())
         }
     }
 }

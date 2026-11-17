@@ -1,3 +1,5 @@
+use crate::i18n::updates as t;
+
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::MetadataExt;
@@ -259,17 +261,17 @@ pub(crate) fn sort_versions(versions: &mut [CoreVersion], selected: Option<&str>
 
 fn parse_release(core: Core, data: &[u8]) -> Result<Download, String> {
     let release: Release =
-        serde_json::from_slice(data).map_err(|_| "官方发布信息格式无效, 请稍后重试".to_string())?;
+        serde_json::from_slice(data).map_err(|_| t::invalid_core_release().to_string())?;
     release_download(core, release)
 }
 
 fn release_download(core: Core, release: Release) -> Result<Download, String> {
-    let version = release_version_name(core, &release).ok_or("官方响应不是可安装的版本")?;
+    let version = release_version_name(core, &release).ok_or(t::core_release_not_installable())?;
     let Some((_, prerelease)) = version_parts(&version) else {
-        return Err("官方响应不是可安装的版本".into());
+        return Err(t::core_release_not_installable().into());
     };
     if release.draft {
-        return Err("官方响应不是已发布的可安装版本".into());
+        return Err(t::core_release_not_published().into());
     }
     let name = release
         .assets
@@ -282,16 +284,14 @@ fn release_download(core: Core, release: Release) -> Result<Download, String> {
                 .find(|asset| matching_asset(core, &version, &asset.name))
         })
         .map(|asset| asset.name.clone())
-        .ok_or("官方发布版本缺少当前架构的 Windows 安装包")?;
+        .ok_or(t::missing_core_architecture())?;
     let mut assets = release
         .assets
         .into_iter()
         .filter(|asset| asset.name == name);
-    let asset = assets
-        .next()
-        .ok_or("官方发布版本缺少当前架构的 Windows 安装包")?;
+    let asset = assets.next().ok_or(t::missing_core_architecture())?;
     if assets.next().is_some() {
-        return Err("官方发布信息包含重复的安装包".into());
+        return Err(t::duplicate_core_package().into());
     }
     let expected_url = format!(
         "https://github.com/{}/releases/download/{}/{}",
@@ -300,17 +300,17 @@ fn release_download(core: Core, release: Release) -> Result<Download, String> {
         name
     );
     if asset.url != expected_url {
-        return Err("安装包下载地址不是对应的官方发布地址".into());
+        return Err(t::unofficial_core_package_url().into());
     }
     if asset.size == 0 || asset.size > MAX_ARCHIVE_SIZE {
-        return Err("官方安装包大小无效或超出限制".into());
+        return Err(t::invalid_core_package_size().into());
     }
     let digest = asset
         .digest
         .as_deref()
         .and_then(|value| value.strip_prefix("sha256:"))
         .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or("官方安装包缺少有效的 SHA-256 校验值")?;
+        .ok_or(t::missing_core_digest())?;
     let mut sha256 = [0; 32];
     for (index, value) in sha256.iter_mut().enumerate() {
         *value = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
@@ -332,7 +332,7 @@ fn release_download(core: Core, release: Release) -> Result<Download, String> {
 
 fn parse_releases(core: Core, data: &[u8]) -> Result<ReleasePage, String> {
     let releases: Vec<Release> =
-        serde_json::from_slice(data).map_err(|_| "官方发布列表格式无效, 请稍后重试".to_string())?;
+        serde_json::from_slice(data).map_err(|_| t::invalid_core_release_list().to_string())?;
     let has_more = releases.len() == 30;
     let mut versions = Vec::new();
     for release in releases {
@@ -406,7 +406,7 @@ pub fn fetch_releases(
     cancelled: &AtomicBool,
 ) -> Result<ReleasePage, String> {
     if page == 0 {
-        return Err("版本列表页码无效".into());
+        return Err(t::invalid_versions_page().into());
     }
     let data = release_data(
         core,
@@ -419,7 +419,7 @@ pub fn fetch_releases(
 
 pub fn version_directory(core: Core, root: &Path, version: &str) -> Result<PathBuf, String> {
     if version_parts(version).is_none() {
-        return Err("核心版本号无效".into());
+        return Err(t::invalid_core_version().into());
     }
     let directory = versions_directory(core, root)?.join(version);
     check_directory(&directory)?;
@@ -435,11 +435,11 @@ fn versions_directory(core: Core, root: &Path) -> Result<PathBuf, String> {
 fn check_directory(directory: &Path) -> Result<(), String> {
     match fs::symlink_metadata(directory) {
         Ok(metadata) if !metadata.is_dir() || is_reparse_point(&metadata) => {
-            Err("核心版本路径不是普通目录, 无法执行操作".into())
+            Err(t::invalid_core_directory().into())
         }
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("无法检查核心版本目录: {error}")),
+        Err(error) => Err(t::cannot_check_core_directory(error)),
     }
 }
 
@@ -452,11 +452,11 @@ pub fn installed_versions(core: Core, root: &Path) -> Result<Vec<CoreVersion>, S
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("无法读取本地核心版本: {error}")),
+        Err(error) => return Err(t::cannot_read_local_versions(error)),
     };
     let mut versions = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|error| format!("无法读取本地核心版本: {error}"))?;
+        let entry = entry.map_err(t::cannot_read_local_versions)?;
         let Some(version) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -465,7 +465,7 @@ pub fn installed_versions(core: Core, root: &Path) -> Result<Vec<CoreVersion>, S
         }
         if entry
             .file_type()
-            .map_err(|error| format!("无法检查本地核心版本: {error}"))?
+            .map_err(t::cannot_check_local_versions)?
             .is_file()
         {
             continue;
@@ -474,7 +474,7 @@ pub fn installed_versions(core: Core, root: &Path) -> Result<Vec<CoreVersion>, S
         let record = match fs::read(path.join(".ladder-version.json")) {
             Ok(data) => serde_json::from_slice::<VersionRecord>(&data).ok(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(format!("无法读取核心版本记录: {error}")),
+            Err(error) => return Err(t::cannot_read_version_record(error)),
         };
         let (channel, release_tag) = match record {
             Some(record) => (record.channel, record.release_tag),
@@ -500,30 +500,28 @@ pub fn installed_versions(core: Core, root: &Path) -> Result<Vec<CoreVersion>, S
 
 pub fn delete_version(core: Core, root: &Path, version: &str) -> Result<(), String> {
     let directory = version_directory(core, root, version)?;
-    let parent = fs::canonicalize(directory.parent().unwrap())
-        .map_err(|error| format!("无法定位核心版本目录: {error}"))?;
-    let target =
-        fs::canonicalize(&directory).map_err(|error| format!("无法定位待删除版本: {error}"))?;
+    let parent =
+        fs::canonicalize(directory.parent().unwrap()).map_err(t::cannot_locate_core_directory)?;
+    let target = fs::canonicalize(&directory).map_err(t::cannot_locate_deleted_version)?;
     if target.parent() != Some(parent.as_path()) {
-        return Err("待删除版本不在核心版本目录内".into());
+        return Err(t::delete_outside_core_directory().into());
     }
-    fs::remove_dir_all(&target)
-        .map_err(|error| format!("删除核心 {version} 失败, 请关闭占用该版本的程序后重试: {error}"))
+    fs::remove_dir_all(&target).map_err(|error| t::cannot_delete_core_version(version, error))
 }
 
 fn network_error(error: ureq::Error) -> String {
     match error {
-        ureq::Error::StatusCode(403 | 429) => "GitHub 暂时限制请求, 请稍后重试".into(),
-        ureq::Error::StatusCode(404) => "官方发布文件暂不可用, 请稍后重试".into(),
-        ureq::Error::StatusCode(code) => format!("下载服务返回 HTTP {code}, 请稍后重试"),
-        ureq::Error::Timeout(_) => "连接或下载超时, 请检查网络后重试".into(),
-        _ => "无法连接官方发布服务, 请检查网络、代理和证书后重试".into(),
+        ureq::Error::StatusCode(403 | 429) => t::core_request_limited().into(),
+        ureq::Error::StatusCode(404) => t::core_release_unavailable().into(),
+        ureq::Error::StatusCode(code) => t::download_http_error(code),
+        ureq::Error::Timeout(_) => t::core_download_timeout().into(),
+        _ => t::core_request_failed().into(),
     }
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
     if cancelled.load(Ordering::Acquire) {
-        Err("已取消更新".into())
+        Err(t::update_cancelled().into())
     } else {
         Ok(())
     }
@@ -540,24 +538,24 @@ pub fn prepare_version(
     check_cancelled(cancelled)?;
     let target = version_directory(core, root, &release.version)?;
     if target.exists() {
-        return Err("该版本已存在于本地, 请先删除后再下载".into());
+        return Err(t::core_version_exists().into());
     }
     let tag = release
         .release_tag
         .as_deref()
-        .ok_or("请先刷新官方版本列表")?;
+        .ok_or(t::refresh_versions_first())?;
     if tag.strip_prefix('v').unwrap_or(tag) != release.version
         && !(core == Core::Mihomo
             && tag == "Prerelease-Alpha"
             && release.version.starts_with("alpha-"))
     {
-        return Err("官方版本标签与版本号不符, 请刷新列表".into());
+        return Err(t::core_tag_mismatch().into());
     }
     progress(UpdateProgress::Checking);
     let data = release_data(core, &format!("releases/tags/{tag}"), prefix, cancelled)?;
     let download = parse_release(core, &data)?;
     if download.version != release.version || download.tag != tag {
-        return Err("官方发布响应与所选版本不符, 请刷新列表".into());
+        return Err(t::core_release_mismatch().into());
     }
     let mut prepared = PreparedUpdate::new(core, root, download.version.clone())?;
     prepared.channel = download.channel;
@@ -578,9 +576,9 @@ pub fn prepare_version(
     prepared.extract(core, &archive, cancelled)?;
     let staged_executable = prepared.staged.join(executable_name(core));
     let staged_version = read_version(core, &staged_executable, VERSION_TIMEOUT)
-        .map_err(|message| format!("安装包验证失败: {message}；现有核心未修改"))?;
+        .map_err(t::package_validation_failed)?;
     if staged_version != prepared.version {
-        return Err("安装包中的核心版本与官方发布信息不符, 现有核心未修改".into());
+        return Err(t::core_package_version_mismatch().into());
     }
     check_cancelled(cancelled)?;
     Ok(prepared)
@@ -612,7 +610,7 @@ fn download_archive(
         .call()
         .map_err(network_error)?;
     let mut reader = response.into_body().into_reader();
-    let mut file = File::create(path).map_err(|e| format!("创建下载临时文件失败: {e}"))?;
+    let mut file = File::create(path).map_err(t::cannot_create_download_file)?;
     let mut received = 0;
     let mut buffer = [0; 64 * 1024];
     let mut hasher = Sha256::new();
@@ -620,16 +618,16 @@ fn download_archive(
         check_cancelled(cancelled)?;
         let count = reader
             .read(&mut buffer)
-            .map_err(|_| "下载中断或超时, 请检查网络后重试".to_string())?;
+            .map_err(|_| t::core_download_interrupted().to_string())?;
         if count == 0 {
             break;
         }
         received += count as u64;
         if received > download.size {
-            return Err("下载大小与官方发布信息不符, 请重试".into());
+            return Err(t::core_download_size_mismatch().into());
         }
         file.write_all(&buffer[..count])
-            .map_err(|e| format!("保存下载文件失败: {e}"))?;
+            .map_err(t::cannot_save_download)?;
         hasher.update(&buffer[..count]);
         progress(UpdateProgress::Downloading {
             received,
@@ -638,15 +636,14 @@ fn download_archive(
     }
     check_cancelled(cancelled)?;
     if received != download.size {
-        return Err("安装包下载不完整, 请重试".into());
+        return Err(t::core_download_incomplete().into());
     }
     progress(UpdateProgress::Verifying);
     let digest: [u8; 32] = hasher.finalize().into();
     if digest != download.sha256 {
-        return Err("安装包 SHA-256 校验失败, 现有核心未修改, 请重试".into());
+        return Err(t::core_digest_mismatch().into());
     }
-    file.sync_all()
-        .map_err(|e| format!("保存下载文件失败: {e}"))?;
+    file.sync_all().map_err(t::cannot_save_download)?;
     Ok(())
 }
 
@@ -667,9 +664,9 @@ impl PreparedUpdate {
         let directory = tempfile::Builder::new()
             .prefix(&format!(".ladder-download-{}-", core.label()))
             .tempdir_in(root)
-            .map_err(|e| format!("创建下载暂存目录失败: {e}"))?;
+            .map_err(t::cannot_create_download_stage)?;
         let staged = directory.path().join("new");
-        fs::create_dir(&staged).map_err(|e| format!("创建下载暂存目录失败: {e}"))?;
+        fs::create_dir(&staged).map_err(t::cannot_create_download_stage)?;
         let channel = if version_parts(&version).unwrap().1.is_some() {
             UpdateChannel::Preview
         } else {
@@ -693,13 +690,15 @@ impl PreparedUpdate {
         archive: &Path,
         cancelled: &AtomicBool,
     ) -> Result<(), String> {
-        let file = File::open(archive).map_err(|e| format!("打开安装包失败: {e}"))?;
-        let mut archive = ZipArchive::new(file).map_err(|_| "安装包不是有效的 ZIP 文件")?;
+        let file = File::open(archive).map_err(t::cannot_open_package)?;
+        let mut archive = ZipArchive::new(file).map_err(|_| t::invalid_core_zip())?;
         let mut total = 0u64;
         for index in 0..archive.len() {
             check_cancelled(cancelled)?;
-            let mut entry = archive.by_index(index).map_err(|_| "无法读取安装包条目")?;
-            let name = entry.name().map_err(|_| "安装包包含无效文件名")?;
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|_| t::cannot_read_archive_entry())?;
+            let name = entry.name().map_err(|_| t::invalid_archive_filename())?;
             if entry.enclosed_name().is_none()
                 || Path::new(name.as_ref())
                     .components()
@@ -734,46 +733,42 @@ impl PreparedUpdate {
                 })
                 || entry.is_symlink()
             {
-                return Err("安装包包含不安全路径或符号链接".into());
+                return Err(t::unsafe_archive_path().into());
             }
             let path = self.staged.join(name.as_ref());
             if entry.is_dir() {
-                fs::create_dir_all(&path).map_err(|e| format!("创建暂存目录失败: {e}"))?;
+                fs::create_dir_all(&path).map_err(t::cannot_create_stage_directory)?;
                 continue;
             }
             let size = entry.size();
             total = total
                 .checked_add(size)
                 .filter(|size| *size <= MAX_EXTRACTED_SIZE)
-                .ok_or("安装包解压大小超出限制")?;
-            fs::create_dir_all(path.parent().unwrap())
-                .map_err(|e| format!("创建暂存目录失败: {e}"))?;
-            let mut output =
-                File::create_new(&path).map_err(|e| format!("创建暂存文件失败: {e}"))?;
+                .ok_or(t::archive_extraction_limit())?;
+            fs::create_dir_all(path.parent().unwrap()).map_err(t::cannot_create_stage_directory)?;
+            let mut output = File::create_new(&path).map_err(t::cannot_create_stage_file)?;
             let mut written = 0;
             let mut buffer = [0; 64 * 1024];
             loop {
                 check_cancelled(cancelled)?;
                 let count = entry
                     .read(&mut buffer)
-                    .map_err(|_| "安装包解压失败或内容损坏")?;
+                    .map_err(|_| t::archive_extraction_failed())?;
                 if count == 0 {
                     break;
                 }
                 written += count as u64;
                 if written > size {
-                    return Err("安装包解压大小与条目信息不符".into());
+                    return Err(t::archive_entry_size_mismatch().into());
                 }
                 output
                     .write_all(&buffer[..count])
-                    .map_err(|e| format!("写入暂存文件失败: {e}"))?;
+                    .map_err(t::cannot_write_stage_file)?;
             }
             if written != size {
-                return Err("安装包条目不完整".into());
+                return Err(t::archive_entry_incomplete().into());
             }
-            output
-                .sync_all()
-                .map_err(|e| format!("保存暂存文件失败: {e}"))?;
+            output.sync_all().map_err(t::cannot_save_stage_file)?;
         }
         let executable = executable_name(core);
         if core == Core::Mihomo && !self.staged.join(executable).exists() {
@@ -790,39 +785,38 @@ impl PreparedUpdate {
                 .map(|name| self.staged.join(name))
                 .find(|path| path.is_file())
             {
-                fs::rename(source, self.staged.join(executable))
-                    .map_err(|error| format!("整理 mihomo 程序文件失败: {error}"))?;
+                fs::rename(source, self.staged.join(executable)).map_err(t::cannot_move_mihomo)?;
             }
         }
         if !self.staged.join(executable).is_file() {
             let entries = fs::read_dir(&self.staged)
                 .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
-                .map_err(|e| format!("读取暂存目录失败: {e}"))?;
+                .map_err(t::cannot_read_stage_directory)?;
             if entries.len() == 1 && entries[0].path().is_dir() {
                 self.staged = entries[0].path();
             }
         }
         let path = self.staged.join(executable);
         if !path.is_file() {
-            return Err(format!("安装包缺少 {executable}"));
+            return Err(t::missing_core_executable(executable));
         }
         if fs::metadata(&path)
-            .map_err(|e| format!("读取暂存核心信息失败: {e}"))?
+            .map_err(t::cannot_read_staged_core)?
             .len()
             == 0
         {
-            return Err(format!("安装包中的 {executable} 为空"));
+            return Err(t::empty_core_executable(executable));
         }
         Ok(())
     }
 
     pub fn install(&mut self) -> Result<(), String> {
         if self.installed {
-            return Err("该版本已完成下载".into());
+            return Err(t::core_download_complete().into());
         }
         let target = version_directory(self.core, &self.root, &self.version)?;
         if target.exists() {
-            return Err("该版本已存在于本地, 请先删除后再下载".into());
+            return Err(t::core_version_exists().into());
         }
         let record = VersionRecord {
             channel: self.channel,
@@ -831,21 +825,17 @@ impl PreparedUpdate {
         let mut file =
             File::create_new(self.staged.join(".ladder-version.json")).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    "安装包包含与版本记录冲突的 .ladder-version.json".into()
+                    t::version_record_conflict().into()
                 } else {
-                    format!("创建版本记录失败: {error}")
+                    t::cannot_create_version_record(error)
                 }
             })?;
-        serde_json::to_writer(&mut file, &record)
-            .map_err(|error| format!("保存版本记录失败: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("保存版本记录失败: {error}"))?;
+        serde_json::to_writer(&mut file, &record).map_err(t::cannot_save_version_record)?;
+        file.sync_all().map_err(t::cannot_save_version_record)?;
         drop(file);
-        fs::create_dir_all(target.parent().unwrap())
-            .map_err(|error| format!("创建核心版本目录失败: {error}"))?;
+        fs::create_dir_all(target.parent().unwrap()).map_err(t::cannot_create_core_directory)?;
         version_directory(self.core, &self.root, &self.version)?;
-        fs::rename(&self.staged, &target)
-            .map_err(|error| format!("保存核心版本失败, 现有版本未修改: {error}"))?;
+        fs::rename(&self.staged, &target).map_err(t::cannot_save_core_version)?;
         self.installed = true;
         Ok(())
     }
@@ -894,47 +884,47 @@ pub fn read_version_for(core: Core, executable: &Path) -> Result<String, String>
 fn read_version(core: Core, executable: &Path, timeout: Duration) -> Result<String, String> {
     validate_executable(executable)?;
     // 用临时文件接收输出, 避免异常版本命令填满管道或后代持有管道导致等待不返回。
-    let mut output = tempfile::tempfile().map_err(|e| format!("创建版本检测临时文件失败: {e}"))?;
+    let mut output = tempfile::tempfile().map_err(t::cannot_create_version_tempfile)?;
     let child = JobProcess::spawn_version(core, executable, &output)
-        .map_err(|_| "无法运行核心版本命令, 可重新安装官方核心".to_string())?;
+        .map_err(|_| t::cannot_run_version_command().to_string())?;
     let deadline = Instant::now() + timeout;
     let result = loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => break Ok(()),
-            Ok(Some(_)) => break Err("核心版本命令失败, 可重新安装官方核心".to_string()),
-            Err(_) => break Err("无法读取核心版本命令状态".to_string()),
+            Ok(Some(_)) => break Err(t::version_command_failed().to_string()),
+            Err(_) => break Err(t::cannot_read_version_status().to_string()),
             Ok(None) => {}
         }
         if Instant::now() >= deadline {
-            break Err("读取核心版本超时, 可重新安装官方核心".into());
+            break Err(t::version_command_timeout().into());
         }
         if output
             .metadata()
             .is_ok_and(|metadata| metadata.len() > 16 * 1024)
         {
-            break Err("核心版本命令输出异常, 可重新安装官方核心".into());
+            break Err(t::invalid_version_output().into());
         }
         thread::sleep(Duration::from_millis(10));
     };
     let cleanup = child
         .terminate()
-        .map_err(|_| "版本检测进程尚未完全退出, 请重试".to_string());
+        .map_err(|_| t::version_process_still_running().to_string());
     result?;
     cleanup?;
     drop(child);
     output
         .seek(SeekFrom::Start(0))
-        .map_err(|_| "无法读取核心版本")?;
+        .map_err(|_| t::cannot_read_core_version())?;
     let mut text = String::new();
     output
         .take(16 * 1024)
         .read_to_string(&mut text)
-        .map_err(|_| "无法读取核心版本")?;
-    parse_version(core, &text).ok_or_else(|| "无法识别核心版本, 可重新安装官方核心".into())
+        .map_err(|_| t::cannot_read_core_version())?;
+    parse_version(core, &text).ok_or_else(|| t::unrecognized_core_version().into())
 }
 
 fn validate_executable(executable: &Path) -> Result<(), String> {
-    let invalid = || "核心不是有效的 Windows 程序, 可重新安装官方核心".to_string();
+    let invalid = || t::invalid_core_executable().to_string();
     let mut file = File::open(executable).map_err(|_| invalid())?;
     let length = file.metadata().map_err(|_| invalid())?.len();
     let mut dos = [0; 64];

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::Core;
 use crate::core_output::CoreDiagnostics;
 use crate::dns::DnsLease;
+use crate::i18n::{Language, runtime as t};
 use crate::logging;
 use crate::managed_child::{JobProcess, ManagedChild};
 use crate::scheduler::{DesktopDns, desktop_dns};
@@ -31,6 +32,8 @@ pub enum ThemePreference {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Settings {
     pub theme: ThemePreference,
+    #[serde(default)]
+    pub language: Option<Language>,
     #[serde(default)]
     pub startup_core: Core,
     pub minimize_to_tray: bool,
@@ -52,6 +55,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemePreference::default(),
+            language: None,
             startup_core: Core::default(),
             minimize_to_tray: false,
             auto_sing_box: false,
@@ -65,6 +69,10 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn effective_language(&self) -> Language {
+        Language::resolve(self.language)
+    }
+
     pub fn github_request_prefix(&self) -> &str {
         if self.github_proxy_enabled {
             &self.github_proxy
@@ -203,6 +211,7 @@ pub enum Action {
 enum Request {
     Action(Action),
     SetTheme(ThemePreference, async_channel::Sender<()>),
+    SetLanguage(Language, async_channel::Sender<()>),
     SetStartupCore(Core, async_channel::Sender<()>),
     SetGithubProxy(String, async_channel::Sender<()>),
     Shutdown(mpsc::Sender<Result<Option<String>, String>>),
@@ -228,15 +237,9 @@ impl Saved {
         let data = match fs::read(root.join("ladder-state.json")) {
             Ok(data) => data,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(format!("读取 ladder-state.json 失败: {e}")),
+            Err(e) => return Err(t::read_state(e)),
         };
-        serde_json::from_slice(&data).map_err(|e| {
-            format!(
-                "ladder-state.json 格式无效 (第 {} 行, 第 {} 列) ",
-                e.line(),
-                e.column()
-            )
-        })
+        serde_json::from_slice(&data).map_err(|e| t::invalid_state(e.line(), e.column()))
     }
 
     fn store(&self, root: &Path) -> io::Result<()> {
@@ -277,9 +280,15 @@ impl Saved {
         let version = self
             .selected_version(core)
             .as_deref()
-            .ok_or("未找到核心程序, 请先下载并选择核心版本")?;
+            .ok_or(t::missing_core())?;
         Ok(update::version_directory(core, root, version)?.join(format!("{}.exe", core.label())))
     }
+}
+
+pub(crate) fn saved_language(root: &Path) -> Language {
+    Saved::load(root)
+        .map(|saved| saved.settings.effective_language())
+        .unwrap_or_else(|_| Language::system())
 }
 
 #[derive(Clone)]
@@ -315,7 +324,7 @@ impl Runtime {
         Self::start_worker(root, dns, recovery_error.clone(), task_warning.clone()).map_err(
             |mut error| {
                 if let Some(message) = recovery_error {
-                    error.push_str(&format!("\nDNS 尚未恢复: {message}"));
+                    error.push_str(&t::pending_dns(message));
                 }
                 if let Some(message) = task_warning {
                     error.push('\n');
@@ -332,7 +341,7 @@ impl Runtime {
         dns_recovery_error: Option<String>,
         dns_task_warning: Option<String>,
     ) -> Result<Self, String> {
-        let root = std::path::absolute(root).map_err(|e| format!("读取软件目录失败: {e}"))?;
+        let root = std::path::absolute(root).map_err(t::read_root)?;
         let saved = Saved::load(&root)?;
         let mut snapshot = Snapshot {
             settings: saved.settings.clone(),
@@ -342,10 +351,9 @@ impl Runtime {
         };
         for core in Core::ALL {
             let dir = core.config_dir(&root);
-            fs::create_dir_all(&dir)
-                .map_err(|e| format!("创建 {} 配置目录失败: {e}", core.label()))?;
+            fs::create_dir_all(&dir).map_err(|e| t::create_config_dir(core.label(), e))?;
             fs::create_dir_all(core.core_dir(&root))
-                .map_err(|e| format!("创建 {} 核心目录失败: {e}", core.label()))?;
+                .map_err(|e| t::create_core_dir(core.label(), e))?;
             cleanup_runtime_configs(&dir);
             let state = snapshot.core_mut(core);
             state.configs = list_configs(core, &dir)?;
@@ -381,7 +389,7 @@ impl Runtime {
         thread::Builder::new()
             .name("ladder-cores".into())
             .spawn(move || worker.run(rx))
-            .map_err(|e| format!("创建核心管理线程失败: {e}"))?;
+            .map_err(t::create_manager)?;
         logging::info("runtime", "核心管理线程已启动");
         Ok(Self {
             root,
@@ -405,7 +413,7 @@ impl Runtime {
 
     pub fn send(&self, action: Action) -> Result<(), String> {
         if self.quitting.load(Ordering::Acquire) {
-            return Err("正在退出或准备更新, 请稍候".into());
+            return Err(t::quitting().into());
         }
         match action {
             Action::ValidateConfig(core, ref name) => {
@@ -429,14 +437,14 @@ impl Runtime {
             }
             Action::SwitchVersion(core, _) | Action::DeleteVersion(core, _) => {
                 if snapshot.core(*core).update.is_some() {
-                    return Err("正在下载核心, 完成后可切换或删除版本".into());
+                    return Err(t::download_busy().into());
                 }
                 Some((*core, CoreOperation::Updating))
             }
             Action::Set(_, _) => None,
             Action::RetryDns => {
                 if snapshot.dns_recovery_error.is_none() || snapshot.dns_recovery_busy {
-                    return Err("当前没有可重试的 DNS 恢复操作".into());
+                    return Err(t::no_dns_retry().into());
                 }
                 snapshot.dns_recovery_busy = true;
                 None
@@ -450,7 +458,7 @@ impl Runtime {
         if let Some((core, operation)) = target {
             let active = snapshot.core_mut(core);
             if active.operation.is_some() {
-                return Err(format!("{} 正在处理上一项操作", core.label()));
+                return Err(t::core_busy(core.label()));
             }
             active.operation = Some(operation);
             if operation == CoreOperation::Updating {
@@ -466,7 +474,7 @@ impl Runtime {
             if retry_dns {
                 snapshot.dns_recovery_busy = false;
             }
-            "核心管理线程已关闭".to_string()
+            t::manager_closed().to_string()
         })
     }
 
@@ -474,7 +482,15 @@ impl Runtime {
         let (tx, rx) = async_channel::bounded(1);
         self.tx
             .send(Request::SetTheme(theme, tx))
-            .map_err(|_| "核心管理线程已关闭".to_string())?;
+            .map_err(|_| t::manager_closed().to_string())?;
+        Ok(rx)
+    }
+
+    pub fn set_language(&self, language: Language) -> Result<async_channel::Receiver<()>, String> {
+        let (tx, rx) = async_channel::bounded(1);
+        self.tx
+            .send(Request::SetLanguage(language, tx))
+            .map_err(|_| t::manager_closed().to_string())?;
         Ok(rx)
     }
 
@@ -482,38 +498,35 @@ impl Runtime {
         let (tx, rx) = async_channel::bounded(1);
         self.tx
             .send(Request::SetStartupCore(core, tx))
-            .map_err(|_| "核心管理线程已关闭".to_string())?;
+            .map_err(|_| t::manager_closed().to_string())?;
         Ok(rx)
     }
 
     pub fn set_github_proxy(&self, prefix: String) -> Result<async_channel::Receiver<()>, String> {
         let prefix = crate::github::normalized_prefix(&prefix)?;
         if prefix.is_empty() {
-            return Err("GitHub 加速链接前缀不能为空".into());
+            return Err(t::empty_proxy().into());
         }
         let (tx, rx) = async_channel::bounded(1);
         self.tx
             .send(Request::SetGithubProxy(prefix, tx))
-            .map_err(|_| "核心管理线程已关闭".to_string())?;
+            .map_err(|_| t::manager_closed().to_string())?;
         Ok(rx)
     }
 
     fn validate_configs(&self, core: Core, name: Option<&str>) -> Result<(), String> {
         if self.quitting.load(Ordering::Acquire) {
-            return Err("正在退出, 无法验证配置".into());
+            return Err(t::quitting_validation().into());
         }
         let mut snapshot = self.state.lock().unwrap();
         let state = snapshot.core_mut(core);
         if state.validation_busy {
-            return Err("正在验证配置, 请稍候".into());
+            return Err(t::validation_busy().into());
         }
-        let version = state
-            .selected_version
-            .clone()
-            .ok_or("请先下载并选择核心版本")?;
+        let version = state.selected_version.clone().ok_or(t::select_core())?;
         let exe = update::version_directory(core, &self.root, &version)?
             .join(format!("{}.exe", core.label()));
-        let exe_stamp = executable_stamp(&exe).ok_or("请先下载并选择核心版本")?;
+        let exe_stamp = executable_stamp(&exe).ok_or(t::select_core())?;
         let names = match name {
             Some(name) => {
                 config_path(core, &self.root, name)?;
@@ -588,7 +601,7 @@ impl Runtime {
                     state.validation.remove(&name);
                 }
                 state.validation_busy = false;
-                format!("创建配置验证线程失败: {error}")
+                t::validation_thread(error)
             })?;
         Ok(())
     }
@@ -600,10 +613,8 @@ impl Runtime {
         let (tx, rx) = mpsc::channel();
         self.tx
             .send(Request::Shutdown(tx))
-            .map_err(|_| "核心管理线程已关闭".to_string())?;
-        let result = rx
-            .recv()
-            .map_err(|_| "核心管理线程未返回退出结果".to_string())?;
+            .map_err(|_| t::manager_closed().to_string())?;
+        let result = rx.recv().map_err(|_| t::no_shutdown_reply().to_string())?;
         if result.is_err() {
             self.cancel_app_update();
         }
@@ -616,11 +627,8 @@ impl Runtime {
         let result = self
             .tx
             .send(Request::PrepareAppUpdate(tx))
-            .map_err(|_| "核心管理线程已关闭".to_string())
-            .and_then(|()| {
-                rx.recv()
-                    .map_err(|_| "核心管理线程未返回更新准备结果".to_string())
-            })
+            .map_err(|_| t::manager_closed().to_string())
+            .and_then(|()| rx.recv().map_err(|_| t::no_update_reply().to_string()))
             .and_then(|result| result);
         if result.is_err() {
             self.cancel_app_update();
@@ -634,16 +642,16 @@ impl Runtime {
 
     fn load_versions(&self, core: Core, more: bool) -> Result<(), String> {
         if self.quitting.load(Ordering::Acquire) {
-            return Err("正在退出, 无法获取版本列表".into());
+            return Err(t::quitting_versions().into());
         }
         let mut snapshot = self.state.lock().unwrap();
         let prefix = snapshot.settings.github_request_prefix().to_owned();
         let state = snapshot.core_mut(core);
         if state.versions_loading {
-            return Err("正在获取版本列表".into());
+            return Err(t::versions_busy().into());
         }
         if more && (!state.versions_loaded || !state.versions_has_more) {
-            return Err("没有更多版本".into());
+            return Err(t::no_more_versions().into());
         }
         let page = if more { state.versions_page + 1 } else { 1 };
         state.versions_loading = true;
@@ -686,14 +694,13 @@ impl Runtime {
                             "update",
                             format_args!("{} 获取版本列表失败: {error}", core.label()),
                         );
-                        state.versions_error =
-                            Some(format!("{} 版本列表加载失败: {error}", core.label()));
+                        state.versions_error = Some(t::versions_failed(core.label(), error));
                     }
                 }
             })
             .map_err(|error| {
                 state.versions_loading = false;
-                format!("创建版本列表线程失败: {error}")
+                t::versions_thread(error)
             })?;
         Ok(())
     }
@@ -701,11 +708,11 @@ impl Runtime {
     fn begin_download(&self, core: Core, version: &str) -> Result<(), String> {
         let mut snapshot = self.state.lock().unwrap();
         if self.quitting.load(Ordering::Acquire) {
-            return Err("正在退出, 无法开始下载".into());
+            return Err(t::quitting_download().into());
         }
         let state = snapshot.core_mut(core);
         if state.update.is_some() || state.operation.is_some() {
-            return Err(format!("{} 正在处理上一项操作", core.label()));
+            return Err(t::core_busy(core.label()));
         }
         let release = state
             .versions
@@ -714,7 +721,7 @@ impl Runtime {
                 release.version == version && !release.installed && release.release_tag.is_some()
             })
             .cloned()
-            .ok_or("请先获取版本列表并选择尚未下载的版本")?;
+            .ok_or(t::select_download())?;
         state.update = Some(UpdateProgress::Checking);
         state.downloading_version = Some(version.into());
         state.update_error = None;
@@ -733,10 +740,10 @@ impl Runtime {
                     let state = snapshot.core_mut(core);
                     state.update = None;
                     state.downloading_version = None;
-                    state.update_error = Some(format!(
-                        "{} v{} 下载失败: {error}",
+                    state.update_error = Some(t::version_download_failed(
                         core.label(),
-                        release.version
+                        release.version,
+                        error,
                     ));
                     if state.operation == Some(CoreOperation::Updating) {
                         state.operation = None;
@@ -746,7 +753,7 @@ impl Runtime {
             .map_err(|error| {
                 state.update = None;
                 state.downloading_version = None;
-                format!("创建下载线程失败: {error}")
+                t::download_thread(error)
             })?;
         Ok(())
     }
@@ -769,7 +776,7 @@ impl Runtime {
     fn queue_prepared(&self, core: Core, prepared: PreparedUpdate) -> Result<(), String> {
         loop {
             if self.quitting.load(Ordering::Acquire) {
-                return Err("更新已取消, 现有核心文件保持不变".into());
+                return Err(t::update_cancelled().into());
             }
             let mut snapshot = self.state.lock().unwrap();
             let state = snapshot.core_mut(core);
@@ -783,7 +790,7 @@ impl Runtime {
                 return self
                     .tx
                     .send(Request::Prepared(core, prepared))
-                    .map_err(|_| "核心管理线程已关闭, 更新未应用".into());
+                    .map_err(|_| t::update_manager_closed().into());
             }
             drop(snapshot);
             thread::sleep(Duration::from_millis(30));
@@ -816,8 +823,8 @@ fn merge_versions(
 
 fn list_configs(core: Core, dir: &Path) -> Result<Vec<String>, String> {
     let mut items = Vec::new();
-    for entry in fs::read_dir(dir).map_err(|e| format!("读取配置目录失败: {e}"))? {
-        let entry = entry.map_err(|e| format!("读取配置文件信息失败: {e}"))?;
+    for entry in fs::read_dir(dir).map_err(t::read_config_dir)? {
+        let entry = entry.map_err(t::read_config_info)?;
         let path = entry.path();
         if is_config(core, &path)
             && !is_runtime_config(&path)
@@ -881,9 +888,9 @@ fn readable_config(core: Core, root: &Path, name: &str) -> Result<PathBuf, Strin
     let config = config_path(core, root, name)?;
     let metadata = fs::File::open(&config)
         .and_then(|file| file.metadata())
-        .map_err(|error| format!("无法读取配置文件, 请检查文件是否存在及访问权限: {error}"))?;
+        .map_err(t::read_config)?;
     if !metadata.is_file() {
-        return Err("所选路径不是配置文件".into());
+        return Err(t::not_config_file().into());
     }
     Ok(config)
 }
@@ -896,7 +903,7 @@ fn config_path(core: Core, root: &Path, name: &str) -> Result<PathBuf, String> {
         || !is_config(core, name_path)
         || is_runtime_config(name_path)
     {
-        return Err("配置文件名无效".into());
+        return Err(t::invalid_config_name().into());
     }
     Ok(core.config_dir(root).join(name))
 }
@@ -910,49 +917,46 @@ fn validate_config(
 ) -> Result<(), String> {
     const OUTPUT_LIMIT: u64 = 64 * 1024;
     if cancelled.load(Ordering::Acquire) {
-        return Err("配置验证已取消".into());
+        return Err(t::validation_cancelled().into());
     }
-    let mut output =
-        tempfile::tempfile().map_err(|error| format!("创建验证输出文件失败: {error}"))?;
+    let mut output = tempfile::tempfile().map_err(t::create_validation_output)?;
     let child = JobProcess::spawn_validation(core, exe, root, config, &output)
-        .map_err(|error| format!("无法运行核心验证命令: {error}"))?;
+        .map_err(t::run_validation)?;
     let deadline = Instant::now() + Duration::from_secs(30);
     let result = loop {
         if cancelled.load(Ordering::Acquire) {
-            break Err("配置验证已取消".to_string());
+            break Err(t::validation_cancelled().to_string());
         }
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status.success()),
-            Err(_) => break Err("无法读取核心验证状态".into()),
+            Err(_) => break Err(t::validation_status_failed().into()),
             Ok(None) => {}
         }
         if Instant::now() >= deadline {
-            break Err("配置验证超时, 请检查配置引用的资源是否可用".into());
+            break Err(t::validation_timeout().into());
         }
         if output
             .metadata()
             .is_ok_and(|metadata| metadata.len() > OUTPUT_LIMIT)
         {
-            break Err("核心验证输出过多, 已停止验证".into());
+            break Err(t::validation_output_limit().into());
         }
         thread::sleep(Duration::from_millis(20));
     };
-    child
-        .terminate()
-        .map_err(|_| "验证进程尚未完全退出, 请重试")?;
+    child.terminate().map_err(|_| t::validation_not_exited())?;
     drop(child);
     output
         .seek(SeekFrom::Start(0))
-        .map_err(|_| "无法读取验证输出")?;
+        .map_err(|_| t::validation_output_failed())?;
     let mut bytes = Vec::new();
     output
         .take(OUTPUT_LIMIT)
         .read_to_end(&mut bytes)
-        .map_err(|_| "无法读取验证输出")?;
+        .map_err(|_| t::validation_output_failed())?;
     let message = crate::core_output::sanitized_output(&bytes);
     match result {
         Ok(true) => Ok(()),
-        Ok(false) if message.trim().is_empty() => Err("配置验证失败, 核心未提供错误详情".into()),
+        Ok(false) if message.trim().is_empty() => Err(t::validation_failed().into()),
         Ok(false) => Err(message),
         Err(error) if message.trim().is_empty() => Err(error),
         Err(error) => Err(format!("{error}\n{message}")),
@@ -972,7 +976,7 @@ struct Worker {
 impl Worker {
     fn apply_update(&mut self, core: Core, mut prepared: PreparedUpdate) {
         let result = if self.quitting.load(Ordering::Acquire) {
-            Err("下载已取消, 现有核心文件保持不变".into())
+            Err(t::download_cancelled().into())
         } else {
             prepared.install()
         };
@@ -1026,6 +1030,11 @@ impl Worker {
                 Ok(Request::SetTheme(theme, reply)) => {
                     logging::info("settings", format_args!("更改主题: {theme:?}"));
                     self.update_settings(|settings| settings.theme = theme);
+                    let _ = reply.try_send(());
+                }
+                Ok(Request::SetLanguage(language, reply)) => {
+                    logging::info("settings", format_args!("更改语言: {}", language.tag()));
+                    self.update_settings(|settings| settings.language = Some(language));
                     let _ = reply.try_send(());
                 }
                 Ok(Request::SetStartupCore(core, reply)) => {
@@ -1106,7 +1115,7 @@ impl Worker {
             Action::Start(core) => {
                 let current = self.saved.current(core).clone();
                 let result = match current {
-                    None => Err("尚未选择配置, 请在配置列表中点击“切换”".into()),
+                    None => Err(t::select_config().into()),
                     Some(name) if self.children[core as usize].is_none() => self
                         .readable_config(core, &name)
                         .and_then(|config| self.start(core, &config)),
@@ -1159,7 +1168,7 @@ impl Worker {
             }
             Err(e) => {
                 logging::error("settings", format_args!("保存软件设置失败: {e}"));
-                snapshot.settings_error = Some(format!("保存软件设置失败: {e}"));
+                snapshot.settings_error = Some(t::save_settings(e));
             }
         }
     }
@@ -1167,19 +1176,18 @@ impl Worker {
     fn switch_version(&mut self, core: Core, version: &str) -> Result<(), String> {
         let path = update::version_directory(core, &self.root, version)?;
         if !path.join(format!("{}.exe", core.label())).is_file() {
-            return Err("所选版本尚未下载或核心文件已丢失".into());
+            return Err(t::version_missing().into());
         }
         if self.saved.selected_version(core).as_deref() == Some(version) {
             return Ok(());
         }
         let mut next = self.saved.clone();
         next.select_version(core, version.into());
-        next.store(&self.root)
-            .map_err(|error| format!("保存核心版本失败: {error}"))?;
+        next.store(&self.root).map_err(t::save_version)?;
         // 保存失败不能中断当前进程；停止失败时仍保留其运行版本, 禁止误删。
         if let Err(error) = self.stop(core) {
             if let Err(save_error) = self.saved.store(&self.root) {
-                return Err(format!("{error}；恢复版本选择失败: {save_error}"));
+                return Err(t::restore_version(error, save_error));
             }
             return Err(error);
         }
@@ -1190,7 +1198,7 @@ impl Worker {
 
     fn delete_version(&mut self, core: Core, version: &str) -> Result<(), String> {
         if self.saved.selected_version(core).as_deref() == Some(version) {
-            return Err("当前使用的版本无法删除, 请先切换到其他版本".into());
+            return Err(t::cannot_delete_current_version().into());
         }
         update::delete_version(core, &self.root, version)?;
         Ok(())
@@ -1204,11 +1212,10 @@ impl Worker {
             Core::Xray => next.xray = Some(name.into()),
             Core::Mihomo => next.mihomo = Some(name.into()),
         }
-        next.store(&self.root)
-            .map_err(|e| format!("保存当前配置失败: {e}"))?;
+        next.store(&self.root).map_err(t::save_config)?;
         if let Err(error) = self.stop(core) {
             if let Err(save_error) = self.saved.store(&self.root) {
-                return Err(format!("{error}；恢复配置选择失败: {save_error}"));
+                return Err(t::restore_config(error, save_error));
             }
             return Err(error);
         }
@@ -1224,9 +1231,9 @@ impl Worker {
                 || same_file::is_same_file(&config, core.config_dir(&self.root).join(current))
                     .unwrap_or(false)
         }) {
-            return Err("当前使用的配置无法删除, 请先切换到其他配置".into());
+            return Err(t::cannot_delete_current_config().into());
         }
-        fs::remove_file(config).map_err(|error| format!("删除配置文件失败: {error}"))
+        fs::remove_file(config).map_err(t::delete_config)
     }
 
     fn refresh(&mut self) {
@@ -1325,7 +1332,7 @@ impl Worker {
                             "core",
                             format_args!("{} 创建版本检测线程失败: {error}", core.label()),
                         );
-                        state.version_error = Some(format!("创建版本检测线程失败: {error}"));
+                        state.version_error = Some(t::version_thread(error));
                     }
                 }
             }
@@ -1341,12 +1348,11 @@ impl Worker {
         let exe = self.saved.executable(core, &self.root)?;
         let assets = exe.parent().expect("version executable has a parent");
         if !exe.is_file() {
-            return Err(format!("未找到核心程序: {}", exe.display()));
+            return Err(t::core_file_missing(exe.display()));
         }
         let hijack = self.saved.settings.hijack_dns;
         if hijack && self.state.lock().unwrap().dns_recovery_error.is_some() {
-            self.restore_dns()
-                .map_err(|_| "DNS 尚未恢复, 无法开始新的 DNS 劫持")?;
+            self.restore_dns().map_err(|_| t::dns_not_restored())?;
         }
         let config = tun_config::prepare(core, config)?;
         if !config.names().is_empty() {
@@ -1361,7 +1367,7 @@ impl Worker {
             self.cleanup_tun();
         }
         let child = ManagedChild::spawn(core, &self.root, &exe, assets, config)
-            .map_err(|e| format!("启动 {} 失败: {e}", core.label()))?;
+            .map_err(|e| t::start_core(core.label(), e))?;
         self.children[core as usize] = Some(child);
         logging::info("core", format_args!("{} 托管进程已创建", core.label()));
         if hijack {
@@ -1428,7 +1434,7 @@ impl Worker {
         if let Some(child) = owned {
             child
                 .terminate()
-                .map_err(|e| format!("停止 {} 失败: {e}", core.label()))?;
+                .map_err(|e| t::stop_core(core.label(), e))?;
         }
         let diagnostics = owned
             .take()
@@ -1505,7 +1511,7 @@ impl Worker {
                 return;
             }
             Err(e) => {
-                let message = format!("检查核心状态失败: {e}");
+                let message = t::core_status(e);
                 let mut snapshot = self.state.lock().unwrap();
                 let state = snapshot.core_mut(core);
                 if state.run_error.as_deref() != Some(message.as_str()) {
@@ -1524,12 +1530,12 @@ impl Worker {
         let (message, output_error) = match result {
             Ok(diagnostics) => (
                 match diagnostics.reason {
-                    Some(reason) => format!("核心已退出。{reason}"),
-                    None => "核心已退出".into(),
+                    Some(reason) => t::core_exited_reason(reason),
+                    None => t::core_exited().into(),
                 },
                 diagnostics.error,
             ),
-            Err(e) => (format!("核心已退出。{e}"), None),
+            Err(e) => (t::core_exited_reason(e), None),
         };
         let mut snapshot = self.state.lock().unwrap();
         let state = snapshot.core_mut(core);
@@ -3422,6 +3428,140 @@ mod tests {
         );
         assert_eq!(fs::read(path).unwrap(), previous);
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn language_defaults_and_legacy_settings_follow_system_without_rewriting() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let defaults = Saved::load(root).unwrap().settings;
+        assert_eq!(defaults.language, None);
+        assert_eq!(defaults.effective_language(), Language::system());
+
+        let mut legacy = serde_json::to_value(Saved::default()).unwrap();
+        legacy["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("language");
+        let data = serde_json::to_vec(&legacy).unwrap();
+        let path = root.join("ladder-state.json");
+        fs::write(&path, &data).unwrap();
+
+        let loaded = Saved::load(root).unwrap().settings;
+        assert_eq!(loaded.language, None);
+        assert_eq!(loaded.effective_language(), Language::system());
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        assert_eq!(runtime.snapshot().settings, loaded);
+        runtime.shutdown().unwrap();
+        assert_eq!(fs::read(path).unwrap(), data);
+    }
+
+    #[test]
+    fn language_choices_persist_and_reopen_with_other_settings_preserved() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let path = root.join("ladder-state.json");
+        let saved = Saved {
+            settings: Settings {
+                theme: ThemePreference::Light,
+                startup_core: Core::Mihomo,
+                minimize_to_tray: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        saved.store(root).unwrap();
+        let mut expected = saved.settings;
+        let mut runtime = Runtime::open(root.to_owned()).unwrap();
+        for language in Language::ALL {
+            runtime
+                .set_language(language)
+                .unwrap()
+                .recv_blocking()
+                .unwrap();
+            expected.language = Some(language);
+            assert_eq!(runtime.snapshot().settings, expected);
+            let stored: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(stored["settings"]["language"], language.tag());
+            assert_eq!(saved_language(root), language);
+
+            runtime.shutdown().unwrap();
+            runtime = Runtime::open(root.to_owned()).unwrap();
+            assert_eq!(runtime.snapshot().settings, expected);
+            assert_eq!(runtime.snapshot().settings.effective_language(), language);
+        }
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn language_failed_save_preserves_previous_choice_and_disk_state() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let path = root.join("ladder-state.json");
+        let saved = Saved {
+            settings: Settings {
+                language: Some(Language::RuRu),
+                theme: ThemePreference::Dark,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        saved.store(root).unwrap();
+        let previous = fs::read(&path).unwrap();
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        fs::create_dir(root.join("ladder-state.json.tmp")).unwrap();
+
+        runtime
+            .set_language(Language::EnUs)
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.settings, saved.settings);
+        assert!(
+            snapshot
+                .settings_error
+                .unwrap()
+                .contains("保存软件设置失败")
+        );
+        assert_eq!(fs::read(&path).unwrap(), previous);
+        assert_eq!(Saved::load(root).unwrap().settings, saved.settings);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn language_unknown_saved_tag_uses_english_and_preserves_other_settings() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let expected = Settings {
+            language: Some(Language::EnUs),
+            theme: ThemePreference::Dark,
+            startup_core: Core::SingBox,
+            minimize_to_tray: true,
+            github_proxy: "https://example.invalid/proxy/".into(),
+            ..Default::default()
+        };
+        let mut saved = serde_json::to_value(Saved {
+            settings: expected.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        saved["settings"]["language"] = "de-DE".into();
+        let data = serde_json::to_vec(&saved).unwrap();
+        let path = root.join("ladder-state.json");
+        fs::write(&path, &data).unwrap();
+
+        assert_eq!(Saved::load(root).unwrap().settings, expected);
+        assert_eq!(saved_language(root), Language::EnUs);
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        assert_eq!(runtime.snapshot().settings, expected);
+        assert_eq!(
+            runtime.snapshot().settings.effective_language(),
+            Language::EnUs
+        );
+        runtime.shutdown().unwrap();
+        assert_eq!(fs::read(path).unwrap(), data);
     }
 
     #[test]

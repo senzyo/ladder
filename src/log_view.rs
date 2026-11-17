@@ -1,6 +1,8 @@
 use super::{Colors, FeedbackScope, MainWindow, TEXT_PRIMARY, control, panel, scroll_area};
 use crate::{
-    desktop, logging,
+    desktop,
+    i18n::ui as t,
+    logging,
     logging::{LogLevel, LogSource, log_level},
 };
 use gpui::{
@@ -176,6 +178,7 @@ impl MainWindow {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .flex_shrink_0()
                     .items_center()
                     .gap(px(8.))
@@ -194,7 +197,7 @@ impl MainWindow {
                             })),
                     )
                     .child(
-                        button("复制日志", "copy-logs", 11, colors).on_click(cx.listener(
+                        button(t::copy_logs(), "copy-logs", 11, colors).on_click(cx.listener(
                             |view, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(
                                     view.logs.lines[view.logs.source.index()].join("\n"),
@@ -204,7 +207,7 @@ impl MainWindow {
                     )
                     .child(div().flex_1())
                     .child(
-                        button("打开日志目录", "open-log-folder", 12, colors).on_click(
+                        button(t::open_log_folder(), "open-log-folder", 12, colors).on_click(
                             cx.listener(|view, _, _, cx| {
                                 if let Some(path) = logging::path()
                                     .and_then(|path| path.parent().map(std::path::Path::to_owned))
@@ -216,7 +219,7 @@ impl MainWindow {
                                         cx,
                                     );
                                 } else {
-                                    logging::warn("desktop", "应用日志目录尚未初始化");
+                                    logging::warn("desktop", t::log_folder_unavailable());
                                     view.logs.refresh();
                                     cx.notify();
                                 }

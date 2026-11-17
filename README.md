@@ -22,6 +22,8 @@
 
 首次运行会在 `ladder.exe` 所在目录创建 `mihomo_config/`、`sing-box_config/` 和 `xray_config/` 三个配置目录。
 
+设置中可横向切换简体中文、English 和 Русский（`zh-Hans`、`en-US`、`ru-RU`）。默认匹配系统显示语言, 不支持的语言使用英语；手动选择后立即更新界面和托盘, 并在重启后保留。
+
 如果提示缺少 `VCRUNTIME140.dll`, 安装与程序架构对应的 [Microsoft Visual C++ v14 Redistributable](https://learn.microsoft.com/zh-cn/cpp/windows/latest-supported-vc-redist)。amd64 选择 x64, arm64 选择 ARM64；虚拟机和沙盒需在其内部安装。
 
 ## 开发

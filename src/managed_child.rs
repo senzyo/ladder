@@ -1,3 +1,5 @@
+use crate::i18n::system as t;
+
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -193,9 +195,9 @@ impl ManagedChild {
 
 impl JobProcess {
     pub(crate) fn spawn_version(core: Core, exe: &Path, stdout: &File) -> io::Result<Self> {
-        let root = exe
-            .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "无法定位核心目录"))?;
+        let root = exe.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, t::core_directory_missing())
+        })?;
         let stdin = File::open("NUL")?;
         let stdout = stdout.try_clone()?;
         let stderr = File::options().write(true).open("NUL")?;
@@ -221,9 +223,9 @@ impl JobProcess {
         config: &Path,
         output: &File,
     ) -> io::Result<Self> {
-        let assets = exe
-            .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "无法定位核心目录"))?;
+        let assets = exe.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, t::core_directory_missing())
+        })?;
         let stdin = File::open("NUL")?;
         let output = output.try_clone()?;
         let stderr = output.try_clone()?;
@@ -364,7 +366,7 @@ impl JobProcess {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "等待托管进程退出超时, 请重试停止",
+                    t::managed_process_stop_timeout(),
                 ));
             }
             std::thread::sleep(Duration::from_millis(10));

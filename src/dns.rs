@@ -1,5 +1,7 @@
 //! 按物理网卡和地址族保存静态/自动 DNS, 再接管到本地回环。
 
+use crate::i18n::system as t;
+
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -77,7 +79,7 @@ impl Journal {
         let data = match fs::read(path) {
             Ok(data) => data,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("无法读取 DNS 恢复记录 {}: {e}", path.display())),
+            Err(e) => return Err(t::dns_read_record(path.display(), e)),
         };
         // 直接按具体类型反序列化, 保留旧数组中完整的 128 位网卡 GUID。
         let result = if data.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'[') {
@@ -88,10 +90,9 @@ impl Journal {
         } else {
             serde_json::from_slice(&data)
         };
-        result.map(Some).map_err(|e| format!(
-            "{} 格式无效 (第 {} 行, 第 {} 列) 。请用备份修复记录, 或在手动恢复网卡 DNS 后移走此文件。",
-            path.display(), e.line(), e.column()
-        ))
+        result
+            .map(Some)
+            .map_err(|e| t::dns_invalid_record(path.display(), e.line(), e.column()))
     }
 
     fn save(&self, path: &Path) -> Result<(), String> {
@@ -109,7 +110,7 @@ impl Journal {
             drop(file);
             fs::rename(&staged, path)
         };
-        save().map_err(|e| format!("无法保存 DNS 恢复记录 {}: {e}", path.display()))
+        save().map_err(|e| t::dns_save_record(path.display(), e))
     }
 
     fn import_legacy(
@@ -152,7 +153,8 @@ impl Journal {
                         state: ImportState::Superseded(targets),
                     });
                     // 即便本次所有网卡都写失败, 下一次开机也能保留机器记录的优先级。
-                    self.save(machine).map_err(|e| format!("{error}；{e}"))?;
+                    self.save(machine)
+                        .map_err(|e| t::combined_errors(&error, e))?;
                 }
                 return Err(error);
             }
@@ -180,8 +182,7 @@ impl Journal {
             // 即使复制成功后立即断电, 开机助手也知道哪些网卡仍需恢复。
             self.save(machine)?;
         }
-        fs::remove_file(source)
-            .map_err(|e| format!("无法清除旧 DNS 恢复记录 {}: {e}", source.display()))?;
+        fs::remove_file(source).map_err(|e| t::dns_remove_old_record(source.display(), e))?;
         self.imports.retain(|entry| entry.source != source);
         Ok(true)
     }
@@ -212,7 +213,7 @@ impl Journal {
         }
         if !errors.is_empty() {
             errors.extend(checkpoint_error);
-            return Err(format!("恢复 DNS 失败: {}", errors.join("；")));
+            return Err(t::dns_restore_failed(errors.join(t::error_separator())));
         }
         if !self.imports.is_empty() {
             return self.save(path);
@@ -220,7 +221,7 @@ impl Journal {
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("无法清除 DNS 恢复记录 {}: {e}", path.display())),
+            Err(e) => Err(t::dns_remove_record(path.display(), e)),
         }
     }
 }
@@ -343,10 +344,10 @@ impl DnsLease {
         if unsafe { DnsFlushResolverCache() } != 0 {
             result.map(|_| ())
         } else {
-            let message = "刷新 DNS 客户端缓存失败";
+            let message = t::dns_flush_failed();
             Err(match result {
                 Ok(_) => message.into(),
-                Err(error) => format!("{error}；{message}"),
+                Err(error) => t::combined_errors(error, message),
             })
         }
     }
@@ -384,7 +385,7 @@ impl DnsLease {
             }
             Ok(Some(fs::canonicalize(portable)?.join("dns-recovery.json")))
         };
-        resolve().map_err(|e| format!("无法核对 DNS 恢复记录 {} 的目录: {e}", path.display()))
+        resolve().map_err(|e| t::dns_check_record_directory(path.display(), e))
     }
 
     fn restore_with(
@@ -450,7 +451,7 @@ impl DnsLease {
         if errors.is_empty() {
             Ok(pending)
         } else {
-            Err(errors.join("；"))
+            Err(errors.join(t::error_separator()))
         }
     }
 }
@@ -459,10 +460,7 @@ fn lock_legacy_journal(source: &Path) -> Result<Option<File>, String> {
     match fs::symlink_metadata(source) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(format!(
-                "无法检查旧 DNS 恢复记录 {}: {error}",
-                source.display()
-            ));
+            return Err(t::dns_check_old_record(source.display(), error));
         }
         Ok(_) => {}
     }
@@ -472,10 +470,10 @@ fn lock_legacy_journal(source: &Path) -> Result<Option<File>, String> {
         .read(true)
         .write(true)
         .open(source.with_file_name("dns-session.lock"))
-        .map_err(|error| format!("无法打开旧 DNS 恢复锁 {}: {error}", source.display()))?;
+        .map_err(|error| t::dns_open_old_lock(source.display(), error))?;
     session
         .try_lock()
-        .map_err(|error| format!("无法取得旧 DNS 恢复锁 {}: {error}", source.display()))?;
+        .map_err(|error| t::dns_acquire_old_lock(source.display(), error))?;
     Ok(Some(session))
 }
 
@@ -484,7 +482,7 @@ fn physical_targets() -> Result<Vec<Target>, String> {
     // SAFETY: 系统填写输出指针, 复制所需行数据后释放整张表。
     let status = unsafe { GetIfTable2(&mut table) };
     if status != NO_ERROR {
-        return Err(format!("无法枚举物理网卡: {}", os_error(status)));
+        return Err(t::dns_enumerate_adapters(os_error(status)));
     }
     // SAFETY: 成功返回的表包含 NumEntries 个实际分配的行, Table 是柔性数组的占位字段。
     let rows = unsafe {
@@ -522,7 +520,7 @@ fn physical_targets() -> Result<Vec<Target>, String> {
             match status {
                 NO_ERROR => targets.push(Target { guid, ipv6 }),
                 ERROR_NOT_FOUND | ERROR_FILE_NOT_FOUND | ERROR_NOT_SUPPORTED => {}
-                _ => return Err(format!("无法查询网卡协议: {}", os_error(status))),
+                _ => return Err(t::dns_query_protocol(os_error(status))),
             }
         }
     }
@@ -534,12 +532,12 @@ fn read_static(target: Target) -> Result<String, String> {
         .options()
         .read()
         .open(target.registry_path())
-        .map_err(|e| format!("无法读取网卡, 请检查网卡是否可用: {e}"))?;
+        .map_err(t::dns_read_adapter)?;
     match key.get_string("NameServer") {
         Ok(value) => Ok(value),
         // 未配置静态 DNS 的接口可能没有 NameServer 值。
         Err(e) if e.code().0 as u32 == (0x8007_0000 | ERROR_FILE_NOT_FOUND) => Ok(String::new()),
-        Err(e) => Err(format!("无法读取网卡 DNS 设置: {e}")),
+        Err(e) => Err(t::dns_read_settings(e)),
     }
 }
 
@@ -563,8 +561,8 @@ fn set_static(target: Target, servers: &str) -> Result<(), u32> {
 
 fn write_error(status: u32) -> String {
     match status {
-        ERROR_ACCESS_DENIED => "Windows 拒绝设置网卡 DNS, 请检查网卡权限或组织策略".into(),
-        _ => format!("设置网卡 DNS 失败: {}", os_error(status)),
+        ERROR_ACCESS_DENIED => t::dns_access_denied().into(),
+        _ => t::dns_write_settings(os_error(status)),
     }
 }
 
@@ -593,7 +591,7 @@ fn restore_existing(
         {
             return Ok(());
         }
-        Err(e) => return Err(format!("无法打开待恢复的网卡 DNS 设置: {e}")),
+        Err(e) => return Err(t::dns_open_restore_settings(e)),
     };
     match set() {
         Ok(()) => Ok(()),
@@ -601,7 +599,7 @@ fn restore_existing(
             ERROR_NOT_FOUND | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_NOT_SUPPORTED,
         ) => key
             .set_string("NameServer", previous)
-            .map_err(|e| format!("无法恢复离线网卡 DNS: {e}")),
+            .map_err(t::dns_restore_offline),
         Err(status) => Err(write_error(status)),
     }
 }

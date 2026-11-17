@@ -8,6 +8,9 @@ mod core;
 #[path = "../../src/dns.rs"]
 mod dns;
 #[allow(dead_code)]
+#[path = "../../src/i18n.rs"]
+mod i18n;
+#[allow(dead_code)]
 #[path = "../../src/logging.rs"]
 mod logging;
 
@@ -73,6 +76,7 @@ fn accepts_arguments(arguments: &[OsString]) -> bool {
 }
 
 fn main() -> ExitCode {
+    i18n::set_current(i18n::Language::system());
     logging::install_panic_hook();
     if !accepts_arguments(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
         return ExitCode::FAILURE;

@@ -28,6 +28,8 @@ fn build_dns_recovery() {
         "src/dns.rs",
         "src/logging.rs",
         "src/core.rs",
+        "src/i18n.rs",
+        "src/i18n",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
