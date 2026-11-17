@@ -26,7 +26,7 @@ use gpui::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tray_icon::{
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{Menu, MenuEvent, MenuItem},
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND},
@@ -54,7 +54,6 @@ enum TrayAction {
 fn tray_menu() -> Result<Menu> {
     let menu = Menu::new();
     menu.append(&MenuItem::with_id("open", "打开 Ladder", true, None))?;
-    menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&MenuItem::with_id("directory", "打开程序目录", true, None))?;
     menu.append(&MenuItem::with_id("exit", "退出并终止", true, None))?;
     Ok(menu)
