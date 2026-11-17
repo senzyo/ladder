@@ -160,7 +160,6 @@ pub enum Setting {
 pub enum Action {
     Start(Core),
     Stop(Core),
-    Restart(Core),
     ValidateConfig(Core, String),
     ValidateAllConfigs(Core),
     SwitchConfig(Core, String),
@@ -393,7 +392,7 @@ impl Runtime {
         let mut snapshot = self.state.lock().unwrap();
         let retry_dns = matches!(action, Action::RetryDns);
         let target = match &action {
-            Action::Start(core) | Action::Restart(core) => Some((*core, CoreOperation::Starting)),
+            Action::Start(core) => Some((*core, CoreOperation::Starting)),
             Action::Stop(core) => Some((*core, CoreOperation::Stopping)),
             Action::SwitchConfig(core, _) | Action::DeleteConfig(core, _) => {
                 Some((*core, CoreOperation::Switching))
@@ -1030,7 +1029,6 @@ impl Worker {
         );
         let operation = match &action {
             Action::Start(core) => Some((*core, "启动")),
-            Action::Restart(core) => Some((*core, "重启")),
             Action::Stop(core) => Some((*core, "停止")),
             Action::SwitchConfig(core, _) => Some((*core, "切换配置")),
             Action::DeleteConfig(core, _) => Some((*core, "删除配置")),
@@ -1057,19 +1055,6 @@ impl Worker {
                 });
             }
             Action::Stop(core) => (core, self.stop(core)),
-            Action::Restart(core) => {
-                let result = self
-                    .saved
-                    .current(core)
-                    .clone()
-                    .ok_or_else(|| "尚未选择配置，请在配置列表中点击“切换”".into())
-                    .and_then(|name| self.readable_config(core, &name))
-                    .and_then(|config| {
-                        self.stop(core)?;
-                        self.start(core, &config)
-                    });
-                (core, result)
-            }
             Action::Start(core) => {
                 let current = self.saved.current(core).clone();
                 let result = match current {
@@ -1836,7 +1821,7 @@ mod tests {
             assert!(runtime.snapshot().core(core).run_error.is_some());
 
             fs::write(core.config_dir(root).join("live-error.json"), "{}").unwrap();
-            runtime.send(Action::Restart(core)).unwrap();
+            stop_and_start(&runtime, core);
             let state = idle(&runtime, core);
             assert!(state.running && state.run_error.is_none() && state.output_error.is_none());
             fs::write(
@@ -1918,11 +1903,11 @@ mod tests {
             runtime.send(Action::Start(core)).unwrap();
             assert!(failed(&runtime, core).output_error.is_some());
             fs::write(core.config_dir(root).join("native-exit.json"), "{}").unwrap();
-            runtime.send(Action::Restart(core)).unwrap();
+            runtime.send(Action::Start(core)).unwrap();
             let state = idle(&runtime, core);
             assert!(state.running && state.output_error.is_none() && state.run_error.is_none());
             fs::write(core.config_dir(root).join("native-exit.json"), config).unwrap();
-            runtime.send(Action::Restart(core)).unwrap();
+            stop_and_start(&runtime, core);
             assert!(failed(&runtime, core).output_error.is_some());
             runtime
                 .send(Action::SwitchConfig(core, "日常.JSON".into()))
@@ -2390,7 +2375,7 @@ mod tests {
             ready(&runtime, *core, *port);
         }
         for (core, version, port, alternate, files) in &fixtures {
-            runtime.send(Action::Restart(*core)).unwrap();
+            stop_and_start(&runtime, *core);
             assert!(idle(&runtime, *core).running);
             ready(&runtime, *core, *port);
             runtime
@@ -2425,7 +2410,7 @@ mod tests {
             };
             runtime.send(Action::Set(auto, true)).unwrap();
             eprintln!(
-                "{} {channel:?} {version} {}: start/restart/config-switch/stop passed; {} peer listeners checked; DNS/TUN disabled",
+                "{} {channel:?} {version} {}: start/stop-start/config-switch/stop passed; {} peer listeners checked; DNS/TUN disabled",
                 core.label(),
                 std::env::consts::ARCH,
                 fixtures.len() - 1

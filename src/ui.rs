@@ -210,7 +210,6 @@ impl MainWindow {
             UiAction::Run(
                 Action::Start(core)
                 | Action::Stop(core)
-                | Action::Restart(core)
                 | Action::SwitchConfig(core, _)
                 | Action::ValidateConfig(core, _)
                 | Action::ValidateAllConfigs(core)
