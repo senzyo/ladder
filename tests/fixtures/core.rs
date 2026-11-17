@@ -7,10 +7,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn main() {
-    if env::args_os().nth(1).as_deref() == Some(OsStr::new("version")) {
+    if matches!(
+        env::args_os().nth(1).as_deref(),
+        Some(arg) if arg == OsStr::new("version") || arg == OsStr::new("-v")
+    ) {
         let exe = env::current_exe().unwrap();
         if exe.file_stem().unwrap() == "xray" {
             println!("Xray 1.0.0 (Xray, Penetrates Everything.) fixture");
+        } else if exe.file_stem().unwrap() == "mihomo" {
+            println!("Mihomo Meta v1.0.0 windows fixture");
         } else {
             println!("sing-box version 1.0.0");
         }
@@ -44,13 +49,27 @@ fn main() {
             env::current_dir().unwrap().canonicalize().unwrap(),
             file.ancestors().nth(3).unwrap().canonicalize().unwrap()
         );
-        let resource_path = if exe.file_stem().unwrap() == "xray" {
-            env::var_os("XRAY_LOCATION_ASSET").unwrap()
-        } else {
-            assert_eq!(env::args_os().nth(2).unwrap(), "-D");
-            env::args_os().nth(3).unwrap()
+        let (resource_path, expected) = match exe.file_stem().unwrap().to_str().unwrap() {
+            "xray" => (env::var_os("XRAY_LOCATION_ASSET").unwrap(), assets),
+            "mihomo" => {
+                assert_eq!(env::args_os().nth(1).unwrap(), "-d");
+                assert_eq!(env::args_os().nth(3).unwrap(), "-f");
+                let config_dir = file.parent().unwrap().canonicalize().unwrap();
+                assert_eq!(
+                    fs::read(config_dir.join("rules/relative.yaml")).unwrap(),
+                    b"fixture rule"
+                );
+                (env::args_os().nth(2).unwrap(), config_dir)
+            }
+            _ => {
+                assert_eq!(env::args_os().nth(2).unwrap(), "-D");
+                (env::args_os().nth(3).unwrap(), assets)
+            }
         };
-        assert_eq!(PathBuf::from(resource_path).canonicalize().unwrap(), assets);
+        assert_eq!(
+            PathBuf::from(resource_path).canonicalize().unwrap(),
+            expected
+        );
         // 刻意留下持有输出管道的后代，测试其随核心或宿主强制退出。
         process::Command::new(exe)
             .arg("--child")

@@ -960,6 +960,51 @@ fn validate_executable(executable: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
+pub(crate) fn official_test_options() -> (Vec<Core>, String) {
+    let cores = match std::env::var("LADDER_TEST_CORE") {
+        Ok(name) => vec![
+            Core::ALL
+                .into_iter()
+                .find(|core| core.label() == name)
+                .expect("LADDER_TEST_CORE must be mihomo, sing-box, or xray"),
+        ],
+        Err(std::env::VarError::NotPresent) => Core::ALL.to_vec(),
+        Err(_) => panic!("LADDER_TEST_CORE must contain valid Unicode"),
+    };
+    let prefix = match std::env::var("LADDER_TEST_GITHUB_PREFIX") {
+        Ok(prefix) => prefix,
+        Err(std::env::VarError::NotPresent) => String::new(),
+        Err(_) => panic!("LADDER_TEST_GITHUB_PREFIX must contain valid Unicode"),
+    };
+    let prefix = crate::github::normalized_prefix(&prefix).expect("invalid test GitHub prefix");
+    (cores, prefix)
+}
+
+#[cfg(test)]
+pub(crate) fn official_test_release(
+    core: Core,
+    channel: UpdateChannel,
+    prefix: &str,
+) -> CoreVersion {
+    eprintln!(
+        "{} {channel:?} {}: fetching release list ({})",
+        core.label(),
+        std::env::consts::ARCH,
+        if prefix.is_empty() {
+            "direct"
+        } else {
+            "prefix"
+        }
+    );
+    fetch_releases(core, 1, prefix, &AtomicBool::new(false))
+        .unwrap_or_else(|error| panic!("{} release list: {error}", core.label()))
+        .versions
+        .into_iter()
+        .find(|item| item.channel == channel)
+        .expect("official first page must contain requested release channel")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io;
@@ -1948,16 +1993,24 @@ fn main() {
 
     fn official_install(channel: UpdateChannel) {
         let root = tempfile::tempdir().unwrap();
-        for core in Core::ALL {
+        let (cores, prefix) = official_test_options();
+        for core in cores {
             let cancelled = AtomicBool::new(false);
-            let release = fetch_releases(core, 1, "", &cancelled)
-                .unwrap()
-                .versions
-                .into_iter()
-                .find(|item| item.channel == channel)
-                .expect("official first page must contain requested release channel");
-            let mut prepared = prepare_version(core, root.path(), &release, "", &cancelled, |_| {})
-                .unwrap_or_else(|error| panic!("{}: {error}", core.label()));
+            let release = official_test_release(core, channel, &prefix);
+            eprintln!(
+                "{} {channel:?} {} {}: downloading ({})",
+                core.label(),
+                release.version,
+                std::env::consts::ARCH,
+                if prefix.is_empty() {
+                    "direct"
+                } else {
+                    "prefix"
+                }
+            );
+            let mut prepared =
+                prepare_version(core, root.path(), &release, &prefix, &cancelled, |_| {})
+                    .unwrap_or_else(|error| panic!("{}: {error}", core.label()));
             let target = version_directory(core, root.path(), &release.version).unwrap();
             assert!(!target.exists());
             prepared.install().unwrap();
@@ -1965,14 +2018,17 @@ fn main() {
                 read_version_for(core, &target.join(executable_name(core))).unwrap(),
                 release.version
             );
-            assert!(prepare_version(core, root.path(), &release, "", &cancelled, |_| {}).is_err());
+            assert!(
+                prepare_version(core, root.path(), &release, &prefix, &cancelled, |_| {}).is_err()
+            );
             let local = installed_versions(core, root.path()).unwrap();
             assert_eq!(local.len(), 1);
             assert_eq!(local[0].channel, channel);
             eprintln!(
-                "{} {channel:?} {}: isolated installation and version probe passed",
+                "{} {channel:?} {} {}: isolated installation and version probe passed",
                 core.label(),
-                release.version
+                release.version,
+                std::env::consts::ARCH
             );
         }
     }

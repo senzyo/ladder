@@ -1741,7 +1741,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&build.stderr)
         );
-        for core in [Core::SingBox, Core::Xray] {
+        for core in Core::ALL {
             let dir = core.executable(root).parent().unwrap().to_owned();
             fs::create_dir_all(&dir).unwrap();
             fs::copy(&exe, dir.join(format!("{}.exe", core.label()))).unwrap();
@@ -1749,7 +1749,7 @@ mod tests {
             let config = match core {
                 Core::SingBox => "{ /* comment */ \"log\": {}, }",
                 Core::Xray => "# comment\n{ \"log\": {} }",
-                Core::Mihomo => "{}",
+                Core::Mihomo => "{\"mode\":\"direct\"}",
             };
             fs::write(core.config_dir(root).join("日常.JSON"), config).unwrap();
             fs::write(
@@ -1758,8 +1758,11 @@ mod tests {
             )
             .unwrap();
         }
+        let rules = Core::Mihomo.config_dir(root).join("rules");
+        fs::create_dir(&rules).unwrap();
+        fs::write(rules.join("relative.yaml"), "fixture rule").unwrap();
         let mut saved = Saved::load(root).unwrap();
-        for core in [Core::SingBox, Core::Xray] {
+        for core in Core::ALL {
             saved.select_version(core, "1.0.0".into());
         }
         saved.store(root).unwrap();
@@ -1786,8 +1789,8 @@ mod tests {
             external.0.id()
         );
         let runtime = Runtime::open(root.to_owned()).unwrap();
-        let mut pids = [external.0.id(), 0];
-        for core in [Core::SingBox, Core::Xray] {
+        let mut pids = [external.0.id(), 0, 0];
+        for core in Core::ALL {
             assert_eq!(runtime.snapshot().core(core).configs.len(), 2);
             assert!(runtime.snapshot().core(core).installed);
             runtime
@@ -1802,7 +1805,7 @@ mod tests {
         let blocked_save = root.join("ladder-state.json.tmp");
         fs::create_dir(&blocked_save).unwrap();
         let saved_before_restart = fs::read(root.join("ladder-state.json")).unwrap();
-        for core in [Core::SingBox, Core::Xray] {
+        for core in Core::ALL {
             stop_and_start(&runtime, core);
             let restarted = idle(&runtime, core);
             assert!(restarted.running, "{restarted:?}");
@@ -1810,15 +1813,13 @@ mod tests {
             assert_eq!(restarted.current.as_deref(), Some("日常.JSON"));
             pids[core as usize] =
                 next_pid(&core.config_dir(root).join("日常.pid"), pids[core as usize]);
-            let other = match core {
-                Core::SingBox => Core::Xray,
-                Core::Xray | Core::Mihomo => Core::SingBox,
-            };
-            assert!(runtime.snapshot().core(other).running);
-            assert_eq!(
-                fs::read_to_string(other.config_dir(root).join("日常.pid")).unwrap(),
-                pids[other as usize].to_string()
-            );
+            for other in Core::ALL.into_iter().filter(|other| *other != core) {
+                assert!(runtime.snapshot().core(other).running);
+                assert_eq!(
+                    fs::read_to_string(other.config_dir(root).join("日常.pid")).unwrap(),
+                    pids[other as usize].to_string()
+                );
+            }
             assert!(external.0.try_wait().unwrap().is_none());
         }
         assert_eq!(
@@ -1933,6 +1934,341 @@ mod tests {
     }
 
     #[test]
+    fn mihomo_yaml_selection_autostart_and_failure_retry_preserve_relative_resources() {
+        let folder = tempfile::Builder::new()
+            .prefix("mihomo YAML ")
+            .tempdir()
+            .unwrap();
+        let root = folder.path();
+        let _process_test = lock_and_install_fixture_cores(root);
+        let core = Core::Mihomo;
+        let config_dir = core.config_dir(root);
+        let yaml = "fixture_tree: true\nrule-providers:\n  local:\n    type: file\n    path: rules/relative.yaml\n";
+        fs::write(config_dir.join("本地.yaml"), yaml).unwrap();
+        fs::write(config_dir.join("失败.yml"), "fixture_failure: true\n").unwrap();
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        runtime
+            .send(Action::SwitchConfig(core, "日常.JSON".into()))
+            .unwrap();
+        assert!(idle(&runtime, core).running);
+        let json_pid = next_pid(&config_dir.join("日常.pid"), 0);
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, json_pid) };
+        assert!(!raw.is_null());
+        let json_process = unsafe { OwnedHandle::from_raw_handle(raw) };
+        runtime
+            .send(Action::SwitchConfig(core, "本地.yaml".into()))
+            .unwrap();
+        let selected = idle(&runtime, core);
+        assert!(selected.running, "{selected:?}");
+        assert_eq!(selected.current.as_deref(), Some("本地.yaml"));
+        let yaml_pid = next_pid(&config_dir.join("本地.pid"), 0);
+        assert_eq!(
+            unsafe { WaitForSingleObject(json_process.as_raw_handle(), 5000) },
+            WAIT_OBJECT_0
+        );
+        runtime
+            .send(Action::Set(Setting::AutoMihomo, true))
+            .unwrap();
+        runtime.shutdown().unwrap();
+
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        let started = idle(&runtime, core);
+        assert!(started.running, "{started:?}");
+        assert_eq!(started.current.as_deref(), Some("本地.yaml"));
+        let autostart_pid = next_pid(&config_dir.join("本地.pid"), yaml_pid);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while runtime.snapshot().core(core).version.as_deref() != Some("1.0.0") {
+            assert!(Instant::now() < deadline, "等待 mihomo -v 版本识别超时");
+            thread::sleep(Duration::from_millis(30));
+        }
+        runtime
+            .send(Action::SwitchConfig(core, "失败.yml".into()))
+            .unwrap();
+        for retry in [false, true] {
+            if retry {
+                runtime.send(Action::Start(core)).unwrap();
+            }
+            let state = failed(&runtime, core);
+            assert_eq!(state.current.as_deref(), Some("失败.yml"));
+            let error = state.run_error.unwrap();
+            assert!(error.contains("核心没有访问所需资源的权限"));
+            assert!(!error.contains("PRIVATE_FIXTURE_VALUE"));
+            assert_eq!(
+                Saved::load(root).unwrap().current(core).as_deref(),
+                Some("失败.yml")
+            );
+        }
+        runtime
+            .send(Action::SwitchConfig(core, "本地.yaml".into()))
+            .unwrap();
+        assert!(idle(&runtime, core).running);
+        next_pid(&config_dir.join("本地.pid"), autostart_pid);
+        runtime.shutdown().unwrap();
+        assert_eq!(
+            fs::read_to_string(config_dir.join("本地.yaml")).unwrap(),
+            yaml
+        );
+        assert_eq!(
+            fs::read(config_dir.join("rules/relative.yaml")).unwrap(),
+            b"fixture rule"
+        );
+    }
+
+    #[test]
+    #[ignore = "downloads and runs real cores; run only in Windows Sandbox or a VM"]
+    fn official_stable_runtime_and_validation() {
+        official_runtime_and_validation(update::UpdateChannel::Stable);
+    }
+
+    #[test]
+    #[ignore = "downloads and runs real cores; run only in Windows Sandbox or a VM"]
+    fn official_preview_runtime_and_validation() {
+        official_runtime_and_validation(update::UpdateChannel::Preview);
+    }
+
+    fn official_runtime_and_validation(channel: update::UpdateChannel) {
+        use serde_json::json;
+        use std::net::{TcpListener, TcpStream};
+
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let (cores, prefix) = update::official_test_options();
+        let cancelled = AtomicBool::new(false);
+        let mut saved = Saved::default();
+        let mut fixtures = Vec::new();
+        let mut validation_failures = Vec::new();
+        for core in cores {
+            let release = update::official_test_release(core, channel, &prefix);
+            eprintln!(
+                "{} {channel:?} {} {}: runtime download ({})",
+                core.label(),
+                release.version,
+                std::env::consts::ARCH,
+                if prefix.is_empty() {
+                    "direct"
+                } else {
+                    "prefix"
+                }
+            );
+            let mut prepared =
+                update::prepare_version(core, root, &release, &prefix, &cancelled, |_| {})
+                    .unwrap_or_else(|error| panic!("{}: {error}", core.label()));
+            prepared.install().unwrap();
+            saved.select_version(core, release.version.clone());
+            let config_dir = core.config_dir(root);
+            fs::create_dir_all(&config_dir).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let valid = match core {
+                Core::SingBox => json!({
+                    "log": {"level": "info"},
+                    "inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": port}],
+                    "outbounds": [{"type": "direct", "tag": "direct"}]
+                }),
+                Core::Xray => json!({
+                    "log": {"loglevel": "info"},
+                    "inbounds": [{"protocol": "socks", "listen": "127.0.0.1", "port": port,
+                        "settings": {"auth": "noauth", "udp": false}}],
+                    "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+                }),
+                Core::Mihomo => {
+                    fs::create_dir(config_dir.join("rules")).unwrap();
+                    fs::write(
+                        config_dir.join("rules/local.yaml"),
+                        "payload:\n  - '+.example.invalid'\n",
+                    )
+                    .unwrap();
+                    json!({
+                        "mode": "rule", "log-level": "info", "mixed-port": port,
+                        "allow-lan": false, "bind-address": "127.0.0.1",
+                        "dns": {"enable": false}, "tun": {"enable": false},
+                        "rule-providers": {"local": {"type": "file", "behavior": "domain",
+                            "format": "yaml", "path": "rules/local.yaml"}},
+                        "rules": ["RULE-SET,local,DIRECT", "MATCH,DIRECT"]
+                    })
+                }
+            };
+            let mut missing = valid.clone();
+            match core {
+                Core::SingBox => {
+                    missing["route"] = json!({
+                        "rule_set": [{"type": "local", "tag": "missing", "format": "source", "path": "ladder-missing.json"}],
+                        "rules": [{"rule_set": ["missing"], "outbound": "direct"}]
+                    })
+                }
+                Core::Xray => {
+                    missing["routing"] = json!({
+                        "rules": [{"type": "field", "domain": ["ext:ladder-missing.dat:test"], "outboundTag": "direct"}]
+                    })
+                }
+                Core::Mihomo => {
+                    missing["rule-providers"]["local"]["path"] = "rules/ladder-missing.yaml".into()
+                }
+            }
+            let valid_text = serde_json::to_string(&valid).unwrap();
+            let alternate = if core == Core::Mihomo {
+                "alternate.yaml"
+            } else {
+                "alternate.json"
+            };
+            let alternate_text = if core == Core::Mihomo {
+                serde_yaml_ng::to_string(&valid).unwrap()
+            } else {
+                serde_json::to_string_pretty(&valid).unwrap()
+            };
+            let files = [
+                ("valid.json", valid_text),
+                (alternate, alternate_text),
+                ("syntax-error.json", "{".into()),
+                (
+                    "missing-resource.json",
+                    serde_json::to_string(&missing).unwrap(),
+                ),
+            ];
+            let exe = update::version_directory(core, root, &release.version)
+                .unwrap()
+                .join(format!("{}.exe", core.label()));
+            let mut valid_configs = true;
+            for (name, text) in &files {
+                fs::write(config_dir.join(name), text).unwrap();
+                let result = validate_config(core, &exe, root, &config_dir.join(name), &cancelled);
+                eprintln!(
+                    "{} {channel:?} {} {}: {name}: {result:?}",
+                    core.label(),
+                    release.version,
+                    std::env::consts::ARCH
+                );
+                let expected_valid = *name == "valid.json" || *name == alternate;
+                let matches_expectation = if expected_valid {
+                    result.is_ok()
+                } else {
+                    result.as_ref().err().is_some_and(|error| {
+                        let infrastructure_failure = [
+                            "配置验证已取消",
+                            "创建验证输出文件失败",
+                            "无法运行核心验证命令",
+                            "无法读取核心验证状态",
+                            "配置验证超时",
+                            "核心验证输出过多",
+                            "验证进程尚未完全退出",
+                            "无法读取验证输出",
+                        ]
+                        .iter()
+                        .any(|prefix| error.starts_with(prefix));
+                        let missing_file = match core {
+                            Core::SingBox => "ladder-missing.json",
+                            Core::Xray => "ladder-missing.dat",
+                            Core::Mihomo => "ladder-missing.yaml",
+                        };
+                        !infrastructure_failure
+                            && (*name != "missing-resource.json" || error.contains(missing_file))
+                    })
+                };
+                if !matches_expectation {
+                    validation_failures.push(format!("{} {name}: {result:?}", core.label()));
+                    if expected_valid {
+                        valid_configs = false;
+                        break;
+                    }
+                }
+            }
+            if valid_configs {
+                fixtures.push((core, release.version, port, alternate, files));
+            }
+        }
+        saved.store(root).unwrap();
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        let ready = |runtime: &Runtime, core: Core, port: u16| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let address = ([127, 0, 0, 1], port).into();
+            loop {
+                let state = runtime.snapshot().core(core).clone();
+                assert!(
+                    state.running && state.run_error.is_none(),
+                    "{}: {state:?}",
+                    core.label()
+                );
+                if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{} listener did not start",
+                    core.label()
+                );
+                thread::sleep(Duration::from_millis(30));
+            }
+        };
+        for (core, _, port, _, _) in &fixtures {
+            runtime
+                .send(Action::SwitchConfig(*core, "valid.json".into()))
+                .unwrap();
+            assert!(idle(&runtime, *core).running);
+            ready(&runtime, *core, *port);
+        }
+        for (core, version, port, alternate, files) in &fixtures {
+            runtime.send(Action::Restart(*core)).unwrap();
+            assert!(idle(&runtime, *core).running);
+            ready(&runtime, *core, *port);
+            runtime
+                .send(Action::SwitchConfig(*core, (*alternate).into()))
+                .unwrap();
+            assert_eq!(idle(&runtime, *core).current.as_deref(), Some(*alternate));
+            ready(&runtime, *core, *port);
+            runtime.send(Action::Stop(*core)).unwrap();
+            assert!(!idle(&runtime, *core).running);
+            drop(
+                TcpListener::bind(("127.0.0.1", *port))
+                    .expect("stopped core retained its listener"),
+            );
+            for (other, _, other_port, _, _) in &fixtures {
+                if other != core {
+                    ready(&runtime, *other, *other_port);
+                }
+            }
+            runtime.send(Action::Start(*core)).unwrap();
+            assert!(idle(&runtime, *core).running);
+            ready(&runtime, *core, *port);
+            for (name, text) in files {
+                assert_eq!(
+                    fs::read_to_string(core.config_dir(root).join(name)).unwrap(),
+                    *text
+                );
+            }
+            let auto = match core {
+                Core::SingBox => Setting::AutoSingBox,
+                Core::Xray => Setting::AutoXray,
+                Core::Mihomo => Setting::AutoMihomo,
+            };
+            runtime.send(Action::Set(auto, true)).unwrap();
+            eprintln!(
+                "{} {channel:?} {version} {}: start/restart/config-switch/stop passed; {} peer listeners checked; DNS/TUN disabled",
+                core.label(),
+                std::env::consts::ARCH,
+                fixtures.len() - 1
+            );
+        }
+        runtime.shutdown().unwrap();
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        for (core, version, port, alternate, _) in &fixtures {
+            assert_eq!(idle(&runtime, *core).current.as_deref(), Some(*alternate));
+            ready(&runtime, *core, *port);
+            eprintln!(
+                "{} {channel:?} {version} {}: autostart passed",
+                core.label(),
+                std::env::consts::ARCH
+            );
+        }
+        runtime.shutdown().unwrap();
+        assert!(
+            validation_failures.is_empty(),
+            "configuration validation expectations failed:\n{}",
+            validation_failures.join("\n")
+        );
+    }
+
+    #[test]
     fn tun_runtime_copies_follow_core_lifetimes_and_preserve_sources() {
         let folder = tempfile::Builder::new()
             .prefix("梯子 TUN ")
@@ -1942,10 +2278,11 @@ mod tests {
         let _process_test = lock_and_install_fixture_cores(root);
         let source_name = "TUN.json";
         let sources = [
+            r#"{"fixture_tun":true,"tun":{"enable":true,"device":"original"}}"#,
             r#"{"fixture_tun":true,"inbounds":[{"type":"tun","interface_name":"original"}]}"#,
             r#"{"fixture_tun":true,"Inbounds":[{"Protocol":"TUN","Settings":{"Name":"original"}}]}"#,
         ];
-        for (core, source) in [Core::SingBox, Core::Xray].into_iter().zip(sources) {
+        for (core, source) in Core::ALL.into_iter().zip(sources) {
             fs::write(core.config_dir(root).join(source_name), source).unwrap();
             fs::write(core.config_dir(root).join(".ladder-tun-stale.json"), "{}").unwrap();
         }
@@ -1966,8 +2303,8 @@ mod tests {
                 thread::sleep(Duration::from_millis(30));
             }
         };
-        let mut copies = Vec::new();
-        for core in [Core::SingBox, Core::Xray] {
+        let mut copies = [PathBuf::new(), PathBuf::new(), PathBuf::new()];
+        for core in Core::ALL {
             let state = runtime.snapshot().core(core).clone();
             assert!(
                 !core
@@ -1989,8 +2326,43 @@ mod tests {
                     .iter()
                     .any(|name| is_runtime_config(Path::new(name)))
             );
-            copies.push(copy);
+            copies[core as usize] = copy;
         }
+        let mihomo_copy = &copies[Core::Mihomo as usize];
+        let mihomo_before: serde_yaml_ng::Value =
+            serde_yaml_ng::from_slice(&fs::read(mihomo_copy).unwrap()).unwrap();
+        stop_and_start(&runtime, Core::Mihomo);
+        assert!(idle(&runtime, Core::Mihomo).running);
+        let mihomo_restarted = copy_path(Core::Mihomo, mihomo_copy);
+        let mihomo_after: serde_yaml_ng::Value =
+            serde_yaml_ng::from_slice(&fs::read(&mihomo_restarted).unwrap()).unwrap();
+        assert_ne!(
+            mihomo_before["tun"]["device"],
+            mihomo_after["tun"]["device"]
+        );
+        assert!(!mihomo_copy.exists());
+        fs::write(mihomo_restarted.with_extension("exit"), []).unwrap();
+        failed(&runtime, Core::Mihomo);
+        assert!(!mihomo_restarted.exists());
+        fs::write(
+            Core::Mihomo.config_dir(root).join("失败TUN.yaml"),
+            "fixture_failure: true\ntun: { enable: true, device: original }\n",
+        )
+        .unwrap();
+        runtime
+            .send(Action::SwitchConfig(Core::Mihomo, "失败TUN.yaml".into()))
+            .unwrap();
+        failed(&runtime, Core::Mihomo);
+        assert!(
+            !fs::read_dir(Core::Mihomo.config_dir(root))
+                .unwrap()
+                .any(|entry| is_runtime_config(&entry.unwrap().path()))
+        );
+        runtime
+            .send(Action::SwitchConfig(Core::Mihomo, source_name.into()))
+            .unwrap();
+        assert!(idle(&runtime, Core::Mihomo).running);
+        let mihomo_shutdown_copy = copy_path(Core::Mihomo, &mihomo_restarted);
         let xray_before = fs::read(&copies[1]).unwrap();
         let sing_before: serde_json::Value =
             serde_json::from_slice(&fs::read(&copies[0]).unwrap()).unwrap();
@@ -2034,6 +2406,7 @@ mod tests {
         let shutdown_copy = copy_path(Core::Xray, &copies[1]);
         runtime.shutdown().unwrap();
         assert!(!shutdown_copy.exists());
+        assert!(!mihomo_shutdown_copy.exists());
         let prepared =
             tun_config::prepare(Core::Xray, &Core::Xray.config_dir(root).join(source_name))
                 .unwrap();
@@ -2049,7 +2422,7 @@ mod tests {
             .is_err()
         );
         assert!(!failed_spawn_copy.exists());
-        for (core, source) in [Core::SingBox, Core::Xray].into_iter().zip(sources) {
+        for (core, source) in Core::ALL.into_iter().zip(sources) {
             assert_eq!(
                 fs::read_to_string(core.config_dir(root).join(source_name)).unwrap(),
                 source
@@ -2073,7 +2446,7 @@ mod tests {
         let root = folder.path();
         let _process_test = lock_and_install_fixture_cores(root);
         let config = "进程树.json";
-        for core in [Core::SingBox, Core::Xray] {
+        for core in Core::ALL {
             fs::write(
                 core.config_dir(root).join(config),
                 r#"{"fixture_tree":true}"#,
@@ -2084,13 +2457,15 @@ mod tests {
             settings: Settings {
                 auto_sing_box: true,
                 auto_xray: true,
+                auto_mihomo: true,
                 ..Default::default()
             },
             sing_box: Some(config.into()),
             xray: Some(config.into()),
+            mihomo: Some(config.into()),
             sing_box_version: Some("1.0.0".into()),
             xray_version: Some("1.0.0".into()),
-            ..Default::default()
+            mihomo_version: Some("1.0.0".into()),
         };
         saved.store(root).unwrap();
         let tree = |core: Core| {
@@ -2119,6 +2494,7 @@ mod tests {
         let runtime = Runtime::open(root.to_owned()).unwrap();
         let sing = tree(Core::SingBox);
         let xray = tree(Core::Xray);
+        let mihomo = tree(Core::Mihomo);
         let signal = Core::SingBox
             .config_dir(root)
             .join(config)
@@ -2126,7 +2502,7 @@ mod tests {
         fs::write(&signal, []).unwrap();
         assert!(failed(&runtime, Core::SingBox).run_error.is_some());
         exited(&sing);
-        for handle in &xray {
+        for handle in xray.iter().chain(&mihomo) {
             assert_eq!(
                 unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) },
                 WAIT_TIMEOUT
@@ -2134,6 +2510,7 @@ mod tests {
         }
         runtime.shutdown().unwrap();
         exited(&xray);
+        exited(&mihomo);
         fs::remove_file(signal).unwrap();
 
         let mut external = FixtureChild(
@@ -2153,10 +2530,12 @@ mod tests {
             .unwrap());
         let sing = tree(Core::SingBox);
         let xray = tree(Core::Xray);
+        let mihomo = tree(Core::Mihomo);
         host.0.kill().unwrap();
         host.0.wait().unwrap();
         exited(&sing);
         exited(&xray);
+        exited(&mihomo);
         assert!(external.0.try_wait().unwrap().is_none());
     }
 
@@ -2174,7 +2553,7 @@ mod tests {
             let session = fs::File::create(root.join("dns-session.lock")).unwrap();
             session.lock().unwrap();
             let runtime = Runtime::open(root.clone()).unwrap();
-            for core in [Core::SingBox, Core::Xray] {
+            for core in Core::ALL {
                 assert!(idle(&runtime, core).running);
             }
             crate::emergency::prepare_test_helper(scenario == "spawn-failure");
@@ -2205,7 +2584,7 @@ mod tests {
                 .unwrap();
             let root = folder.path();
             let _process_test = lock_and_install_fixture_cores(root);
-            for core in [Core::SingBox, Core::Xray] {
+            for core in Core::ALL {
                 fs::write(
                     core.config_dir(root).join("进程树.json"),
                     r#"{"fixture_tree":true}"#,
@@ -2216,14 +2595,16 @@ mod tests {
                 settings: Settings {
                     auto_sing_box: true,
                     auto_xray: true,
+                    auto_mihomo: true,
                     hijack_dns: true,
                     ..Default::default()
                 },
                 sing_box: Some("进程树.json".into()),
                 xray: Some("进程树.json".into()),
+                mihomo: Some("进程树.json".into()),
                 sing_box_version: Some("1.0.0".into()),
                 xray_version: Some("1.0.0".into()),
-                ..Default::default()
+                mihomo_version: Some("1.0.0".into()),
             }
             .store(root)
             .unwrap();
@@ -2250,7 +2631,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(20));
             }
             let mut handles = Vec::new();
-            for core in [Core::SingBox, Core::Xray] {
+            for core in Core::ALL {
                 for extension in ["pid", "child"] {
                     let path = core
                         .config_dir(root)
@@ -2452,14 +2833,14 @@ mod tests {
     }
 
     #[test]
-    fn either_core_can_start_hijacking_and_each_actual_exit_restores_dns() {
+    fn every_core_can_start_hijacking_and_each_actual_exit_restores_dns() {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
         let _process_test = lock_and_install_fixture_cores(root);
         let runtime = Runtime::open(root.to_owned()).unwrap();
         let journal = root.join("dns-recovery.json");
         runtime.send(Action::Set(Setting::HijackDns, true)).unwrap();
-        for core in [Core::SingBox, Core::Xray] {
+        for core in Core::ALL {
             runtime
                 .send(Action::SwitchConfig(core, "日常.JSON".into()))
                 .unwrap();
@@ -2467,31 +2848,39 @@ mod tests {
             assert!(state.running && state.run_error.is_none(), "{state:?}");
             assert!(journal.is_file(), "{} 启动后缺少 DNS 原值", core.label());
         }
-        // 关闭开关只影响下一次启动。当前会话仍应在任意核心退出时恢复。
-        runtime
-            .send(Action::Set(Setting::HijackDns, false))
-            .unwrap();
-        runtime.send(Action::Stop(Core::Xray)).unwrap();
-        assert!(!idle(&runtime, Core::Xray).running);
-        assert!(runtime.snapshot().sing_box.running);
-        assert!(!journal.exists());
-        runtime.send(Action::Start(Core::Xray)).unwrap();
-        assert!(idle(&runtime, Core::Xray).running);
-        assert!(!journal.exists());
+        for core in Core::ALL {
+            // 关闭开关只影响下一次启动。当前会话仍应在任意核心退出时恢复。
+            runtime
+                .send(Action::Set(Setting::HijackDns, false))
+                .unwrap();
+            runtime.send(Action::Stop(core)).unwrap();
+            assert!(!idle(&runtime, core).running);
+            assert!(!journal.exists());
+            runtime.send(Action::Start(core)).unwrap();
+            assert!(idle(&runtime, core).running);
+            assert!(!journal.exists());
 
-        runtime.send(Action::Set(Setting::HijackDns, true)).unwrap();
-        stop_and_start(&runtime, Core::Xray);
-        assert!(idle(&runtime, Core::Xray).running);
-        assert!(journal.exists());
-        fs::write(Core::SingBox.config_dir(root).join("日常.exit"), []).unwrap();
-        assert!(
-            failed(&runtime, Core::SingBox)
-                .run_error
-                .unwrap()
-                .contains("核心已退出")
-        );
-        assert!(runtime.snapshot().xray.running);
-        assert!(!journal.exists());
+            runtime.send(Action::Set(Setting::HijackDns, true)).unwrap();
+            stop_and_start(&runtime, core);
+            assert!(idle(&runtime, core).running);
+            assert!(journal.exists());
+            let signal = core.config_dir(root).join("日常.exit");
+            fs::write(&signal, []).unwrap();
+            assert!(
+                failed(&runtime, core)
+                    .run_error
+                    .unwrap()
+                    .contains("核心已退出")
+            );
+            assert!(!journal.exists());
+            for other in Core::ALL.into_iter().filter(|other| *other != core) {
+                assert!(runtime.snapshot().core(other).running);
+            }
+            fs::remove_file(signal).unwrap();
+            runtime.send(Action::Start(core)).unwrap();
+            assert!(idle(&runtime, core).running);
+            assert!(journal.exists());
+        }
         assert!(runtime.shutdown().unwrap().is_none());
     }
 
@@ -2803,7 +3192,7 @@ mod tests {
     fn config_selection_survives_start_failure_when_the_core_is_uninstalled() {
         let folder = tempfile::tempdir().unwrap();
         let runtime = Runtime::open(folder.path().to_owned()).unwrap();
-        for core in [Core::SingBox, Core::Xray] {
+        for core in Core::ALL {
             fs::write(runtime.config_dir(core).join("选中的配置.json"), "{}").unwrap();
             assert!(!runtime.snapshot().core(core).installed);
             runtime
@@ -2830,7 +3219,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
         let runtime = Runtime::open(root.to_owned()).unwrap();
-        for core in [Core::SingBox, Core::Xray] {
+        for core in Core::ALL {
             for name in ["当前.json", "其他.json"] {
                 fs::write(runtime.config_dir(core).join(name), "{}").unwrap();
             }
@@ -2860,7 +3249,7 @@ mod tests {
         let runtime = Runtime::open(root.to_owned()).unwrap();
         let outside = root.join("outside.json");
         fs::write(&outside, "outside").unwrap();
-        for core in [Core::SingBox, Core::Xray] {
+        for core in Core::ALL {
             let dir = runtime.config_dir(core);
             fs::write(dir.join("current.json"), "current").unwrap();
             fs::write(dir.join("other.JSON"), "other").unwrap();
@@ -2923,7 +3312,7 @@ mod tests {
     fn recovering_config_directory_clears_only_the_scan_error() {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
-        for core in [Core::SingBox, Core::Xray] {
+        for core in Core::ALL {
             fs::create_dir_all(core.config_dir(root)).unwrap();
         }
         let config_dir = Core::SingBox.config_dir(root);
@@ -2968,80 +3357,99 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
         let _guard = lock_and_install_fixture_cores(root);
+        fs::write(
+            Core::Mihomo.config_dir(root).join("日常.JSON"),
+            r#"{"fixture_tree":true,"rule-providers":{"local":{"type":"file","path":"rules/relative.yaml"}}}"#,
+        )
+        .unwrap();
         let runtime = Runtime::open(root.to_owned()).unwrap();
-        for core in [Core::SingBox, Core::Xray] {
+        for core in Core::ALL {
             runtime
                 .send(Action::SwitchConfig(core, "日常.JSON".into()))
                 .unwrap();
             assert!(idle(&runtime, core).running);
         }
-        let core = Core::SingBox;
-        let xray_pid = next_pid(&Core::Xray.config_dir(root).join("日常.pid"), 0);
-        let source = fs::read(core.executable(root)).unwrap();
-        let config = fs::read(core.config_dir(root).join("日常.JSON")).unwrap();
-        let saved = fs::read(root.join("ladder-state.json")).unwrap();
-        runtime.state.lock().unwrap().sing_box.update = Some(UpdateProgress::Downloading {
-            received: 1,
-            total: 10,
-        });
-        assert!(
+        for core in Core::ALL {
+            let peers = Core::ALL
+                .into_iter()
+                .filter(|other| *other != core)
+                .map(|other| (other, next_pid(&other.config_dir(root).join("日常.pid"), 0)))
+                .collect::<Vec<_>>();
+            let source = fs::read(core.executable(root)).unwrap();
+            let config = fs::read(core.config_dir(root).join("日常.JSON")).unwrap();
+            let saved = fs::read(root.join("ladder-state.json")).unwrap();
+            let pid_path = core.config_dir(root).join("日常.pid");
+            let original_pid = next_pid(&pid_path, 0);
+            runtime.state.lock().unwrap().core_mut(core).update =
+                Some(UpdateProgress::Downloading {
+                    received: 1,
+                    total: 10,
+                });
+            assert!(
+                runtime
+                    .send(Action::DownloadVersion(core, "2.0.0".into()))
+                    .is_err()
+            );
+            runtime.send(Action::Stop(core)).unwrap();
+            assert!(!idle(&runtime, core).running);
+            runtime.send(Action::Start(core)).unwrap();
+            assert!(idle(&runtime, core).running);
+            let restarted_pid = next_pid(&pid_path, original_pid);
+            let prepared = PreparedUpdate::for_test(
+                core,
+                root,
+                "2.0.0",
+                &[(&format!("{}.exe", core.label()), &source)],
+            );
+            runtime.queue_prepared(core, prepared).unwrap();
+            let state = idle(&runtime, core);
+            assert!(
+                state.running && state.update.is_none() && state.update_error.is_none(),
+                "{state:?}"
+            );
+            assert_eq!(
+                state
+                    .versions
+                    .iter()
+                    .filter(|version| version.installed)
+                    .count(),
+                2
+            );
+            assert_eq!(state.selected_version.as_deref(), Some("1.0.0"));
+            assert_eq!(fs::read(root.join("ladder-state.json")).unwrap(), saved);
             runtime
-                .send(Action::DownloadVersion(core, "2.0.0".into()))
-                .is_err()
-        );
-        runtime.send(Action::Stop(core)).unwrap();
-        assert!(!idle(&runtime, core).running);
-        runtime.send(Action::Start(core)).unwrap();
-        assert!(idle(&runtime, core).running);
-        let prepared = PreparedUpdate::for_test(core, root, "2.0.0", &[("sing-box.exe", &source)]);
-        runtime.queue_prepared(core, prepared).unwrap();
-        let state = idle(&runtime, core);
-        assert!(
-            state.running && state.update.is_none() && state.update_error.is_none(),
-            "{state:?}"
-        );
-        assert_eq!(
-            state
-                .versions
-                .iter()
-                .filter(|version| version.installed)
-                .count(),
-            2
-        );
-        assert_eq!(state.selected_version.as_deref(), Some("1.0.0"));
-        assert_eq!(fs::read(root.join("ladder-state.json")).unwrap(), saved);
-        runtime
-            .send(Action::DeleteVersion(core, "1.0.0".into()))
-            .unwrap();
-        assert!(
-            idle(&runtime, core)
-                .update_error
-                .unwrap()
-                .contains("当前使用")
-        );
-        assert!(core.executable(root).is_file());
-        runtime
-            .send(Action::SwitchVersion(core, "2.0.0".into()))
-            .unwrap();
-        let switched = idle(&runtime, core);
-        assert!(!switched.running);
-        assert_eq!(switched.selected_version.as_deref(), Some("2.0.0"));
-        assert!(runtime.snapshot().xray.running);
-        assert_eq!(
-            next_pid(&Core::Xray.config_dir(root).join("日常.pid"), 0),
-            xray_pid
-        );
-        runtime
-            .send(Action::DeleteVersion(core, "1.0.0".into()))
-            .unwrap();
-        assert!(idle(&runtime, core).update_error.is_none());
-        assert!(!core.executable(root).exists());
-        assert_eq!(
-            fs::read(core.config_dir(root).join("日常.JSON")).unwrap(),
-            config
-        );
-        runtime.send(Action::Start(core)).unwrap();
-        assert!(idle(&runtime, core).running);
+                .send(Action::DeleteVersion(core, "1.0.0".into()))
+                .unwrap();
+            assert!(
+                idle(&runtime, core)
+                    .update_error
+                    .unwrap()
+                    .contains("当前使用")
+            );
+            assert!(core.executable(root).is_file());
+            runtime
+                .send(Action::SwitchVersion(core, "2.0.0".into()))
+                .unwrap();
+            let switched = idle(&runtime, core);
+            assert!(!switched.running);
+            assert_eq!(switched.selected_version.as_deref(), Some("2.0.0"));
+            for (other, pid) in peers {
+                assert!(runtime.snapshot().core(other).running);
+                assert_eq!(next_pid(&other.config_dir(root).join("日常.pid"), 0), pid);
+            }
+            runtime
+                .send(Action::DeleteVersion(core, "1.0.0".into()))
+                .unwrap();
+            assert!(idle(&runtime, core).update_error.is_none());
+            assert!(!core.executable(root).exists());
+            assert_eq!(
+                fs::read(core.config_dir(root).join("日常.JSON")).unwrap(),
+                config
+            );
+            runtime.send(Action::Start(core)).unwrap();
+            assert!(idle(&runtime, core).running);
+            next_pid(&pid_path, restarted_pid);
+        }
         runtime.shutdown().unwrap();
     }
 
