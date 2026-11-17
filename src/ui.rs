@@ -1342,7 +1342,7 @@ impl MainWindow {
                             .flex()
                             .items_center()
                             .gap(px(10.))
-                            .child(img(self.icon.clone()).size(px(32.)).flex_shrink_0())
+                            .child(img(self.icon.clone()).size(px(36.)).flex_shrink_0())
                             .child(
                                 div()
                                     .flex_shrink_0()
@@ -1350,14 +1350,21 @@ impl MainWindow {
                                     .flex()
                                     .flex_col()
                                     .whitespace_normal()
-                                    .gap(px(4.))
+                                    .gap(px(2.))
                                     .items_start()
-                                    .child(repository_link(
-                                        format!("Ladder {}", env!("CARGO_PKG_VERSION")),
-                                        "https://github.com/senzyo/ladder",
-                                        15,
-                                        colors,
-                                    ))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_baseline()
+                                            .gap(px(8.))
+                                            .child(repository_link(
+                                                format!("Ladder {}", env!("CARGO_PKG_VERSION")),
+                                                "https://github.com/senzyo/ladder",
+                                                15,
+                                                colors,
+                                            ))
+                                            .child(caption("MIT License", colors)),
+                                    )
                                     .child(
                                         div().flex().flex_wrap().gap(px(8.)).children(
                                             [
@@ -1384,7 +1391,7 @@ impl MainWindow {
                                     ),
                             )
                             .child(
-                                div().flex_1().min_w(px(0.)).when_some(
+                                div().flex_1().min_w(px(0.)).text_right().when_some(
                                     update_status,
                                     |el, status| {
                                         el.child(caption(status, colors).whitespace_normal())
@@ -1407,7 +1414,6 @@ impl MainWindow {
                                 .min_w(px(100.)),
                             ),
                     )
-                    .child(caption("MIT License", colors))
                     .when(matches!(self.app_update, AppUpdateState::Ready(_)), |el| {
                         el.child(
                             caption("更新时将停止所有核心，完成后重新打开 Ladder。", colors)
