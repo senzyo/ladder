@@ -56,7 +56,7 @@ fn checked(result: i32) -> io::Result<()> {
 }
 
 fn create_job() -> io::Result<OwnedHandle> {
-    // 匿名且不可继承，最后一个句柄始终由 Ladder 持有。
+    // 匿名且不可继承, 最后一个句柄始终由 Ladder 持有。
     let raw = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
     if raw.is_null() {
         return Err(io::Error::last_os_error());
@@ -75,7 +75,7 @@ fn create_job() -> io::Result<OwnedHandle> {
     Ok(job)
 }
 
-// Windows 的环境块按变量名（忽略大小写）排序，以两个 NUL 结束。
+// Windows 的环境块按变量名 (忽略大小写) 排序, 以两个 NUL 结束。
 fn xray_environment(assets: &Path) -> Vec<u16> {
     let name: Vec<_> = "XRAY_LOCATION_ASSET".encode_utf16().collect();
     let mut entries: Vec<_> = std::env::vars_os()
@@ -321,7 +321,7 @@ impl JobProcess {
                 &mut info,
             )
         });
-        // 只抑制此线程本次创建的系统错误对话，不改变 GUI 或其他线程的错误模式。
+        // 只抑制此线程本次创建的系统错误对话, 不改变 GUI 或其他线程的错误模式。
         unsafe { SetThreadErrorMode(previous_error_mode, ptr::null_mut()) };
         created?;
         let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess) };
@@ -364,7 +364,7 @@ impl JobProcess {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "等待托管进程退出超时，请重试停止",
+                    "等待托管进程退出超时, 请重试停止",
                 ));
             }
             std::thread::sleep(Duration::from_millis(10));

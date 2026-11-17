@@ -134,9 +134,9 @@ pub fn check_latest(prefix: &str) -> Result<Option<AppRelease>, String> {
 
 fn network_error(error: ureq::Error) -> String {
     match error {
-        ureq::Error::StatusCode(403 | 429) => "GitHub 请求受限，请稍后重试或更换加速前缀".into(),
-        ureq::Error::StatusCode(404) => "软件安装包已不存在，请重新检查更新".into(),
-        _ => "软件更新请求失败或超时，请检查网络后重试".into(),
+        ureq::Error::StatusCode(403 | 429) => "GitHub 请求受限, 请稍后重试或更换加速前缀".into(),
+        ureq::Error::StatusCode(404) => "软件安装包已不存在, 请重新检查更新".into(),
+        _ => "软件更新请求失败或超时, 请检查网络后重试".into(),
     }
 }
 
@@ -156,7 +156,7 @@ pub fn download(
     let stage = tempfile::Builder::new()
         .prefix(".ladder-app-update-")
         .tempdir_in(root)
-        .map_err(|_| "无法创建软件更新目录，请检查程序目录权限")?;
+        .map_err(|_| "无法创建软件更新目录, 请检查程序目录权限")?;
     let url = crate::github::url(prefix, &release.url)?;
     progress(UpdateProgress::Downloading {
         received: 0,
@@ -204,7 +204,7 @@ pub fn download(
     progress(UpdateProgress::Verifying);
     let digest: [u8; 32] = hasher.finalize().into();
     if received != release.size || digest != release.sha256 {
-        return Err("软件安装包大小或 SHA-256 校验失败，当前软件未修改".into());
+        return Err("软件安装包大小或 SHA-256 校验失败, 当前软件未修改".into());
     }
     archive_file.sync_all().map_err(|_| "保存软件安装包失败")?;
     drop(archive_file);
@@ -329,11 +329,11 @@ impl UpdateHelper {
             .map_err(|_| "无法检查软件更新助手")?
             .is_some()
         {
-            return Err("软件更新助手已退出，当前软件未修改".into());
+            return Err("软件更新助手已退出, 当前软件未修改".into());
         }
         let stage = self.stage.as_ref().unwrap();
         fs::write(stage.path().join("commit"), b"commit")
-            .map_err(|_| "无法确认软件更新，当前软件未修改")?;
+            .map_err(|_| "无法确认软件更新, 当前软件未修改")?;
         let _ = self.stage.take().unwrap().keep();
         Ok(())
     }
@@ -349,7 +349,7 @@ impl Drop for UpdateHelper {
 }
 
 impl PreparedAppUpdate {
-    // 仅在所有核心停止且 DNS 恢复成功后调用；退出前须 commit，放弃更新则直接 drop。
+    // 仅在所有核心停止且 DNS 恢复成功后调用；退出前须 commit, 放弃更新则直接 drop。
     pub fn launch(self) -> Result<UpdateHelper, String> {
         let name = self
             .target
@@ -383,7 +383,7 @@ impl PreparedAppUpdate {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|_| "无法启动软件更新助手，当前软件未修改")?;
+            .map_err(|_| "无法启动软件更新助手, 当前软件未修改")?;
         let mut helper = UpdateHelper {
             process,
             stage: Some(self.stage),
@@ -403,10 +403,10 @@ impl PreparedAppUpdate {
                 .map_err(|_| "无法检查软件更新助手")?
                 .is_some()
             {
-                return Err("软件更新助手启动失败，当前软件未修改".into());
+                return Err("软件更新助手启动失败, 当前软件未修改".into());
             }
             if Instant::now() >= deadline {
-                return Err("软件更新助手未能及时就绪，当前软件未修改".into());
+                return Err("软件更新助手未能及时就绪, 当前软件未修改".into());
             }
             std::thread::sleep(Duration::from_millis(25));
         }

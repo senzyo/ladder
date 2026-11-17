@@ -216,7 +216,7 @@ fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Res
                                 drop(helper);
                                 report_dns_on_exit(&message);
                             } else if let Err(error) = helper.commit() {
-                                report(&format!("{error}。更新已取消，请重新打开 Ladder 后重试。"));
+                                report(&format!("{error}。更新已取消, 请重新打开 Ladder 后重试。"));
                             }
                             let _ = cx.update(|cx| cx.quit());
                             break;
@@ -230,7 +230,7 @@ fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Res
                 }
                 TrayAction::OpenDirectory => {
                     let result = std::env::current_exe()
-                        .map_err(|error| format!("读取程序目录失败：{error}"))
+                        .map_err(|error| format!("读取程序目录失败: {error}"))
                         .and_then(|exe| {
                             desktop::open_folder(exe.parent().ok_or("无法定位程序目录")?)
                         });
@@ -309,7 +309,7 @@ fn run() -> Result<()> {
     logging::info(
         "app",
         format_args!(
-            "Ladder {} 启动，架构 {}，进程 {}",
+            "Ladder {} 启动, 架构 {}, 进程 {}",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::ARCH,
             std::process::id()
@@ -343,7 +343,7 @@ fn report(message: &str) {
 fn report_dns_on_exit(message: &str) {
     logging::warn("dns", message);
     message_box(
-        &format!("核心已停止，DNS 尚未恢复。下次打开 Ladder 时会再次尝试恢复。\n\n{message}"),
+        &format!("核心已停止, DNS 尚未恢复。下次打开 Ladder 时会再次尝试恢复。\n\n{message}"),
         MB_ICONWARNING,
     );
 }

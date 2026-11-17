@@ -1,4 +1,4 @@
-//! panic 路径直接启动恢复助手，避开 std::process::Command 的全局创建锁。
+//! panic 路径直接启动恢复助手, 避开 std::process::Command 的全局创建锁。
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -18,7 +18,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub(crate) struct PanicHelper {
-    // 先销毁属性表，再释放它引用的句柄数组和句柄。
+    // 先销毁属性表, 再释放它引用的句柄数组和句柄。
     attributes: AttributeList,
     // 属性表引用这块稳定的堆内存；句柄值与 HANDLE 数组具有相同布局。
     _inherited: Box<[usize; 2]>,
@@ -44,7 +44,7 @@ fn checked(result: i32) -> io::Result<()> {
     }
 }
 
-// 始终加引号，按 Windows argv 规则转义引号前和末尾的反斜杠。
+// 始终加引号, 按 Windows argv 规则转义引号前和末尾的反斜杠。
 fn append_argument(command: &mut Vec<u16>, argument: &OsStr) -> io::Result<()> {
     command.push(b'"' as u16);
     let mut slashes = 0;
@@ -91,7 +91,7 @@ impl PanicHelper {
             ));
         }
 
-        // 真实进程句柄不会因 PID 复用而等待另一个进程，也不会赋予助手终止父进程的权限。
+        // 真实进程句柄不会因 PID 复用而等待另一个进程, 也不会赋予助手终止父进程的权限。
         let raw = unsafe {
             OpenProcess(
                 PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
@@ -157,7 +157,7 @@ impl PanicHelper {
             lpAttributeList: self.attributes.0.as_mut_ptr().cast(),
         };
         let mut info = PROCESS_INFORMATION::default();
-        // 不加入核心的 Job：助手必须在 Ladder 终止后继续运行。
+        // 不加入核心的 Job: 助手必须在 Ladder 终止后继续运行。
         checked(unsafe {
             CreateProcessW(
                 self.executable.as_ptr(),

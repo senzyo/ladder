@@ -28,9 +28,9 @@ function Import-VcEnvironment {
     $hostArchitecture = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
     $targetArchitecture = if ($TargetArchitecture -eq 'arm64') { 'arm64' } else { 'x64' }
     $pair = if ($hostArchitecture -eq $targetArchitecture) { $hostArchitecture } else { "${hostArchitecture}_$targetArchitecture" }
-    # cmd 只用于运行 VS 官方环境脚本，不执行文件删除或移动。
+    # cmd 只用于运行 VS 官方环境脚本, 不执行文件删除或移动。
     $environment = & $env:ComSpec /d /c "call `"$vcvars`" $pair >nul && set"
-    if ($LASTEXITCODE -ne 0) { throw "无法加载 $pair 编译环境，请安装对应的 MSVC 组件。" }
+    if ($LASTEXITCODE -ne 0) { throw "无法加载 $pair 编译环境, 请安装对应的 MSVC 组件。" }
     foreach ($line in $environment) {
         if ($line -match '^([^=]+)=(.*)$') {
             [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
@@ -42,7 +42,7 @@ function New-ReleaseArchive {
     param([string]$Arch, [string]$Version, [string]$Executable)
     if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { throw "缺少 $Arch 构建产物。" }
     $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($Executable)
-    if ($versionInfo.ProductVersion -ne $Version) { throw '构建产物版本与 Cargo.toml 不一致，请重新构建。' }
+    if ($versionInfo.ProductVersion -ne $Version) { throw '构建产物版本与 Cargo.toml 不一致, 请重新构建。' }
     $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($Executable))
     try {
         if ($reader.ReadUInt16() -ne 0x5a4d) { throw '构建产物不是 Windows 可执行文件。' }
@@ -93,7 +93,7 @@ try {
     if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw '不支持的发行版本号。' }
     $architectures = if ($Architecture -eq 'all') { @('amd64', 'arm64') } else { @($Architecture) }
     if ($Publish -and $Architecture -ne 'all') { throw '正式发布必须同时提供 amd64 和 arm64。' }
-    if ($Publish -and $SkipBuild) { throw '发布必须重新构建，不能使用 -SkipBuild。' }
+    if ($Publish -and $SkipBuild) { throw '发布必须重新构建, 不能使用 -SkipBuild。' }
     if ($Publish) {
         $changes = & git status --porcelain
         if ($LASTEXITCODE -ne 0 -or $changes) { throw '发布需要干净的 Git 工作区。' }
@@ -104,7 +104,7 @@ try {
         if ($refs.Count -eq 0) { throw "请先将当前提交推送到 GitHub 并创建对应标签 v$version。" }
         $peeled = @($refs | Where-Object { $_.EndsWith('^{}') })
         $remoteCommit = if ($peeled.Count) { ($peeled[0] -split '\s+')[0] } else { ($refs[0] -split '\s+')[0] }
-        if ($remoteCommit -cne $commit) { throw 'GitHub 发行标签没有指向当前提交，停止发布。' }
+        if ($remoteCommit -cne $commit) { throw 'GitHub 发行标签没有指向当前提交, 停止发布。' }
     }
     [IO.Directory]::CreateDirectory($DistRoot) | Out-Null
     $artifacts = @()

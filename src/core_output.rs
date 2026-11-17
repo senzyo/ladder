@@ -77,17 +77,17 @@ fn capture_reason(
     }) {
         Ok(()) => None,
         Err(error) => {
-            // IO 错误的自定义文本也可能来自核心，日志只记录系统代码和种类。
+            // IO 错误的自定义文本也可能来自核心, 日志只记录系统代码和种类。
             logging::warn(
                 "core",
                 format_args!(
-                    "{} {stream} 读取失败（{:?}，系统错误码 {:?}）",
+                    "{} {stream} 读取失败 ({:?}, 系统错误码 {:?})",
                     core.label(),
                     error.kind(),
                     error.raw_os_error()
                 ),
             );
-            Some("读取核心输出失败，诊断可能不完整")
+            Some("读取核心输出失败, 诊断可能不完整")
         }
     }
 }
@@ -480,7 +480,7 @@ mod tests {
         );
         assert_eq!(
             capture_reason(Core::Xray, "stderr", FailingReader(true), &Mutex::new(None)),
-            Some("读取核心输出失败，诊断可能不完整")
+            Some("读取核心输出失败, 诊断可能不完整")
         );
         assert!(
             !logging::recent()

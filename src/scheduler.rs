@@ -27,7 +27,7 @@ const TASK_NAME: &str = "Reset_DNS_On_Boot";
 
 fn system_folder(id: u32) -> Result<PathBuf> {
     let mut buffer = [0u16; 260];
-    // SHGetFolderPathW 要求 MAX_PATH 个字符，成功时返回以 NUL 结尾的绝对路径。
+    // SHGetFolderPathW 要求 MAX_PATH 个字符, 成功时返回以 NUL 结尾的绝对路径。
     let status = unsafe {
         SHGetFolderPathW(
             std::ptr::null_mut(),
@@ -38,7 +38,7 @@ fn system_folder(id: u32) -> Result<PathBuf> {
         )
     };
     if status < 0 {
-        bail!("无法读取 Windows 系统目录（HRESULT {status:#x}）");
+        bail!("无法读取 Windows 系统目录 (HRESULT {status:#x})");
     }
     let length = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
     Ok(OsString::from_wide(&buffer[..length]).into())
@@ -71,12 +71,12 @@ fn check_directory(directory: &Path, script: &str) -> Result<()> {
         Some(4) => "恢复目录包含非预期文件、子目录或重解析点",
         Some(5) => "恢复文件权限不符合 SYSTEM 任务要求",
         Some(_) => bail!(
-            "无法创建或检查 {}，请检查目录权限和占用情况",
+            "无法创建或检查 {}, 请检查目录权限和占用情况",
             directory.display()
         ),
-        None => bail!("检查 {} 的助手异常结束，请重试", directory.display()),
+        None => bail!("检查 {} 的助手异常结束, 请重试", directory.display()),
     };
-    bail!("{}：{reason}", directory.display())
+    bail!("{}: {reason}", directory.display())
 }
 
 fn session_file(directory: &Path) -> io::Result<File> {
@@ -97,7 +97,7 @@ fn lock_desktop_session(session: &File) -> Result<()> {
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(error) => return Err(anyhow::anyhow!("无法取得 DNS 恢复锁：{error}")),
+            Err(error) => return Err(anyhow::anyhow!("无法取得 DNS 恢复锁: {error}")),
         }
     }
 }
@@ -123,7 +123,7 @@ impl DesktopDns {
     }
 }
 
-// 目录别名也可能指向同一份快照。无法确认便携目录独立时，等待用户修复机器目录。
+// 目录别名也可能指向同一份快照。无法确认便携目录独立时, 等待用户修复机器目录。
 fn can_use_portable(directory: &Path, portable: &Path) -> bool {
     match fs::symlink_metadata(directory) {
         Err(error) => error.kind() == io::ErrorKind::NotFound,
@@ -137,10 +137,10 @@ fn can_use_portable(directory: &Path, portable: &Path) -> bool {
 
 pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
     let unavailable = |error: anyhow::Error| {
-        logging::warn("dns", format_args!("机器级 DNS 恢复不可用：{error:#}"));
+        logging::warn("dns", format_args!("机器级 DNS 恢复不可用: {error:#}"));
         (
             DesktopDns::Unavailable(format!(
-                "无法安全访问机器级 DNS 恢复记录。请检查恢复目录，或等待占用结束后重试：{error:#}"
+                "无法安全访问机器级 DNS 恢复记录。请检查恢复目录, 或等待占用结束后重试: {error:#}"
             )),
             None,
         )
@@ -155,11 +155,11 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
                 Ok(lease) => lease,
                 Err(error) => return unavailable(error),
             };
-            logging::warn("dns", format_args!("使用便携 DNS 恢复记录：{error:#}"));
+            logging::warn("dns", format_args!("使用便携 DNS 恢复记录: {error:#}"));
             (
                 DesktopDns::Portable(lease),
                 Some(format!(
-                    "本次使用便携 DNS 恢复记录，只能由 Ladder 恢复。{error:#}"
+                    "本次使用便携 DNS 恢复记录, 只能由 Ladder 恢复。{error:#}"
                 )),
             )
         } else {
@@ -177,7 +177,7 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
         .context("无法定位 Ladder 程序")
         .and_then(|exe| ensure_boot_dns_reset_task(&exe, &directory))
         .err()
-        .map(|error| format!("更新开机 DNS 恢复任务失败：{error:#}"));
+        .map(|error| format!("更新开机 DNS 恢复任务失败: {error:#}"));
     if let Some(message) = &warning {
         logging::warn("dns", message);
     } else {
@@ -197,7 +197,7 @@ pub(crate) fn restore_on_boot() -> Result<()> {
     let session = session_file(&directory)?;
     match session.try_lock() {
         Ok(()) => {
-            // 取得快照锁后才覆盖本次日志，避免与其他恢复进程争用文件。
+            // 取得快照锁后才覆盖本次日志, 避免与其他恢复进程争用文件。
             let _ = logging::init(&directory.join("app.log"));
             logging::info("dns", "开始开机 DNS 恢复");
             let result = DnsLease::new(&directory).restore_if_pending();
@@ -207,7 +207,7 @@ pub(crate) fn restore_on_boot() -> Result<()> {
             }
             result.map_err(anyhow::Error::msg)
         }
-        // 已经打开的 Ladder 会在启动时恢复，之后由它独占正在运行的核心快照。
+        // 已经打开的 Ladder 会在启动时恢复, 之后由它独占正在运行的核心快照。
         Err(TryLockError::WouldBlock) => Ok(()),
         Err(TryLockError::Error(error)) => Err(error.into()),
     }
@@ -226,7 +226,7 @@ pub(crate) fn restore_after_panic(directory: &Path, legacy: Option<&Path>) -> Re
             let lease = DnsLease::for_tests_with_legacy(directory, legacy);
             lease.restore_if_pending().map_err(anyhow::Error::msg)
         }
-        // 新桌面会话先取得锁时由它接管恢复，不能重放其后产生的记录。
+        // 新桌面会话先取得锁时由它接管恢复, 不能重放其后产生的记录。
         Err(TryLockError::WouldBlock) => Ok(()),
         Err(TryLockError::Error(error)) => Err(error.into()),
     }
@@ -255,7 +255,7 @@ fn running_image(exe: &Path) -> Result<File> {
         .read(true)
         .share_mode(1 /* FILE_SHARE_READ */)
         .open(exe)?;
-    // 文件名所在的便携目录可以被移动。确认同一个文件对象后，从此句柄读取 SYSTEM 副本。
+    // 文件名所在的便携目录可以被移动。确认同一个文件对象后, 从此句柄读取 SYSTEM 副本。
     #[link(name = "ntdll")]
     unsafe extern "system" {
         fn NtAreMappedFilesTheSame(
@@ -263,7 +263,7 @@ fn running_image(exe: &Path) -> Result<File> {
             data: *const std::ffi::c_void,
         ) -> i32;
     }
-    // 仅映射文件开头用于查询内核对象身份，不执行或解引用其中的内容。
+    // 仅映射文件开头用于查询内核对象身份, 不执行或解引用其中的内容。
     let same = unsafe {
         let mapping = CreateFileMappingW(
             source.as_raw_handle(),
@@ -286,14 +286,14 @@ fn running_image(exe: &Path) -> Result<File> {
         status == 0
     };
     if !same {
-        bail!("Ladder 程序路径已变化，无法核实开机 DNS 恢复程序");
+        bail!("Ladder 程序路径已变化, 无法核实开机 DNS 恢复程序");
     }
     Ok(source)
 }
 
 fn ensure_boot_dns_reset_task(exe: &Path, directory: &Path) -> Result<()> {
     let helper = directory.join("ladder-dns-recovery.exe");
-    // 从运行中的映像复制内容，新文件继承受保护目录的权限。完整写入后才替换恢复程序。
+    // 从运行中的映像复制内容, 新文件继承受保护目录的权限。完整写入后才替换恢复程序。
     let staged = helper.with_extension("tmp");
     {
         let mut source = running_image(exe)?;
@@ -310,7 +310,7 @@ fn ensure_boot_dns_reset_task(exe: &Path, directory: &Path) -> Result<()> {
         .collect();
     fs::write(&xml, contents)?;
     let system = system_folder(CSIDL_SYSTEM)?;
-    // 重复启动时更新同一任务，保持恢复程序和开机动作一致。
+    // 重复启动时更新同一任务, 保持恢复程序和开机动作一致。
     let status = Command::new(system.join("schtasks.exe"))
         .current_dir(&system)
         .args(["/Create", "/TN", TASK_NAME, "/XML"])
@@ -324,7 +324,7 @@ fn ensure_boot_dns_reset_task(exe: &Path, directory: &Path) -> Result<()> {
     let _ = fs::remove_file(xml);
     let status = status.context("无法启动 Windows 任务计划工具")?;
     if !status.success() {
-        bail!("无法注册开机 DNS 恢复任务，请检查管理员权限和 Windows 任务计划程序服务");
+        bail!("无法注册开机 DNS 恢复任务, 请检查管理员权限和 Windows 任务计划程序服务");
     }
     Ok(())
 }
@@ -372,7 +372,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let machine = temp.path().join("machine");
         // 普通测试令牌不能指派 Administrators 所有者或使用其权限创建文件。
-        // 用测试账户替代该组，保留 Windows 对继承项及 OWNER RIGHTS 的实际处理。
+        // 用测试账户替代该组, 保留 Windows 对继承项及 OWNER RIGHTS 的实际处理。
         let script = include_str!("recovery_directory.ps1")
             .replace("O:BAD:P", "D:P")
             .replace(
@@ -430,7 +430,7 @@ mod tests {
         );
         drop(desktop);
 
-        // 空记录只需删除，不调用真实 DNS 接口或刷新缓存。
+        // 空记录只需删除, 不调用真实 DNS 接口或刷新缓存。
         fs::write(&journal, b"[]").unwrap();
         restore_after_panic(dir.path(), None).unwrap();
         assert!(!journal.exists());

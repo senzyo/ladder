@@ -1,4 +1,4 @@
-//! 清理异常 WinTUN 设备和 tun- 网络记录，保护健康设备及托管核心正在使用的名称。
+//! 清理异常 WinTUN 设备和 tun- 网络记录, 保护健康设备及托管核心正在使用的名称。
 
 use crate::tun_config::TUN_PREFIX;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -74,7 +74,7 @@ mod system {
             Err(error) => {
                 logging::warn(
                     "tun",
-                    format_args!("读取现存接口失败，跳过 TUN 网络记录清理: {error}"),
+                    format_args!("读取现存接口失败, 跳过 TUN 网络记录清理: {error}"),
                 );
                 return;
             }
@@ -89,7 +89,7 @@ mod system {
 
     fn interface_names() -> io::Result<Vec<String>> {
         let mut table: *mut MIB_IF_TABLE2 = ptr::null_mut();
-        // 系统分配表及柔性数组，所有借用在 FreeMibTable 前结束。
+        // 系统分配表及柔性数组, 所有借用在 FreeMibTable 前结束。
         let result = unsafe { GetIfTable2(&mut table) };
         if result != NO_ERROR {
             return Err(io::Error::from_raw_os_error(result as i32));
@@ -119,7 +119,7 @@ mod system {
     }
 
     fn device_ids() -> Result<Vec<u16>, u32> {
-        // 设备可能在两次调用间变化，缓冲区不足时重新枚举。
+        // 设备可能在两次调用间变化, 缓冲区不足时重新枚举。
         for _ in 0..3 {
             let mut size = 0;
             let result = unsafe { CM_Get_Device_ID_List_SizeW(&mut size, ptr::null(), 0) };
@@ -198,7 +198,7 @@ mod system {
                 located
             };
             if !removable_device(name.as_deref(), managed_names, result, status) {
-                // 已启动但尚未出现在接口表中的设备，也必须保留其网络记录。
+                // 已启动但尚未出现在接口表中的设备, 也必须保留其网络记录。
                 protected_registry.extend(name);
                 continue;
             }
@@ -277,7 +277,7 @@ mod system {
                     Ok(())
                 } else {
                     Err(io::Error::other(
-                        "无法清理残留 TUN 设备，请检查管理员权限及设备是否被占用",
+                        "无法清理残留 TUN 设备, 请检查管理员权限及设备是否被占用",
                     ))
                 };
             }

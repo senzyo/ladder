@@ -250,7 +250,7 @@ impl MainWindow {
             UiAction::InstallAppUpdate => self
                 .events
                 .try_send(crate::TrayAction::InstallUpdate)
-                .map_err(|_| "无法开始软件更新，托盘管理线程已关闭。".into()),
+                .map_err(|_| "无法开始软件更新, 托盘管理线程已关闭。".into()),
             UiAction::ShowVersions(core, show) => {
                 let index = core_index(core);
                 self.show_versions[index] = show;
@@ -324,7 +324,7 @@ impl MainWindow {
         scope: FeedbackScope,
         cx: &mut Context<Self>,
     ) {
-        // ShellExecute 会泵 Windows 消息，执行时不能持有 GPUI 的 App 或实体借用。
+        // ShellExecute 会泵 Windows 消息, 执行时不能持有 GPUI 的 App 或实体借用。
         cx.spawn(async move |view, cx| {
             let result = open(&path);
             let _ = view.update(cx, |view, cx| {
@@ -371,7 +371,7 @@ impl MainWindow {
                         if result.is_err() {
                             view.set_command_result(
                                 FeedbackScope::Settings,
-                                Err("主题设置未保存，管理线程已关闭。".into()),
+                                Err("主题设置未保存, 管理线程已关闭。".into()),
                             );
                         }
                         view.refresh(cx);
@@ -399,7 +399,7 @@ impl MainWindow {
                         if result.is_err() {
                             view.set_command_result(
                                 scope,
-                                Err("GitHub 加速前缀未保存，管理线程已关闭。".into()),
+                                Err("GitHub 加速前缀未保存, 管理线程已关闭。".into()),
                             );
                         }
                         view.refresh(cx);
@@ -723,7 +723,7 @@ impl MainWindow {
                 state.current.is_some() && !current_exists && state.scan_error.is_none(),
                 |el| {
                     el.child(error_message(
-                        "当前配置文件已移走，请重新选择配置。".into(),
+                        "当前配置文件已移走, 请重新选择配置。".into(),
                         colors,
                     ))
                 },
@@ -1034,7 +1034,7 @@ impl MainWindow {
                                     colors,
                                     cx,
                                 )
-                                // 蓝底上下各内收 1px，平衡旁边浅色描边按钮的视觉高度。
+                                // 蓝底上下各内收 1px, 平衡旁边浅色描边按钮的视觉高度。
                                 .h(px(28.)),
                             ),
                     ),
@@ -1185,7 +1185,7 @@ impl MainWindow {
             ),
             (
                 "劫持DNS到本地回环",
-                "下次启动任一核心时，将物理网卡 DNS 设为 127.0.0.1 和 ::1。不要和 mihomo 的 strict-route、sing-box 的 strict_route、Xray 的 autoSystemWfpBlockLeak 同时开启。",
+                "下次启动任一核心时, 将物理网卡 DNS 设为 127.0.0.1 和 ::1。不要和 mihomo 的 strict-route、sing-box 的 strict_route、Xray 的 autoSystemWfpBlockLeak 同时开启。",
                 Setting::HijackDns,
                 settings.hijack_dns,
             ),
@@ -1437,7 +1437,7 @@ impl MainWindow {
                     )
                     .when(matches!(self.app_update, AppUpdateState::Ready(_)), |el| {
                         el.child(
-                            caption("更新时将停止所有核心，完成后重新打开 Ladder。", colors)
+                            caption("更新时将停止所有核心, 完成后重新打开 Ladder。", colors)
                                 .w_full()
                                 .whitespace_normal(),
                         )

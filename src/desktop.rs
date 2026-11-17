@@ -24,7 +24,7 @@ pub(crate) fn set_titlebar_dark(window: &Window, dark: bool) {
     {
         let hwnd = raw.hwnd.get() as HWND;
         let enabled = i32::from(dark);
-        // HWND 由当前窗口持有，DWM 在这次调用中读取 BOOL。
+        // HWND 由当前窗口持有, DWM 在这次调用中读取 BOOL。
         unsafe {
             let result = DwmSetWindowAttribute(
                 hwnd,
@@ -89,7 +89,7 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
         .chain(Some(0))
         .collect();
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // 部分编辑器仅注册 open；让 Shell 解析用户关联，不自行拼接注册表命令。
+    // 部分编辑器仅注册 open；让 Shell 解析用户关联, 不自行拼接注册表命令。
     for verb in [w!("edit"), w!("open")] {
         if !has_editor_association(&wide_extension, verb) {
             continue;
@@ -104,7 +104,7 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
     }
 
     let mut directory = [0u16; 260];
-    // 系统只写入给定容量内，返回的字符数不包含末尾 NUL。
+    // 系统只写入给定容量内, 返回的字符数不包含末尾 NUL。
     let length = unsafe { GetSystemDirectoryW(directory.as_mut_ptr(), directory.len() as u32) };
     if length == 0 {
         return Err(format!(
@@ -136,8 +136,8 @@ fn has_editor_association(extension: &[u16], verb: *const u16) -> bool {
     .into_iter()
     .any(|kind| {
         let mut length = 0;
-        // 只查询长度，排除会打开选择器的 Unknown 关联；COM 处理器不一定有命令行。
-        // 输入均以 NUL 结尾，查询不修复注册表，也不启动处理器。
+        // 只查询长度, 排除会打开选择器的 Unknown 关联；COM 处理器不一定有命令行。
+        // 输入均以 NUL 结尾, 查询不修复注册表, 也不启动处理器。
         let result = unsafe {
             AssocQueryStringW(
                 ASSOCF_INIT_IGNOREUNKNOWN | ASSOCF_NOFIXUPS,

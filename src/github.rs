@@ -8,7 +8,7 @@ pub(crate) fn normalized_prefix(prefix: &str) -> Result<String, String> {
         return Ok(String::new());
     }
     let invalid =
-        || "GitHub 加速前缀须为 HTTPS 地址，不能包含账号、密码、查询参数或片段".to_owned();
+        || "GitHub 加速前缀须为 HTTPS 地址, 不能包含账号、密码、查询参数或片段".to_owned();
     let uri: Uri = prefix.parse().map_err(|_| invalid())?;
     if uri.scheme_str() != Some("https")
         || uri.host().is_none_or(str::is_empty)

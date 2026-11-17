@@ -49,7 +49,7 @@ impl Default for AppUpdater {
             .unwrap_or(false)
         {
             state.status = AppUpdateState::Failed(
-                "上次软件更新未完成，配置已保留。请重试更新，或退出后手动替换 ladder.exe；详情见程序目录的 update-error.log。".into(),
+                "上次软件更新未完成, 配置已保留。请重试更新, 或退出后手动替换 ladder.exe；详情见程序目录的 update-error.log。".into(),
             );
         }
         Self(Arc::new(Mutex::new(state)))
@@ -87,7 +87,7 @@ impl AppUpdater {
             })
             .map(|_| ())
             .map_err(|error| {
-                let error = format!("无法创建软件更新检查线程：{error}");
+                let error = format!("无法创建软件更新检查线程: {error}");
                 self.fail(error.clone());
                 error
             })
@@ -122,7 +122,7 @@ impl AppUpdater {
             })
             .map(|_| ())
             .map_err(|error| {
-                let error = format!("无法创建软件下载线程：{error}");
+                let error = format!("无法创建软件下载线程: {error}");
                 self.fail(error.clone());
                 error
             })
@@ -136,7 +136,7 @@ impl AppUpdater {
         let prepared = state
             .prepared
             .take()
-            .ok_or("软件更新文件不可用，请重新下载")?;
+            .ok_or("软件更新文件不可用, 请重新下载")?;
         state.status = AppUpdateState::Installing;
         Ok(prepared)
     }

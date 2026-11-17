@@ -168,7 +168,7 @@ fn prepare_mihomo(source: &Path, text: &[u8]) -> Result<PreparedConfig, String> 
 }
 
 fn config_key(core: Core, object: &Value, key: &str) -> String {
-    // 保留 Xray 的原字段拼写，避免另插入 settings 或 name 而覆盖原设置。
+    // 保留 Xray 的原字段拼写, 避免另插入 settings 或 name 而覆盖原设置。
     if core == Core::Xray
         && object.get(key).is_none()
         && let Some(actual) = object.as_object().and_then(|object| {
@@ -193,7 +193,7 @@ fn random_name() -> String {
     format!("{TUN_PREFIX}{:06x}", hasher.finish() & 0xff_ffff)
 }
 
-// Xray 还允许 # 行注释。只遮盖字符串和已有注释以外的 #，保留错误行列位置。
+// Xray 还允许 # 行注释。只遮盖字符串和已有注释以外的 #, 保留错误行列位置。
 fn mask_hash_comments(mut text: Vec<u8>) -> Vec<u8> {
     let mut index = 0;
     while index < text.len() {

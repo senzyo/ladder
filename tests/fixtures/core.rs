@@ -91,7 +91,7 @@ fn main() {
             PathBuf::from(resource_path).canonicalize().unwrap(),
             expected
         );
-        // 刻意留下持有输出管道的后代，测试其随核心或宿主强制退出。
+        // 刻意留下持有输出管道的后代, 测试其随核心或宿主强制退出。
         process::Command::new(exe)
             .arg("--child")
             .arg(file.with_extension("child"))

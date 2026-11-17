@@ -1,4 +1,4 @@
-//! panic 后由独立进程恢复 DNS，避免重入出错线程或与仍在运行的 DNS 写入竞争。
+//! panic 后由独立进程恢复 DNS, 避免重入出错线程或与仍在运行的 DNS 写入竞争。
 
 use std::ffi::OsString;
 use std::io;
@@ -23,7 +23,7 @@ static RECOVERY: Mutex<Option<PanicHelper>> = Mutex::new(None);
 pub(crate) fn install_panic_hook() {
     let log_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // 其他线程同时 panic 时，让首个线程先创建助手，避免提前杀掉它。
+        // 其他线程同时 panic 时, 让首个线程先创建助手, 避免提前杀掉它。
         if PANICKING.swap(true, Ordering::AcqRel) {
             std::thread::sleep(Duration::from_secs(5));
             terminate();
@@ -32,7 +32,7 @@ pub(crate) fn install_panic_hook() {
         if let Ok(mut recovery) = RECOVERY.try_lock()
             && let Some(command) = recovery.as_mut()
         {
-            // 创建失败时保留快照，由下次启动或开机恢复。这里不再取日志锁或弹窗。
+            // 创建失败时保留快照, 由下次启动或开机恢复。这里不再取日志锁或弹窗。
             let _ = command.spawn();
         }
         // 包括后台线程的 panic 都视为致命错误。退出也关闭托管核心的 Job 句柄。
@@ -41,7 +41,7 @@ pub(crate) fn install_panic_hook() {
     INSTALLED.store(true, Ordering::Release);
 }
 
-// 在正常执行路径准备参数与真实进程句柄，panic 中不读取应用状态或初始化恢复目录。
+// 在正常执行路径准备参数与真实进程句柄, panic 中不读取应用状态或初始化恢复目录。
 pub(crate) fn prepare(dns: &scheduler::DesktopDns) {
     if !INSTALLED.load(Ordering::Acquire) {
         return;
@@ -66,13 +66,13 @@ pub(crate) fn prepare(dns: &scheduler::DesktopDns) {
     if let Some(error) = error {
         logging::warn(
             "dns",
-            format_args!("无法准备 panic DNS 恢复，异常退出后需重新打开 Ladder：{error}"),
+            format_args!("无法准备 panic DNS 恢复, 异常退出后需重新打开 Ladder: {error}"),
         );
     }
 }
 
 fn terminate() -> ! {
-    // 不进入 Rust/C 退出清理或 DLL detach，避免出错线程遗留的锁挡住父进程终止。
+    // 不进入 Rust/C 退出清理或 DLL detach, 避免出错线程遗留的锁挡住父进程终止。
     unsafe { TerminateProcess(GetCurrentProcess(), 1) };
     std::process::abort();
 }
@@ -144,7 +144,7 @@ mod tests {
         };
         let root = PathBuf::from(root);
         fs::write(root.join("helper-started"), []).unwrap();
-        // 与生产助手一样，先等待原进程停止，再进入有会话锁的恢复入口。
+        // 与生产助手一样, 先等待原进程停止, 再进入有会话锁的恢复入口。
         wait_for_parent().unwrap();
         let result = scheduler::restore_after_panic(&root, None);
         let completed = root.join("recovery-result.tmp");
@@ -173,7 +173,7 @@ mod tests {
                 "助手不能把仍存活的父进程当成已退出"
             );
             assert!(root.join("dns-recovery.json").exists());
-            // 助手启动后父进程仍可能修改记录，必须恢复父进程退出时的最终版本。
+            // 助手启动后父进程仍可能修改记录, 必须恢复父进程退出时的最终版本。
             fs::write(root.join("dns-recovery.json"), b"last interrupted write").unwrap();
             terminate();
         }

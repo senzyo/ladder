@@ -1,4 +1,4 @@
-//! 按物理网卡和地址族保存静态/自动 DNS，再接管到本地回环。
+//! 按物理网卡和地址族保存静态/自动 DNS, 再接管到本地回环。
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -68,7 +68,7 @@ struct LegacyImport {
 enum ImportState {
     // 删除便携文件之前落盘；SYSTEM 完成恢复后仍保留这张收据。
     Imported(Vec<SavedDns>),
-    // 旧文件暂不可读。即使稍后修好，也不能覆盖机器记录已交还的网卡。
+    // 旧文件暂不可读。即使稍后修好, 也不能覆盖机器记录已交还的网卡。
     Superseded(Vec<Target>),
 }
 
@@ -79,7 +79,7 @@ impl Journal {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("无法读取 DNS 恢复记录 {}: {e}", path.display())),
         };
-        // 直接按具体类型反序列化，保留旧数组中完整的 128 位网卡 GUID。
+        // 直接按具体类型反序列化, 保留旧数组中完整的 128 位网卡 GUID。
         let result = if data.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'[') {
             serde_json::from_slice(&data).map(|changes| Self {
                 changes,
@@ -89,7 +89,7 @@ impl Journal {
             serde_json::from_slice(&data)
         };
         result.map(Some).map_err(|e| format!(
-            "{} 格式无效（第 {} 行，第 {} 列）。请用备份修复记录，或在手动恢复网卡 DNS 后移走此文件。",
+            "{} 格式无效 (第 {} 行, 第 {} 列) 。请用备份修复记录, 或在手动恢复网卡 DNS 后移走此文件。",
             path.display(), e.line(), e.column()
         ))
     }
@@ -151,7 +151,7 @@ impl Journal {
                         source: source.to_owned(),
                         state: ImportState::Superseded(targets),
                     });
-                    // 即便本次所有网卡都写失败，下一次开机也能保留机器记录的优先级。
+                    // 即便本次所有网卡都写失败, 下一次开机也能保留机器记录的优先级。
                     self.save(machine).map_err(|e| format!("{error}；{e}"))?;
                 }
                 return Err(error);
@@ -177,7 +177,7 @@ impl Journal {
                 source: source.to_owned(),
                 state: ImportState::Imported(old),
             });
-            // 即使复制成功后立即断电，开机助手也知道哪些网卡仍需恢复。
+            // 即使复制成功后立即断电, 开机助手也知道哪些网卡仍需恢复。
             self.save(machine)?;
         }
         fs::remove_file(source)
@@ -200,7 +200,7 @@ impl Journal {
                 Ok(()) => {
                     self.changes.remove(index);
                     if !self.changes.is_empty() {
-                        // 恢复一个协议就交还一个，后续写盘成功可补上先前失败的检查点。
+                        // 恢复一个协议就交还一个, 后续写盘成功可补上先前失败的检查点。
                         checkpoint_error = self.save(path).err();
                     }
                 }
@@ -339,7 +339,7 @@ impl DnsLease {
         if !always_flush && matches!(result, Ok(false)) {
             return Ok(());
         }
-        // SAFETY: dnsapi.dll 的无参数同步调用，刷新本机 DNS 客户端缓存。
+        // SAFETY: dnsapi.dll 的无参数同步调用, 刷新本机 DNS 客户端缓存。
         if unsafe { DnsFlushResolverCache() } != 0 {
             result.map(|_| ())
         } else {
@@ -364,7 +364,7 @@ impl DnsLease {
                     target,
                     previous: read(target)?,
                 });
-                // 第二个核心也会接管 DNS，但每张网卡只登记首次接管前的原值。
+                // 第二个核心也会接管 DNS, 但每张网卡只登记首次接管前的原值。
                 journal.save(&self.journal)?;
             }
             write(target, target.loopback())?;
@@ -397,7 +397,7 @@ impl DnsLease {
             errors.push(e);
             None
         });
-        // 便携助手可能仍在交还旧快照；无法独占时保留两份记录，避免并发恢复同一网卡。
+        // 便携助手可能仍在交还旧快照；无法独占时保留两份记录, 避免并发恢复同一网卡。
         let _legacy_session = legacy
             .as_deref()
             .map(lock_legacy_journal)
@@ -407,7 +407,7 @@ impl DnsLease {
             let old = if _legacy_session.is_some() {
                 Journal::load(&source)
             } else {
-                // 没有旧记录时不创建锁文件，也不在检查后重新读取可能刚出现的记录。
+                // 没有旧记录时不创建锁文件, 也不在检查后重新读取可能刚出现的记录。
                 Ok(None)
             };
             (source, old)
@@ -432,7 +432,7 @@ impl DnsLease {
             }
             Err(e) => {
                 errors.push(e);
-                // 保留损坏的机器记录，同时尽量就地恢复可读的便携记录。
+                // 保留损坏的机器记录, 同时尽量就地恢复可读的便携记录。
                 if let Some((source, old)) = legacy {
                     match old {
                         Ok(Some(old)) => {
@@ -534,7 +534,7 @@ fn read_static(target: Target) -> Result<String, String> {
         .options()
         .read()
         .open(target.registry_path())
-        .map_err(|e| format!("无法读取网卡，请检查网卡是否可用: {e}"))?;
+        .map_err(|e| format!("无法读取网卡, 请检查网卡是否可用: {e}"))?;
     match key.get_string("NameServer") {
         Ok(value) => Ok(value),
         // 未配置静态 DNS 的接口可能没有 NameServer 值。
@@ -563,7 +563,7 @@ fn set_static(target: Target, servers: &str) -> Result<(), u32> {
 
 fn write_error(status: u32) -> String {
     match status {
-        ERROR_ACCESS_DENIED => "Windows 拒绝设置网卡 DNS，请检查网卡权限或组织策略".into(),
+        ERROR_ACCESS_DENIED => "Windows 拒绝设置网卡 DNS, 请检查网卡权限或组织策略".into(),
         _ => format!("设置网卡 DNS 失败: {}", os_error(status)),
     }
 }
@@ -582,7 +582,7 @@ fn restore_existing(
     previous: &str,
     set: impl FnOnce() -> Result<(), u32>,
 ) -> Result<(), String> {
-    // 开机早期、禁用或暂时拔掉的网卡可能没有活动 IP 接口，但其持久设置仍在注册表。
+    // 开机早期、禁用或暂时拔掉的网卡可能没有活动 IP 接口, 但其持久设置仍在注册表。
     // 整个协议配置键都不存在时才把目标视为已移除。
     let key = match key {
         Ok(key) => key,
@@ -649,7 +649,7 @@ mod tests {
         assert_eq!(read(V4).unwrap(), "127.0.0.1");
         assert_eq!(read(V6).unwrap(), "::1");
 
-        // 已完成的协议不再重试，尚未恢复的协议覆盖期间的手动设置。
+        // 已完成的协议不再重试, 尚未恢复的协议覆盖期间的手动设置。
         let restarted = DnsLease::new(dir.path());
         write(V6, "2001:db8::9").unwrap();
         let failure = restarted.restore_with(|target, value| {
@@ -776,7 +776,7 @@ mod tests {
             ("\0\0", ""),
             ("192.0.2.1,192.0.2.2\0\0", "192.0.2.1,192.0.2.2"),
         ] {
-            // 使用与 Key::get_string 相同的 REG_SZ 转换，无需写入系统注册表。
+            // 使用与 Key::get_string 相同的 REG_SZ 转换, 无需写入系统注册表。
             let value = windows_registry::Value::from(text);
             assert!(value.as_wide().ends_with(&[0, 0]));
             let current = String::try_from(value).unwrap();
@@ -989,7 +989,7 @@ mod tests {
         let machine = tempfile::tempdir().unwrap();
         let lease = DnsLease::with_legacy(machine.path(), portable.path());
         let source = lease.legacy_source().unwrap().unwrap();
-        // 禁止按文件打开该位置，模拟旧目录不允许创建锁；没有旧记录就无需访问它。
+        // 禁止按文件打开该位置, 模拟旧目录不允许创建锁；没有旧记录就无需访问它。
         fs::create_dir(portable.path().join("dns-session.lock")).unwrap();
         Journal {
             changes: vec![SavedDns {
@@ -1023,7 +1023,7 @@ mod tests {
         lease
             .restore_with(|target, previous| {
                 if target == V4 {
-                    // 对无关的不存在路径做只读打开，取得 Windows 的“配置键不存在”错误。
+                    // 对无关的不存在路径做只读打开, 取得 Windows 的“配置键不存在”错误。
                     let path = format!(
                         r"Software\LadderTest\{}",
                         dir.path().file_name().unwrap().to_string_lossy()
@@ -1057,7 +1057,7 @@ mod tests {
             )
             .unwrap();
         }
-        // 允许读取，禁止删除，模拟旧记录被其他程序占用。
+        // 允许读取, 禁止删除, 模拟旧记录被其他程序占用。
         let held = fs::OpenOptions::new()
             .read(true)
             .share_mode(1)

@@ -15,7 +15,7 @@ use crate::runtime::Core;
 const FILE_LIMIT: u64 = 2 * 1024 * 1024;
 const RECENT_LIMIT: usize = 500;
 const RECORD_LIMIT: usize = 8 * 1024;
-const LIMIT_WARNING: &str = "本次运行日志已达 2 MiB 上限，后续日志仅在界面显示。";
+const LIMIT_WARNING: &str = "本次运行日志已达 2 MiB 上限, 后续日志仅在界面显示。";
 
 static LOG: OnceLock<Mutex<LogState>> = OnceLock::new();
 
@@ -29,7 +29,7 @@ pub(crate) fn log_level(line: &str) -> Option<LogLevel> {
     if line.starts_with("Failed to start:") {
         return Some(LogLevel::Error);
     }
-    // mihomo 的 logrus 文本格式以 time= 开头，级别是独立的 level= 字段。
+    // mihomo 的 logrus 文本格式以 time= 开头, 级别是独立的 level= 字段。
     if line.starts_with("time=") {
         let level = line
             .split_whitespace()
@@ -156,7 +156,7 @@ impl LogState {
             None => format!("I/O 类型 {:?}", error.kind()),
         };
         let message = format!(
-            "应用日志无法写入文件（{reason}）。本次仅在界面保留最近 500 条日志，请检查日志目录权限或磁盘空间后重启 Ladder。"
+            "应用日志无法写入文件 ({reason}) 。本次仅在界面保留最近 500 条日志, 请检查日志目录权限或磁盘空间后重启 Ladder。"
         );
         self.remember(format_record("WARN", "logging", message));
     }
@@ -224,13 +224,13 @@ pub(crate) fn install_panic_hook() {
                 "ERROR",
                 "panic",
                 format_args!(
-                    "线程发生异常：{}:{}:{}（异常内容不记录）",
+                    "线程发生异常: {}:{}:{} (异常内容不记录)",
                     location.file(),
                     location.line(),
                     location.column()
                 ),
             ),
-            None => format_record("ERROR", "panic", "线程发生异常（异常内容不记录）"),
+            None => format_record("ERROR", "panic", "线程发生异常 (异常内容不记录)"),
         };
         // 日志写入本身发生 panic 时不能再次等待相同的锁。
         if let Some(state) = LOG.get()
@@ -241,7 +241,7 @@ pub(crate) fn install_panic_hook() {
                 let _ = file.file.sync_data();
             }
         }
-        // 默认 hook 会输出可能包含配置和密钥的 panic payload，因此不转发。
+        // 默认 hook 会输出可能包含配置和密钥的 panic payload, 因此不转发。
     }));
 }
 
@@ -251,7 +251,7 @@ pub(crate) fn with_locked_log(f: impl FnOnce()) {
     f();
 }
 
-// Display 分段写入有界缓冲区，避免超长错误先分配完整字符串。
+// Display 分段写入有界缓冲区, 避免超长错误先分配完整字符串。
 struct Line {
     text: String,
     truncated: bool,
@@ -327,7 +327,7 @@ impl CappedFile {
         let bytes = line.len() as u64 + 1;
         let notice = format_record("WARN", "logging", LIMIT_WARNING);
         let reserved = notice.len() as u64 + 1;
-        // 将最后一条提示也计入上限，不留下半条普通记录。
+        // 将最后一条提示也计入上限, 不留下半条普通记录。
         if self.written + bytes + reserved > FILE_LIMIT {
             self.file.write_all(notice.as_bytes())?;
             self.file.write_all(b"\n")?;
@@ -549,7 +549,7 @@ mod tests {
             return;
         }
 
-        // 独立测试进程安装全局 hook，不改变并行用例的异常处理。
+        // 独立测试进程安装全局 hook, 不改变并行用例的异常处理。
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("app.log");
         let output = std::process::Command::new(std::env::current_exe().unwrap())
