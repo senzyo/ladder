@@ -29,4 +29,25 @@
 
 验证使用所选核心版本，单项或当前核心的全部配置均在后台串行检查。每项限时 30 秒、输出上限 64 KiB，所有验证进程归入独立 Windows Job。它不经过 Ladder 的核心启动、DNS 劫持或 TUN 清理流程。
 
-通过后显示“配置合法”；失败信息去除 ANSI 控制序列并沿用敏感日志过滤，再显示于配置下方及对应核心日志。核心原始输出不写入应用日志文件。配置或核心程序变化、切换版本后清除旧结果；取消时清理尚未完成的验证状态。
+通过后显示“配置合法”，仅表示所选核心的检查命令通过，不保证所有引用资源可用或实际运行成功。Ladder 沿用原生检查结果，不增加本地资源预检。失败信息去除 ANSI 控制序列并沿用敏感日志过滤，再显示于配置下方及对应核心日志。核心原始输出不写入应用日志文件。配置或核心程序变化、切换版本后清除旧结果；取消时清理尚未完成的验证状态。
+
+## 资源加载与运行诊断
+
+2026-11-17 的 AMD64 Windows 沙盒实测边界如下：
+
+| 核心版本 | 配置引用 | 原生行为 |
+| --- | --- | --- |
+| mihomo `1.19.34` | 缺失本地 rule provider | `-t` 仍通过；实际运行记录加载 `ERROR`，进程继续运行。影响取决于可用规则及后续规则，不能直接判定整份配置不可用。 |
+| Xray `26.11.9` | `geosite:cn` 或 `geoip:cn`，相应 `.dat` 文件缺失 | `run -test` 和 `run` 均退出 `23`，错误包含对应文件名。 |
+| sing-box `1.14.4` | 本地 source `.json` 或 binary `.srs` 规则集缺失 | `check` 和 `run` 均退出 `1`，错误包含对应文件名。 |
+| sing-box `1.14.4` | 旧 `geosite` / `geoip` 规则 | `check` 和 `run` 均退出 `1`，明确提示这些功能已在 `1.12.0` 移除；不是缺少旧数据库。 |
+
+Xray 的[规则解析](https://github.com/XTLS/Xray-core/blob/v26.11.9/common/geodata/rule_parser.go)将 `geosite:` / `geoip:` 映射到对应 `.dat` 并检查文件，[命令入口](https://github.com/XTLS/Xray-core/blob/v26.11.9/main/run.go)规定配置初始化失败时退出 `23`。sing-box 的[弃用说明](https://sing-box.sagernet.org/deprecated/#geoip)记录 GeoIP/Geosite 在 `1.8` 弃用、`1.12` 移除，应迁移到 rule-set；[本地规则集实现](https://github.com/SagerNet/sing-box/blob/v1.14.4/route/rule/rule_set_local.go)在初始化时读取 source 或 binary 文件并返回读取错误。
+
+mihomo `1.19.34` 的 [`-t` 分支](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/main.go#L175-L190)完成配置解析后返回，不进入运行时的 provider 初始化；解析仍会[检查引用的 provider 是否已声明](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/config/config.go#L1121-L1125)。运行时 [`loadProvider`](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/hub/executor/executor.go#L318-L352)仅记录初始化错误，[随后仍进入运行状态](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/hub/executor/executor.go#L115-L119)。因此加载成功不是这一启动路径的硬条件，但 `-t` 通过也不能说明配置不需要该 provider。
+
+本次 mihomo 配置为 `mode: rule`，声明了一个没有 `payload` 回退内容的 file/domain provider，规则依次为 `RULE-SET,local,DIRECT` 和 `MATCH,DIRECT`。源码中 provider [先创建空规则策略，也支持可选 payload 回退](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/rules/provider/provider.go#L125-L144)；[空 domain 规则集不匹配](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/rules/provider/domain_strategy.go#L26-L28)，[`RULE-SET` 委托该 provider 匹配](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/rules/provider/rule_set.go#L23-L35)，[未命中则继续后续规则](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/tunnel/tunnel.go#L663-L690)。据此推断，这份缺文件配置会落到 `MATCH,DIRECT`，仍可能正常直连；它不能验证 provider 中预期的分流已生效。本轮只实测了检查通过、加载错误和进程继续运行，没有实测该回退流量。其他配置若有可用缓存、payload 或不同后续规则，结果可能不同，不能把所有 provider 都称为启动必需资源。
+
+Xray 与 sing-box 的独立资源验收共 18 项全部通过，包含无需资源的基线、有效本地规则集及上述负例；证据位于本机忽略目录 `target/handoff-20261117/output/run-18.log` 和同目录 `resource-evidence/`。这些原生进程使用无入站、无 DNS/TUN 的隔离配置；正例运行只观察短时存活，不能据此宣称网络功能或 Ladder 界面已通过验收。mihomo 的检查与运行边界见[本轮验收记录](verification-2026-11-17.md)。
+
+从 `4fd63bb` 起，三核心运行期间的最近一条已识别错误会在脱敏后进入主界面，也保留在对应核心日志。核心自行退出时先排空 stdout/stderr，再保留最后的错误，包括启动后立即退出的情况；停止或开始新一轮运行时清除主界面诊断。每条输出限制为 8 KiB，敏感行隐藏后仍保留错误级别。此诊断与操作失败提示独立，不把原生错误全文写入 `app.log`；应用日志只记录概括原因。
