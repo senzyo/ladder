@@ -19,6 +19,45 @@ const LIMIT_WARNING: &str = "本次运行日志已达 2 MiB 上限，后续日�
 
 static LOG: OnceLock<Mutex<LogState>> = OnceLock::new();
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum LogLevel {
+    Warning,
+    Error,
+}
+
+pub(crate) fn log_level(line: &str) -> Option<LogLevel> {
+    if line.starts_with("Failed to start:") {
+        return Some(LogLevel::Error);
+    }
+    // mihomo 的 logrus 文本格式以 time= 开头，级别是独立的 level= 字段。
+    if line.starts_with("time=") {
+        let level = line
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("level="))?;
+        return match level {
+            "error" | "fatal" | "panic" => Some(LogLevel::Error),
+            "warning" | "warn" => Some(LogLevel::Warning),
+            _ => None,
+        };
+    }
+    let header = line.split_whitespace().find(|word| {
+        !word.bytes().all(|byte| {
+            byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'/' | b':' | b'.' | b'T' | b'Z')
+        })
+    })?;
+    let level = header
+        .trim_start_matches('[')
+        .split(['[', ']', ':'])
+        .next()?;
+    if level.eq_ignore_ascii_case("error") || level.eq_ignore_ascii_case("fatal") {
+        Some(LogLevel::Error)
+    } else if level.eq_ignore_ascii_case("warn") || level.eq_ignore_ascii_case("warning") {
+        Some(LogLevel::Warning)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LogSource {
     SingBox,
@@ -308,6 +347,49 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    #[test]
+    fn recognizes_application_and_core_levels_without_matching_message_text() {
+        for (line, expected) in [
+            (
+                "2026-11-17 10:20:30.123 [ERROR] [app] failed",
+                Some(LogLevel::Error),
+            ),
+            (
+                "2026/11/17 10:20:30 [Warning] core: warning",
+                Some(LogLevel::Warning),
+            ),
+            (
+                "+0800 2026-11-17 10:20:30 ERROR [123 0ms] failed",
+                Some(LogLevel::Error),
+            ),
+            ("WARN[0000] deprecated", Some(LogLevel::Warning)),
+            ("[Error] failed", Some(LogLevel::Error)),
+            (
+                "Failed to start: main: failed to load config files",
+                Some(LogLevel::Error),
+            ),
+            (
+                "time=\"2026-11-17T10:20:30Z\" level=error msg=\"failed\"",
+                Some(LogLevel::Error),
+            ),
+            (
+                "time=\"2026-11-17T10:20:30Z\" level=warning msg=\"warning\"",
+                Some(LogLevel::Warning),
+            ),
+            (
+                "2026-11-17T10:20:30Z [WARN] warning",
+                Some(LogLevel::Warning),
+            ),
+            ("2026-11-17 10:20:30 [INFO] [app] error count is zero", None),
+            ("INFO[0000] error count is zero", None),
+            ("INFO Failed to start: is a diagnostic prefix", None),
+            ("upstream reports Failed to start: text", None),
+            ("connection reports an error", None),
+            ("", None),
+        ] {
+            assert_eq!(log_level(line), expected, "{line}");
+        }
+    }
     #[test]
     fn reopening_replaces_previous_session_without_loading_history() {
         let root = tempfile::tempdir().unwrap();

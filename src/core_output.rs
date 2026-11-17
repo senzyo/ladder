@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::{logging, runtime::Core};
@@ -6,6 +7,13 @@ use crate::{logging, runtime::Core};
 pub(crate) struct CoreOutput {
     stdout: JoinHandle<Option<&'static str>>,
     stderr: JoinHandle<Option<&'static str>>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CoreDiagnostics {
+    pub(crate) reason: Option<&'static str>,
+    pub(crate) error: Option<String>,
 }
 
 impl CoreOutput {
@@ -14,14 +22,25 @@ impl CoreOutput {
         stdout: impl Read + Send + 'static,
         stderr: impl Read + Send + 'static,
     ) -> Self {
+        let error = Arc::new(Mutex::new(None));
+        let stdout_error = error.clone();
+        let stderr_error = error.clone();
         Self {
-            stdout: thread::spawn(move || capture_reason(core, "stdout", stdout)),
-            stderr: thread::spawn(move || capture_reason(core, "stderr", stderr)),
+            stdout: thread::spawn(move || capture_reason(core, "stdout", stdout, &stdout_error)),
+            stderr: thread::spawn(move || capture_reason(core, "stderr", stderr, &stderr_error)),
+            error,
         }
     }
 
+    pub(crate) fn error(&self) -> Option<String> {
+        self.error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     // 核心退出后等待两条管道读完, 再生成诊断。
-    pub(crate) fn finish(self) -> Option<&'static str> {
+    pub(crate) fn finish(self) -> CoreDiagnostics {
         let stdout = self
             .stdout
             .join()
@@ -30,12 +49,32 @@ impl CoreOutput {
             .stderr
             .join()
             .unwrap_or(Some("核心输出读取线程异常退出"));
-        stderr.or(stdout)
+        let error = self
+            .error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        CoreDiagnostics {
+            reason: stderr.or(stdout),
+            error,
+        }
     }
 }
 
-fn capture_reason(core: Core, stream: &'static str, pipe: impl Read) -> Option<&'static str> {
-    match read_output(pipe, |line| logging::record_core(core, line)) {
+fn capture_reason(
+    core: Core,
+    stream: &'static str,
+    pipe: impl Read,
+    output_error: &Mutex<Option<String>>,
+) -> Option<&'static str> {
+    match read_output(pipe, |line| {
+        if logging::log_level(&line) == Some(logging::LogLevel::Error) {
+            *output_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(line.clone());
+        }
+        logging::record_core(core, line);
+    }) {
         Ok(reason) => reason,
         Err(error) => {
             // IO 错误的自定义文本也可能来自核心，日志只记录系统代码和种类。
@@ -215,7 +254,11 @@ impl OutputLines {
             .filter(|ch| !ch.is_control())
             .collect();
         if self.hidden {
-            text = HIDDEN_LINE.into();
+            text = match logging::log_level(&text) {
+                Some(logging::LogLevel::Error) => format!("[ERROR] {HIDDEN_LINE}"),
+                Some(logging::LogLevel::Warning) => format!("[WARN] {HIDDEN_LINE}"),
+                None => HIDDEN_LINE.into(),
+            };
         } else if self.truncated || text.len() > LINE_LIMIT {
             let mut end = (LINE_LIMIT - 3).min(text.len());
             while !text.is_char_boundary(end) {
@@ -324,7 +367,8 @@ mod tests {
         let reason = read_output(Cursor::new(text), |line| lines.push(line)).unwrap();
         assert_eq!(reason, Some("当前核心不支持配置中的字段或类型"));
         assert_eq!(lines.first().unwrap(), "INFO ready");
-        assert!(lines[1..8].iter().all(|line| line == HIDDEN_LINE));
+        assert_eq!(lines[1], format!("[ERROR] {HIDDEN_LINE}"));
+        assert!(lines[2..8].iter().all(|line| line == HIDDEN_LINE));
         assert_eq!(lines.last().unwrap(), "INFO still running");
     }
 
@@ -366,7 +410,100 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         drop(writer);
-        assert_eq!(output.finish(), None);
+        assert_eq!(output.finish().reason, None);
+    }
+
+    #[test]
+    fn live_errors_are_bounded_redacted_and_independent_before_eof() {
+        use std::io::Write;
+        use std::time::Instant;
+
+        let (reader, mut writer) = io::pipe().unwrap();
+        let output = CoreOutput::capture(Core::Mihomo, reader, Cursor::new(b""));
+        let wait_error = |output: &CoreOutput, expected: &str| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(error) = output.error()
+                    && error.contains(expected)
+                {
+                    return error;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "live error was not available before EOF"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        writeln!(
+            writer,
+            "time=\"fixture\" level=error msg=\"bounded-live-error {}\"",
+            "界".repeat(LINE_LIMIT)
+        )
+        .unwrap();
+        let error = wait_error(&output, "bounded-live-error");
+        assert!(error.len() <= LINE_LIMIT && error.ends_with("..."));
+        writeln!(writer, "ERROR password=DO_NOT_EXPOSE_LIVE").unwrap();
+        let hidden = wait_error(&output, HIDDEN_LINE);
+        assert_eq!(hidden, format!("[ERROR] {HIDDEN_LINE}"));
+        let other = CoreOutput::capture(
+            Core::Xray,
+            Cursor::new(b"[Error] separate-live-error\n"),
+            Cursor::new(b""),
+        );
+        assert_eq!(
+            wait_error(&other, "separate-live-error"),
+            "[Error] separate-live-error"
+        );
+        assert_eq!(output.error(), Some(hidden));
+        assert_eq!(other.finish().reason, None);
+        drop(writer);
+        assert_eq!(output.finish().reason, None);
+        assert!(
+            !logging::recent_for(logging::LogSource::Mihomo)
+                .iter()
+                .any(|line| line.contains("DO_NOT_EXPOSE_LIVE"))
+        );
+        assert!(
+            !logging::recent()
+                .iter()
+                .any(|line| line.contains("bounded-live-error")
+                    || line.contains("separate-live-error")
+                    || line.contains("DO_NOT_EXPOSE_LIVE"))
+        );
+    }
+
+    #[test]
+    fn finished_diagnostics_include_final_unterminated_native_errors_safely() {
+        for (text, expected) in [
+            (
+                "Failed to start: main: cannot find the file",
+                "Failed to start: main: cannot find the file",
+            ),
+            (
+                "Failed to start: main: cannot find the file; password=EXIT_SECRET",
+                "[ERROR] [已隐藏敏感日志]",
+            ),
+        ] {
+            let output = CoreOutput::capture(
+                Core::Xray,
+                Cursor::new(b""),
+                Cursor::new(text.as_bytes().to_vec()),
+            );
+            let diagnostics = output.finish();
+            assert_eq!(diagnostics.reason, Some("核心找不到配置引用的资源文件"));
+            assert_eq!(diagnostics.error.as_deref(), Some(expected));
+        }
+        assert!(
+            !logging::recent()
+                .iter()
+                .any(|line| line.contains("Failed to start:") || line.contains("EXIT_SECRET"))
+        );
+        assert!(
+            !logging::recent_for(logging::LogSource::Xray)
+                .iter()
+                .any(|line| line.contains("EXIT_SECRET"))
+        );
     }
 
     #[test]
@@ -433,7 +570,7 @@ mod tests {
         assert!(receive.try_recv().is_err());
         gate.wait();
         assert_eq!(
-            receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+            receive.recv_timeout(Duration::from_secs(5)).unwrap().reason,
             Some("核心没有访问所需资源的权限")
         );
         finished.join().unwrap();
@@ -456,7 +593,7 @@ mod tests {
             io::ErrorKind::Other
         );
         assert_eq!(
-            capture_reason(Core::Xray, "stderr", FailingReader(true)),
+            capture_reason(Core::Xray, "stderr", FailingReader(true), &Mutex::new(None)),
             Some("读取核心输出失败，诊断可能不完整")
         );
         assert!(

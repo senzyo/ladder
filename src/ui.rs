@@ -731,6 +731,9 @@ impl MainWindow {
             .when_some(state.run_error.clone(), |el, message| {
                 el.child(error_message(message, colors))
             })
+            .when_some(state.output_error.clone(), |el, message| {
+                el.child(error_message(message, colors))
+            })
             .child(
                 div()
                     .flex_shrink_0()

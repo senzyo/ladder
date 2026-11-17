@@ -42,6 +42,27 @@ fn main() {
         eprintln!("access is denied: PRIVATE_FIXTURE_VALUE");
         process::exit(42);
     }
+    if config.contains("fixture_native_exit") {
+        let exe = env::current_exe().unwrap();
+        let label = exe.file_stem().unwrap().to_str().unwrap();
+        let prefix = match label {
+            "mihomo" => "time=\"fixture\" level=fatal msg=",
+            "xray" => "Failed to start: main:",
+            _ => "FATAL[0000]",
+        };
+        eprintln!("{prefix} fixture-native-exit-{label}: cannot find the file specified");
+        process::exit(42);
+    }
+    if config.contains("fixture_live_error") {
+        let exe = env::current_exe().unwrap();
+        let label = exe.file_stem().unwrap().to_str().unwrap();
+        let prefix = match label {
+            "mihomo" => "time=\"fixture\" level=error msg=",
+            "xray" => "[Error]",
+            _ => "ERROR[0000]",
+        };
+        eprintln!("{prefix} fixture-live-output-{label}: cannot find the file specified");
+    }
     if config.contains("fixture_tree") {
         let exe = env::current_exe().unwrap();
         let assets = exe.parent().unwrap().canonicalize().unwrap();

@@ -1,5 +1,8 @@
 use super::{Colors, FeedbackScope, MainWindow, TEXT_PRIMARY, control, panel, scroll_area};
-use crate::{desktop, logging, logging::LogSource};
+use crate::{
+    desktop, logging,
+    logging::{LogLevel, LogSource, log_level},
+};
 use gpui::{
     ClipboardItem, Context, Div, PathBuilder, Rgba, ScrollHandle, Stateful, canvas, div, point,
     prelude::*, px,
@@ -118,42 +121,6 @@ fn playback_icon(paused: bool, color: Rgba) -> impl IntoElement {
     )
     .size(px(16.))
     .flex_shrink_0()
-}
-
-#[derive(Debug, PartialEq)]
-enum LogLevel {
-    Warning,
-    Error,
-}
-
-fn log_level(line: &str) -> Option<LogLevel> {
-    // mihomo 的 logrus 文本格式以 time= 开头，级别是独立的 level= 字段。
-    if line.starts_with("time=") {
-        let level = line
-            .split_whitespace()
-            .find_map(|part| part.strip_prefix("level="))?;
-        return match level {
-            "error" | "fatal" | "panic" => Some(LogLevel::Error),
-            "warning" | "warn" => Some(LogLevel::Warning),
-            _ => None,
-        };
-    }
-    let header = line.split_whitespace().find(|word| {
-        !word.bytes().all(|byte| {
-            byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'/' | b':' | b'.' | b'T' | b'Z')
-        })
-    })?;
-    let level = header
-        .trim_start_matches('[')
-        .split(['[', ']', ':'])
-        .next()?;
-    if level.eq_ignore_ascii_case("error") || level.eq_ignore_ascii_case("fatal") {
-        Some(LogLevel::Error)
-    } else if level.eq_ignore_ascii_case("warn") || level.eq_ignore_ascii_case("warning") {
-        Some(LogLevel::Warning)
-    } else {
-        None
-    }
 }
 
 impl MainWindow {
@@ -293,48 +260,5 @@ impl MainWindow {
                     .flex_1(),
                 ),
             )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recognizes_application_and_core_levels_without_matching_message_text() {
-        for (line, expected) in [
-            (
-                "2026-11-17 10:20:30.123 [ERROR] [app] failed",
-                Some(LogLevel::Error),
-            ),
-            (
-                "2026/11/17 10:20:30 [Warning] core: warning",
-                Some(LogLevel::Warning),
-            ),
-            (
-                "+0800 2026-11-17 10:20:30 ERROR [123 0ms] failed",
-                Some(LogLevel::Error),
-            ),
-            ("WARN[0000] deprecated", Some(LogLevel::Warning)),
-            ("[Error] failed", Some(LogLevel::Error)),
-            (
-                "time=\"2026-11-17T10:20:30Z\" level=error msg=\"failed\"",
-                Some(LogLevel::Error),
-            ),
-            (
-                "time=\"2026-11-17T10:20:30Z\" level=warning msg=\"warning\"",
-                Some(LogLevel::Warning),
-            ),
-            (
-                "2026-11-17T10:20:30Z [WARN] warning",
-                Some(LogLevel::Warning),
-            ),
-            ("2026-11-17 10:20:30 [INFO] [app] error count is zero", None),
-            ("INFO[0000] error count is zero", None),
-            ("connection reports an error", None),
-            ("", None),
-        ] {
-            assert_eq!(log_level(line), expected, "{line}");
-        }
     }
 }

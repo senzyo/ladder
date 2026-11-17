@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::core_output::CoreDiagnostics;
 use crate::dns::DnsLease;
 use crate::logging;
 use crate::managed_child::{JobProcess, ManagedChild};
@@ -96,6 +97,7 @@ pub struct CoreState {
     pub running: bool,
     pub operation: Option<CoreOperation>,
     pub run_error: Option<String>,
+    pub output_error: Option<String>,
     pub scan_error: Option<String>,
     pub version: Option<String>,
     pub version_error: Option<String>,
@@ -1307,6 +1309,7 @@ impl Worker {
     }
 
     fn start(&mut self, core: Core, config: &Path) -> Result<(), String> {
+        self.state.lock().unwrap().core_mut(core).output_error = None;
         let exe = self.saved.executable(core, &self.root)?;
         let assets = exe.parent().expect("version executable has a parent");
         if !exe.is_file() {
@@ -1354,8 +1357,9 @@ impl Worker {
     }
 
     fn stop(&mut self, core: Core) -> Result<(), String> {
-        if self.children[core as usize].is_some() {
-            self.stop_process(core)?;
+        let running = self.children[core as usize].is_some();
+        self.stop_process(core)?;
+        if running {
             let _ = self.restore_dns();
             self.cleanup_tun();
         }
@@ -1391,20 +1395,26 @@ impl Worker {
         self.state.lock().unwrap().dns_recovery_busy = false;
     }
 
-    fn stop_process(&mut self, core: Core) -> Result<Option<&'static str>, String> {
+    fn stop_process(&mut self, core: Core) -> Result<CoreDiagnostics, String> {
         let owned = &mut self.children[core as usize];
         if let Some(child) = owned {
             child
                 .terminate()
                 .map_err(|e| format!("停止 {} 失败: {e}", core.label()))?;
         }
-        let reason = owned.take().and_then(|child| {
-            let reason = child.output.finish();
-            logging::info("core", format_args!("{} 托管进程树已停止", core.label()));
-            reason
-        });
-        self.state.lock().unwrap().core_mut(core).running = false;
-        Ok(reason)
+        let diagnostics = owned
+            .take()
+            .map(|child| {
+                let diagnostics = child.output.finish();
+                logging::info("core", format_args!("{} 托管进程树已停止", core.label()));
+                diagnostics
+            })
+            .unwrap_or_default();
+        let mut snapshot = self.state.lock().unwrap();
+        let state = snapshot.core_mut(core);
+        state.running = false;
+        state.output_error = None;
+        Ok(diagnostics)
     }
 
     fn cleanup_tun(&self) {
@@ -1462,7 +1472,10 @@ impl Worker {
             return;
         };
         match child.try_wait() {
-            Ok(None) => return,
+            Ok(None) => {
+                self.state.lock().unwrap().core_mut(core).output_error = child.output.error();
+                return;
+            }
             Err(e) => {
                 let message = format!("检查核心状态失败: {e}");
                 let mut snapshot = self.state.lock().unwrap();
@@ -1480,12 +1493,17 @@ impl Worker {
             let _ = self.restore_dns();
             self.cleanup_tun();
         }
-        let message = match result {
-            Ok(reason) => format!(
-                "核心已退出。{}",
-                reason.unwrap_or("请检查配置内容及核心所需的资源文件")
+        let (message, output_error) = match result {
+            Ok(diagnostics) => (
+                format!(
+                    "核心已退出。{}",
+                    diagnostics
+                        .reason
+                        .unwrap_or("请检查配置内容及核心所需的资源文件")
+                ),
+                diagnostics.error,
             ),
-            Err(e) => format!("核心已退出。{e}"),
+            Err(e) => (format!("核心已退出。{e}"), None),
         };
         let mut snapshot = self.state.lock().unwrap();
         let state = snapshot.core_mut(core);
@@ -1493,6 +1511,7 @@ impl Worker {
             logging::warn("core", format_args!("{} {message}", core.label()));
         }
         state.run_error = Some(message);
+        state.output_error = output_error;
     }
 }
 
@@ -1767,6 +1786,161 @@ mod tests {
         }
         saved.store(root).unwrap();
         guard
+    }
+
+    #[test]
+    fn live_core_errors_reach_snapshot_without_overwriting_actions_and_clear_on_new_runs() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let _process_test = lock_and_install_fixture_cores(root);
+        for core in Core::ALL {
+            fs::write(
+                core.config_dir(root).join("live-error.json"),
+                r#"{"fixture_live_error":true}"#,
+            )
+            .unwrap();
+        }
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        let wait_error = |core: Core| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let state = runtime.snapshot().core(core).clone();
+                assert!(state.running, "core must still be running: {state:?}");
+                if state.output_error.as_deref().is_some_and(|error| {
+                    error.contains(&format!("fixture-live-output-{}", core.label()))
+                }) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "live output did not reach snapshot: {state:?}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        for core in Core::ALL {
+            runtime
+                .send(Action::SwitchConfig(core, "live-error.json".into()))
+                .unwrap();
+            assert!(idle(&runtime, core).running);
+            wait_error(core);
+            assert!(runtime.snapshot().core(core).run_error.is_none());
+        }
+        for core in Core::ALL {
+            runtime
+                .send(Action::SwitchConfig(core, "missing.json".into()))
+                .unwrap();
+            let state = idle(&runtime, core);
+            assert!(state.running && state.run_error.is_some() && state.output_error.is_some());
+            wait_error(core);
+            assert!(runtime.snapshot().core(core).run_error.is_some());
+
+            fs::write(core.config_dir(root).join("live-error.json"), "{}").unwrap();
+            runtime.send(Action::Restart(core)).unwrap();
+            let state = idle(&runtime, core);
+            assert!(state.running && state.run_error.is_none() && state.output_error.is_none());
+            fs::write(
+                core.config_dir(root).join("again.json"),
+                r#"{"fixture_live_error":true}"#,
+            )
+            .unwrap();
+            runtime
+                .send(Action::SwitchConfig(core, "again.json".into()))
+                .unwrap();
+            assert!(idle(&runtime, core).running);
+            wait_error(core);
+            runtime
+                .send(Action::SwitchConfig(core, "日常.JSON".into()))
+                .unwrap();
+            let state = idle(&runtime, core);
+            assert!(state.running && state.output_error.is_none());
+            runtime
+                .send(Action::SwitchConfig(core, "again.json".into()))
+                .unwrap();
+            assert!(idle(&runtime, core).running);
+            wait_error(core);
+            runtime.send(Action::Stop(core)).unwrap();
+            let state = idle(&runtime, core);
+            assert!(!state.running && state.output_error.is_none());
+            for other in Core::ALL.into_iter().filter(|other| *other != core) {
+                let state = runtime.snapshot().core(other).clone();
+                if state.running {
+                    assert!(
+                        state
+                            .output_error
+                            .as_deref()
+                            .unwrap()
+                            .contains(&format!("fixture-live-output-{}", other.label()))
+                    );
+                }
+            }
+        }
+        runtime.shutdown().unwrap();
+        assert!(
+            !logging::recent()
+                .iter()
+                .any(|line| line.contains("fixture-live-output"))
+        );
+    }
+
+    #[test]
+    fn exited_core_errors_remain_visible_until_stop_or_new_run() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let _process_test = lock_and_install_fixture_cores(root);
+        let config = r#"{"fixture_native_exit":true}"#;
+        for core in Core::ALL {
+            fs::write(core.config_dir(root).join("native-exit.json"), config).unwrap();
+        }
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        for core in Core::ALL {
+            runtime
+                .send(Action::SwitchConfig(core, "native-exit.json".into()))
+                .unwrap();
+            let state = failed(&runtime, core);
+            assert!(state.run_error.as_deref().unwrap().contains("核心已退出"));
+            assert!(
+                state.output_error.as_deref().is_some_and(
+                    |error| error.contains(&format!("fixture-native-exit-{}", core.label()))
+                ),
+                "native exit diagnostic was lost: {state:?}"
+            );
+        }
+        for core in Core::ALL {
+            let peers = Core::ALL
+                .into_iter()
+                .filter(|other| *other != core)
+                .map(|other| (other, runtime.snapshot().core(other).output_error.clone()))
+                .collect::<Vec<_>>();
+            runtime.send(Action::Stop(core)).unwrap();
+            let state = idle(&runtime, core);
+            assert!(!state.running && state.output_error.is_none() && state.run_error.is_none());
+            runtime.send(Action::Start(core)).unwrap();
+            assert!(failed(&runtime, core).output_error.is_some());
+            fs::write(core.config_dir(root).join("native-exit.json"), "{}").unwrap();
+            runtime.send(Action::Restart(core)).unwrap();
+            let state = idle(&runtime, core);
+            assert!(state.running && state.output_error.is_none() && state.run_error.is_none());
+            fs::write(core.config_dir(root).join("native-exit.json"), config).unwrap();
+            runtime.send(Action::Restart(core)).unwrap();
+            assert!(failed(&runtime, core).output_error.is_some());
+            runtime
+                .send(Action::SwitchConfig(core, "日常.JSON".into()))
+                .unwrap();
+            let state = idle(&runtime, core);
+            assert!(state.running && state.output_error.is_none());
+            runtime.send(Action::Stop(core)).unwrap();
+            assert!(idle(&runtime, core).output_error.is_none());
+            for (other, expected) in peers {
+                assert_eq!(runtime.snapshot().core(other).output_error, expected);
+            }
+        }
+        runtime.shutdown().unwrap();
+        assert!(
+            !logging::recent()
+                .iter()
+                .any(|line| line.contains("fixture-native-exit"))
+        );
     }
 
     // 真实子进程验证 Windows 句柄归属、带空格的路径和启动失败, 不操作网络接口。
