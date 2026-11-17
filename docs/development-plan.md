@@ -13,7 +13,7 @@
 | `lib.rs`                                                       | 程序入口、单实例、托盘和更新退出流程                   |
 | `dns.rs` / `scheduler.rs` / `emergency.rs` / `panic_helper.rs` | DNS 快照及正常/开机/panic 恢复                         |
 | `tun_config.rs` / `tun_cleanup.rs`                             | TUN 运行副本和受保护的残留清理                         |
-| `logging.rs` / `core_output.rs`                                | 有界日志、核心输出和敏感字段过滤                       |
+| `logging.rs` / `core_output.rs`                                | 有界日志、核心输出与终端控制序列清理                   |
 
 ## 构建环境
 

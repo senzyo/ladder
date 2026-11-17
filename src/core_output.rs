@@ -75,7 +75,7 @@ fn capture_reason(
         }
         logging::record_core(core, line);
     }) {
-        Ok(reason) => reason,
+        Ok(()) => None,
         Err(error) => {
             // IO 错误的自定义文本也可能来自核心，日志只记录系统代码和种类。
             logging::warn(
@@ -92,14 +92,9 @@ fn capture_reason(
     }
 }
 
-fn read_output(
-    mut pipe: impl Read,
-    mut on_line: impl FnMut(String),
-) -> io::Result<Option<&'static str>> {
+fn read_output(mut pipe: impl Read, mut on_line: impl FnMut(String)) -> io::Result<()> {
     let mut buffer = [0; 4096];
-    let mut pending = Vec::with_capacity(buffer.len() + 32);
     let mut lines = OutputLines::default();
-    let mut reason = None;
     loop {
         let size = match pipe.read(&mut buffer) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -112,40 +107,13 @@ fn read_output(
         if size == 0 {
             break;
         }
-        pending.extend_from_slice(&buffer[..size]);
-        let text = String::from_utf8_lossy(&pending).to_ascii_lowercase();
-        let matched = if text.contains("address already in use") || text.contains("only one usage")
-        {
-            Some("监听端口或地址已被占用")
-        } else if text.contains("access is denied") || text.contains("permission denied") {
-            Some("核心没有访问所需资源的权限")
-        } else if text.contains("unknown field")
-            || text.contains("unsupported")
-            || text.contains("unknown type")
-            || text.contains("unknown inbound")
-            || text.contains("unknown outbound")
-            || text.contains("unknown config id")
-        {
-            Some("当前核心不支持配置中的字段或类型")
-        } else if text.contains("cannot find the file") || text.contains("no such file") {
-            Some("核心找不到配置引用的资源文件")
-        } else {
-            None
-        };
-        reason = matched.or(reason);
         lines.push(&buffer[..size], &mut on_line);
-        // 诊断只保留跨次读取所需的尾部，显示用的行缓冲单独限长。
-        let keep = pending.len().min(32);
-        let start = pending.len() - keep;
-        pending.copy_within(start.., 0);
-        pending.truncate(keep);
     }
     lines.finish(&mut on_line);
-    Ok(reason)
+    Ok(())
 }
 
 const LINE_LIMIT: usize = 8 * 1024;
-const HIDDEN_LINE: &str = "[已隐藏敏感日志]";
 
 pub(crate) fn sanitized_output(bytes: &[u8]) -> String {
     let mut output = Vec::new();
@@ -168,11 +136,8 @@ enum Escape {
 #[derive(Default)]
 struct OutputLines {
     line: Vec<u8>,
-    redaction: Vec<u8>,
     truncated: bool,
     escape: Escape,
-    private_key: bool,
-    hidden: bool,
 }
 
 impl OutputLines {
@@ -193,12 +158,6 @@ impl OutputLines {
                             self.line.push(byte);
                         } else {
                             self.truncated = true;
-                        }
-                        self.redaction.push(byte);
-                        if self.redaction.len() == LINE_LIMIT {
-                            self.scan_redaction();
-                            // 保留跨缓冲区的凭据和 PEM 标记；显示截断后仍继续扫描。
-                            self.redaction.drain(..LINE_LIMIT - 64);
                         }
                     }
                 },
@@ -230,36 +189,15 @@ impl OutputLines {
         }
     }
 
-    fn scan_redaction(&mut self) {
-        let lower: String = String::from_utf8_lossy(&self.redaction)
-            .chars()
-            .filter(|ch| !ch.is_control())
-            .flat_map(char::to_lowercase)
-            .collect();
-        let begins_key = lower.contains("-----begin ") && lower.contains("private key-----");
-        self.hidden |= self.private_key || begins_key || sensitive_line(&lower);
-        self.private_key |= begins_key;
-        if lower.contains("-----end ") && lower.contains("private key-----") {
-            self.private_key = false;
-        }
-    }
-
     fn finish(&mut self, on_line: &mut impl FnMut(String)) {
         if self.line.is_empty() && !self.truncated {
             return;
         }
-        self.scan_redaction();
         let mut text: String = String::from_utf8_lossy(&self.line)
             .chars()
             .filter(|ch| !ch.is_control())
             .collect();
-        if self.hidden {
-            text = match logging::log_level(&text) {
-                Some(logging::LogLevel::Error) => format!("[ERROR] {HIDDEN_LINE}"),
-                Some(logging::LogLevel::Warning) => format!("[WARN] {HIDDEN_LINE}"),
-                None => HIDDEN_LINE.into(),
-            };
-        } else if self.truncated || text.len() > LINE_LIMIT {
+        if self.truncated || text.len() > LINE_LIMIT {
             let mut end = (LINE_LIMIT - 3).min(text.len());
             while !text.is_char_boundary(end) {
                 end -= 1;
@@ -271,47 +209,8 @@ impl OutputLines {
             on_line(text);
         }
         self.line.clear();
-        self.redaction.clear();
         self.truncated = false;
-        self.hidden = false;
     }
-}
-
-// 保守隐藏明确的凭据标记；不将核心文本送入应用诊断或磁盘日志。
-fn sensitive_line(lower: &str) -> bool {
-    [
-        "password",
-        "passwd",
-        "token",
-        "secret",
-        "privatekey",
-        "private_key",
-        "private key",
-        "api_key",
-        "api-key",
-        "apikey",
-        "authorization",
-        "bearer ",
-        "uuid",
-        "密码",
-        "密钥",
-        "令牌",
-        "ss://",
-        "ssr://",
-        "vmess://",
-        "vless://",
-        "trojan://",
-        "hysteria2://",
-        "hy2://",
-        "tuic://",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-        || lower.split("://").skip(1).any(|rest| {
-            rest.split(['/', '?', '#', ' ', '\t', '"', '\''])
-                .next()
-                .is_some_and(|authority| authority.contains('@'))
-        })
 }
 
 #[cfg(test)]
@@ -328,7 +227,7 @@ mod tests {
             let pipe = Cursor::new(&text.as_bytes()[..split])
                 .chain(Cursor::new(&text.as_bytes()[split..]));
             let mut lines = Vec::new();
-            assert_eq!(read_output(pipe, |line| lines.push(line)).unwrap(), None);
+            read_output(pipe, |line| lines.push(line)).unwrap();
             assert_eq!(
                 lines,
                 ["ERROR 中文🪜", "link", "last line"],
@@ -338,11 +237,10 @@ mod tests {
     }
 
     #[test]
-    fn long_lines_are_bounded_and_diagnostics_survive_truncation() {
+    fn long_lines_are_bounded_without_splitting_utf8() {
         let text = format!("{} unsupported\nnext\n", "界".repeat(LINE_LIMIT));
         let mut lines = Vec::new();
-        let reason = read_output(Cursor::new(text), |line| lines.push(line)).unwrap();
-        assert_eq!(reason, Some("当前核心不支持配置中的字段或类型"));
+        read_output(Cursor::new(text), |line| lines.push(line)).unwrap();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].len() <= LINE_LIMIT);
         assert!(lines[0].ends_with("..."));
@@ -351,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_credentials_and_multiline_private_keys_are_hidden() {
+    fn credential_markers_and_multiline_text_are_preserved() {
         let text = concat!(
             "INFO ready\n",
             "ERROR unsupported Password=fixture-value\n",
@@ -364,16 +262,13 @@ mod tests {
             "INFO still running\n",
         );
         let mut lines = Vec::new();
-        let reason = read_output(Cursor::new(text), |line| lines.push(line)).unwrap();
-        assert_eq!(reason, Some("当前核心不支持配置中的字段或类型"));
-        assert_eq!(lines.first().unwrap(), "INFO ready");
-        assert_eq!(lines[1], format!("[ERROR] {HIDDEN_LINE}"));
-        assert!(lines[2..8].iter().all(|line| line == HIDDEN_LINE));
-        assert_eq!(lines.last().unwrap(), "INFO still running");
+        read_output(Cursor::new(text), |line| lines.push(line)).unwrap();
+        assert_eq!(lines, text.lines().collect::<Vec<_>>());
+        assert_eq!(sanitized_output(text.as_bytes()), text.trim_end());
     }
 
     #[test]
-    fn private_key_markers_survive_line_truncation_and_scan_boundaries() {
+    fn truncated_credential_markers_do_not_change_following_lines() {
         for offset in [LINE_LIMIT - 8, LINE_LIMIT, LINE_LIMIT * 2] {
             let padding = "x".repeat(offset);
             let text = format!(
@@ -382,11 +277,11 @@ mod tests {
             );
             let mut lines = Vec::new();
             read_output(Cursor::new(text), |line| lines.push(line)).unwrap();
-            assert_eq!(
-                lines,
-                [HIDDEN_LINE, HIDDEN_LINE, HIDDEN_LINE, "INFO still running"],
-                "marker offset {offset}"
-            );
+            assert_eq!(lines.len(), 4, "marker offset {offset}");
+            assert!(lines[0].len() <= LINE_LIMIT && lines[0].ends_with("..."));
+            assert_eq!(lines[1], "QUJDREVGRw==");
+            assert!(lines[2].len() <= LINE_LIMIT && lines[2].ends_with("..."));
+            assert_eq!(lines[3], "INFO still running");
         }
     }
 
@@ -414,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn live_errors_are_bounded_redacted_and_independent_before_eof() {
+    fn live_errors_are_bounded_preserved_and_independent_before_eof() {
         use std::io::Write;
         use std::time::Instant;
 
@@ -443,9 +338,9 @@ mod tests {
         .unwrap();
         let error = wait_error(&output, "bounded-live-error");
         assert!(error.len() <= LINE_LIMIT && error.ends_with("..."));
-        writeln!(writer, "ERROR password=DO_NOT_EXPOSE_LIVE").unwrap();
-        let hidden = wait_error(&output, HIDDEN_LINE);
-        assert_eq!(hidden, format!("[ERROR] {HIDDEN_LINE}"));
+        writeln!(writer, "ERROR password=LIVE_FIXTURE_VALUE").unwrap();
+        let original = wait_error(&output, "LIVE_FIXTURE_VALUE");
+        assert_eq!(original, "ERROR password=LIVE_FIXTURE_VALUE");
         let other = CoreOutput::capture(
             Core::Xray,
             Cursor::new(b"[Error] separate-live-error\n"),
@@ -455,35 +350,29 @@ mod tests {
             wait_error(&other, "separate-live-error"),
             "[Error] separate-live-error"
         );
-        assert_eq!(output.error(), Some(hidden));
+        assert_eq!(output.error(), Some(original));
         assert_eq!(other.finish().reason, None);
         drop(writer);
         assert_eq!(output.finish().reason, None);
         assert!(
-            !logging::recent_for(logging::LogSource::Mihomo)
+            logging::recent_for(logging::LogSource::Mihomo)
                 .iter()
-                .any(|line| line.contains("DO_NOT_EXPOSE_LIVE"))
+                .any(|line| line == "ERROR password=LIVE_FIXTURE_VALUE")
         );
         assert!(
             !logging::recent()
                 .iter()
                 .any(|line| line.contains("bounded-live-error")
                     || line.contains("separate-live-error")
-                    || line.contains("DO_NOT_EXPOSE_LIVE"))
+                    || line.contains("LIVE_FIXTURE_VALUE"))
         );
     }
 
     #[test]
-    fn finished_diagnostics_include_final_unterminated_native_errors_safely() {
-        for (text, expected) in [
-            (
-                "Failed to start: main: cannot find the file",
-                "Failed to start: main: cannot find the file",
-            ),
-            (
-                "Failed to start: main: cannot find the file; password=EXIT_SECRET",
-                "[ERROR] [已隐藏敏感日志]",
-            ),
+    fn finished_diagnostics_preserve_final_unterminated_native_errors() {
+        for text in [
+            "Failed to start: main: cannot find the file",
+            "Failed to start: main: cannot find the file; password=EXIT_FIXTURE_VALUE",
         ] {
             let output = CoreOutput::capture(
                 Core::Xray,
@@ -491,23 +380,23 @@ mod tests {
                 Cursor::new(text.as_bytes().to_vec()),
             );
             let diagnostics = output.finish();
-            assert_eq!(diagnostics.reason, Some("核心找不到配置引用的资源文件"));
-            assert_eq!(diagnostics.error.as_deref(), Some(expected));
+            assert_eq!(diagnostics.reason, None);
+            assert_eq!(diagnostics.error.as_deref(), Some(text));
         }
         assert!(
-            !logging::recent()
-                .iter()
-                .any(|line| line.contains("Failed to start:") || line.contains("EXIT_SECRET"))
+            !logging::recent().iter().any(
+                |line| line.contains("Failed to start:") || line.contains("EXIT_FIXTURE_VALUE")
+            )
         );
         assert!(
-            !logging::recent_for(logging::LogSource::Xray)
+            logging::recent_for(logging::LogSource::Xray)
                 .iter()
-                .any(|line| line.contains("EXIT_SECRET"))
+                .any(|line| line.contains("EXIT_FIXTURE_VALUE"))
         );
     }
 
     #[test]
-    fn classifies_errors_split_at_every_byte() {
+    fn preserves_native_errors_split_at_every_byte() {
         for phrase in [
             "address already in use",
             "only one usage",
@@ -522,24 +411,19 @@ mod tests {
             "cannot find the file",
             "no such file",
         ] {
-            let expected = read_output(Cursor::new(phrase.as_bytes()), |_| {}).unwrap();
-            assert!(expected.is_some());
             for split in 1..phrase.len() {
                 let pipe = Cursor::new(&phrase.as_bytes()[..split])
                     .chain(Cursor::new(&phrase.as_bytes()[split..]));
-                assert_eq!(
-                    read_output(pipe, |_| {}).unwrap(),
-                    expected,
-                    "split {split} of {phrase}"
-                );
+                let mut lines = Vec::new();
+                read_output(pipe, |line| lines.push(line)).unwrap();
+                assert_eq!(lines, [phrase], "split {split} of {phrase}");
             }
         }
         let mut text = vec![b'x'; 4090];
         text.extend_from_slice(b"ACCESS IS DENIED: PRIVATE_FIXTURE_VALUE");
-        assert_eq!(
-            read_output(Cursor::new(text), |_| {}).unwrap(),
-            Some("核心没有访问所需资源的权限")
-        );
+        let mut lines = Vec::new();
+        read_output(Cursor::new(&text), |line| lines.push(line)).unwrap();
+        assert_eq!(lines, [String::from_utf8(text).unwrap()]);
     }
 
     #[test]
@@ -562,16 +446,18 @@ mod tests {
             Cursor::new(b"unknown field"),
             DelayedReader {
                 gate: Some(gate.clone()),
-                text: Cursor::new(b"access is denied: PRIVATE_FIXTURE_VALUE"),
+                text: Cursor::new(b"ERROR access is denied: PRIVATE_FIXTURE_VALUE"),
             },
         );
         let (send, receive) = mpsc::channel();
         let finished = thread::spawn(move || send.send(output.finish()).unwrap());
         assert!(receive.try_recv().is_err());
         gate.wait();
+        let diagnostics = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(diagnostics.reason, None);
         assert_eq!(
-            receive.recv_timeout(Duration::from_secs(5)).unwrap().reason,
-            Some("核心没有访问所需资源的权限")
+            diagnostics.error.as_deref(),
+            Some("ERROR access is denied: PRIVATE_FIXTURE_VALUE")
         );
         finished.join().unwrap();
     }

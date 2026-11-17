@@ -1,4 +1,4 @@
-//! 应用诊断只落盘安全摘要；经过显示过滤的核心日志仅保存在各自的内存队列。
+//! 应用诊断只落盘安全摘要；核心日志清理终端控制序列后仅保存在各自的内存队列。
 
 use std::collections::VecDeque;
 use std::fmt::{self, Display, Write as _};

@@ -1480,12 +1480,10 @@ impl Worker {
         }
         let (message, output_error) = match result {
             Ok(diagnostics) => (
-                format!(
-                    "核心已退出。{}",
-                    diagnostics
-                        .reason
-                        .unwrap_or("请检查配置内容及核心所需的资源文件")
-                ),
+                match diagnostics.reason {
+                    Some(reason) => format!("核心已退出。{reason}"),
+                    None => "核心已退出".into(),
+                },
                 diagnostics.error,
             ),
             Err(e) => (format!("核心已退出。{e}"), None),
@@ -1552,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_command_returns_details_with_credentials_redacted() {
+    fn validation_command_preserves_details_without_terminal_escapes() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("validation-fixture.rs");
         let exe = root.path().join("ladder-validation-fixture.exe");
@@ -1564,7 +1562,7 @@ mod tests {
             let content = std::fs::read_to_string(args.last().unwrap()).unwrap();
             if content == "invalid" {
                 eprintln!("\x1b[31mERROR unknown field: broken\x1b[0m");
-                eprintln!("password=DO_NOT_EXPOSE");
+                eprintln!("password=fixture-value");
                 std::process::exit(42);
             }
         }"#,
@@ -1588,11 +1586,7 @@ mod tests {
             fs::write(&config, "invalid").unwrap();
             let error = validate_config(core, &exe, root.path(), &config, &AtomicBool::new(false))
                 .unwrap_err();
-            assert!(error.contains("unknown field: broken"));
-            assert!(error.contains("已隐藏敏感日志"));
-            assert!(!error.contains("DO_NOT_EXPOSE"));
-            assert!(!error.contains("42"));
-            assert!(!error.contains('\x1b'));
+            assert_eq!(error, "ERROR unknown field: broken\npassword=fixture-value");
         }
         assert_eq!(
             validate_config(
@@ -1883,7 +1877,7 @@ mod tests {
                 .send(Action::SwitchConfig(core, "native-exit.json".into()))
                 .unwrap();
             let state = failed(&runtime, core);
-            assert!(state.run_error.as_deref().unwrap().contains("核心已退出"));
+            assert_eq!(state.run_error.as_deref(), Some("核心已退出"));
             assert!(
                 state.output_error.as_deref().is_some_and(
                     |error| error.contains(&format!("fixture-native-exit-{}", core.label()))
@@ -2009,22 +2003,15 @@ mod tests {
             Some("失败.json")
         );
         let error = stopped.run_error.unwrap();
-        assert!(!error.contains("exit code"));
-        assert!(error.contains("核心没有访问所需资源的权限"));
-        assert!(!error.contains("PRIVATE_FIXTURE_VALUE"));
+        assert_eq!(error, "核心已退出");
         let logs = logging::recent().join("\n");
-        assert!(logs.contains("核心没有访问所需资源的权限"));
+        assert!(logs.contains("sing-box 核心已退出"));
         assert!(!logs.contains("PRIVATE_FIXTURE_VALUE"));
         assert!(runtime.snapshot().xray.running);
         runtime.send(Action::Start(Core::SingBox)).unwrap();
         let retry = failed(&runtime, Core::SingBox);
         assert_eq!(retry.current.as_deref(), Some("失败.json"));
-        assert!(
-            retry
-                .run_error
-                .unwrap()
-                .contains("核心没有访问所需资源的权限")
-        );
+        assert_eq!(retry.run_error.as_deref(), Some("核心已退出"));
         runtime
             .send(Action::Set(Setting::AutoSingBox, true))
             .unwrap();
@@ -2074,12 +2061,7 @@ mod tests {
         let reopened = Runtime::open(root.to_owned()).unwrap();
         let restarted = failed(&reopened, Core::SingBox);
         assert_eq!(restarted.current.as_deref(), Some("失败.json"));
-        assert!(
-            restarted
-                .run_error
-                .unwrap()
-                .contains("核心没有访问所需资源的权限")
-        );
+        assert_eq!(restarted.run_error.as_deref(), Some("核心已退出"));
         assert!(!reopened.snapshot().xray.running);
         assert!(reopened.snapshot().settings.minimize_to_tray);
         reopened.shutdown().unwrap();
@@ -2150,8 +2132,7 @@ mod tests {
             let state = failed(&runtime, core);
             assert_eq!(state.current.as_deref(), Some("失败.yml"));
             let error = state.run_error.unwrap();
-            assert!(error.contains("核心没有访问所需资源的权限"));
-            assert!(!error.contains("PRIVATE_FIXTURE_VALUE"));
+            assert_eq!(error, "核心已退出");
             assert_eq!(
                 Saved::load(root).unwrap().current(core).as_deref(),
                 Some("失败.yml")
