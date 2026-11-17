@@ -31,16 +31,20 @@ Debug GPUI 从构建机的 Cargo 源码目录读取着色器, 复制到其他机
 
 不要在运行 VPN/核心的主机直接执行完整测试或真实 Ladder。启动真实程序可能恢复 DNS、注册开机恢复任务或清理 TUN；部分旧测试创建 `sing-box.exe` / `xray.exe` 同名模拟进程, 可能被同时运行的 ladder-main 识别。完整进程与系统集成测试放到独立 Windows 沙盒或 GitHub Actions 临时 runner。
 
-以下集合使用纯解析、临时文件、模拟 DNS 或本机回环 HTTP, 不启动真实核心, 不更改主机 DNS/TUN:
+以下集合使用纯解析、临时文件、模拟 DNS 或本机回环 HTTP, 不启动真实核心, 不更改主机 DNS/TUN。离线 DNS 恢复测试只在事务中创建临时 HKCU 键, 结束时自动回滚:
 
 ```powershell
 cargo test --locked --lib -- --skip runtime::tests --skip scheduler::tests --skip update::tests::version_commands --skip update::tests::successful_version_commands --skip update::tests::version_process --skip update::tests::official
 cargo test --locked --lib mihomo_config_extensions
 cargo test --locked --lib validation_command
 cargo test --locked --lib validation_failures_for_locked_configs
+cargo test --locked --lib app_update_preparation_recovers_after_dns_failure_and_cancellation
+cargo test --locked --lib scheduler::tests::boot_leaves_an_active_session_alone_and_retries_after_exit -- --exact
 ```
 
-验证命令测试只创建唯一名称的 `ladder-validation-fixture.exe`。软件更新助手测试只运行临时无害程序, 验证替换、重启、回滚、取消和设置保留:
+上面列出的验证命令测试只创建唯一名称的 `ladder-validation-fixture.exe`。`validation_requests_complete_and_reject_duplicates` 和 `validation_results_are_discarded_after_inputs_change` 则通过真实请求入口启动模拟核心, 随完整测试在隔离环境执行。模拟核心每个测试进程只编译一次, 各用例复制到独立临时目录。
+
+软件更新助手测试只运行临时无害程序, 验证替换、重启、回滚、取消和设置保留:
 
 ```powershell
 ./scripts/test-release.ps1 -Executable ./target/debug/ladder.exe

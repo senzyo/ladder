@@ -28,6 +28,24 @@ fn main() {
         return;
     }
     let config = fs::read_to_string(&file).unwrap();
+    if env::args().any(|arg| matches!(arg.as_str(), "check" | "-test" | "-t")) {
+        if config.contains("fixture_validation_wait") {
+            fs::write(file.with_extension("started"), process::id().to_string()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !file.with_extension("continue").is_file() {
+                assert!(
+                    Instant::now() < deadline,
+                    "validation fixture was not released"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if config.contains("fixture_failure") {
+            eprintln!("fixture configuration rejected");
+            process::exit(42);
+        }
+        return;
+    }
     if config.contains("fixture_tun") {
         let exe = env::current_exe().unwrap();
         let root = file.ancestors().nth(3).unwrap();

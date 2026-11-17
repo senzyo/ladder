@@ -36,6 +36,11 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test --locked --lib
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Verify package and update helper before merge
+        run: |
+          cargo build --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./scripts/test-release.ps1 -Executable ./target/debug/ladder.exe
 
   package:
     needs: check

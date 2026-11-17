@@ -149,33 +149,49 @@ pub struct PreparedAppUpdate {
 pub fn download(
     release: &AppRelease,
     prefix: &str,
-    mut progress: impl FnMut(UpdateProgress),
+    progress: impl FnMut(UpdateProgress),
 ) -> Result<PreparedAppUpdate, String> {
     let target = std::env::current_exe().map_err(|_| "无法定位软件程序")?;
+    let url = crate::github::url(prefix, &release.url)?;
+    download_to(
+        release,
+        target,
+        || {
+            let response = ureq::get(&url)
+                .config()
+                .https_only(true)
+                .timeout_resolve(Some(TIMEOUT))
+                .timeout_connect(Some(TIMEOUT))
+                .timeout_send_request(Some(TIMEOUT))
+                .timeout_recv_response(Some(TIMEOUT))
+                .timeout_per_read(Some(TIMEOUT))
+                .timeout_recv_body(None)
+                .build()
+                .header("User-Agent", USER_AGENT)
+                .call()
+                .map_err(network_error)?;
+            Ok(response.into_body().into_reader())
+        },
+        progress,
+    )
+}
+
+fn download_to<R: Read>(
+    release: &AppRelease,
+    target: PathBuf,
+    open: impl FnOnce() -> Result<R, String>,
+    mut progress: impl FnMut(UpdateProgress),
+) -> Result<PreparedAppUpdate, String> {
     let root = target.parent().ok_or("无法定位程序目录")?;
     let stage = tempfile::Builder::new()
         .prefix(".ladder-app-update-")
         .tempdir_in(root)
         .map_err(|_| "无法创建软件更新目录, 请检查程序目录权限")?;
-    let url = crate::github::url(prefix, &release.url)?;
     progress(UpdateProgress::Downloading {
         received: 0,
         total: release.size,
     });
-    let response = ureq::get(&url)
-        .config()
-        .https_only(true)
-        .timeout_resolve(Some(TIMEOUT))
-        .timeout_connect(Some(TIMEOUT))
-        .timeout_send_request(Some(TIMEOUT))
-        .timeout_recv_response(Some(TIMEOUT))
-        .timeout_per_read(Some(TIMEOUT))
-        .timeout_recv_body(None)
-        .build()
-        .header("User-Agent", USER_AGENT)
-        .call()
-        .map_err(network_error)?;
-    let mut reader = response.into_body().into_reader();
+    let mut reader = open()?;
     let archive_path = stage.path().join("release.zip");
     let mut archive_file = File::create(&archive_path).map_err(|_| "无法保存软件安装包")?;
     let mut hasher = Sha256::new();
@@ -415,8 +431,14 @@ impl PreparedAppUpdate {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::io::Cursor;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
     use zip::write::SimpleFileOptions;
 
     fn release(version: &str) -> serde_json::Value {
@@ -424,6 +446,124 @@ mod tests {
         serde_json::json!({ "tag_name": format!("v{version}"), "draft": false, "prerelease": false,
             "assets": [{ "name": name, "browser_download_url": format!("https://github.com/{REPOSITORY}/releases/download/v{version}/{name}"),
                 "size": 4096, "digest": format!("sha256:{}", "a".repeat(64)) }] })
+    }
+
+    fn package() -> (AppRelease, Vec<u8>, Vec<u8>) {
+        let mut executable = vec![0; 152];
+        executable[..2].copy_from_slice(b"MZ");
+        executable[60..64].copy_from_slice(&64u32.to_le_bytes());
+        executable[64..68].copy_from_slice(b"PE\0\0");
+        let machine: u16 = if cfg!(target_arch = "aarch64") {
+            0xaa64
+        } else {
+            0x8664
+        };
+        executable[68..70].copy_from_slice(&machine.to_le_bytes());
+        executable[84..86].copy_from_slice(&64u16.to_le_bytes());
+        executable[88..90].copy_from_slice(&0x20bu16.to_le_bytes());
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, contents) in [
+            ("ladder.exe", executable.as_slice()),
+            ("README.md", b"test documentation".as_slice()),
+            ("LICENSE", b"test license".as_slice()),
+        ] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(contents).unwrap();
+        }
+        let archive = zip.finish().unwrap().into_inner();
+        let release = AppRelease {
+            version: "4.0.0".into(),
+            url: "https://github.com/senzyo/ladder/releases/download/v4.0.0/test.zip".into(),
+            size: archive.len() as u64,
+            sha256: Sha256::digest(&archive).into(),
+        };
+        (release, archive, executable)
+    }
+
+    pub(crate) fn prepared_update() -> (TempDir, AppRelease, PreparedAppUpdate) {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("ladder.exe");
+        fs::write(&target, b"old program").unwrap();
+        let (release, archive, _) = package();
+        let prepared = download_to(&release, target, || Ok(archive.as_slice()), |_| {}).unwrap();
+        (root, release, prepared)
+    }
+
+    #[test]
+    fn downloads_verify_and_stage_the_program_without_replacing_the_current_one() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("ladder.exe");
+        fs::write(&target, b"old program").unwrap();
+        let (release, archive, executable) = package();
+        let mut progress = Vec::new();
+        let prepared = download_to(
+            &release,
+            target.clone(),
+            || Ok(archive.as_slice()),
+            |value| progress.push(value),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"old program");
+        assert_eq!(prepared.target, target);
+        assert_eq!(prepared.stage.path().parent(), Some(root.path()));
+        assert_eq!(
+            fs::read(prepared.stage.path().join("ladder.exe")).unwrap(),
+            executable
+        );
+        let expected_hash = if cfg!(target_arch = "aarch64") {
+            "549fc36846d0e7dddf6bd4da15689f76a6df95971a3929f5e78b51be439afd41"
+        } else {
+            "b4c68064bf6b6b5982134be37f32df9a0364e7da6438b8e951845960eda93887"
+        };
+        assert_eq!(prepared.sha256, expected_hash);
+        assert_eq!(
+            progress.first(),
+            Some(&UpdateProgress::Downloading {
+                received: 0,
+                total: release.size,
+            })
+        );
+        assert!(progress.contains(&UpdateProgress::Downloading {
+            received: release.size,
+            total: release.size,
+        }));
+        assert!(progress.ends_with(&[UpdateProgress::Verifying, UpdateProgress::Extracting]));
+        let stage = prepared.stage.path().to_owned();
+        drop(prepared);
+        assert!(!stage.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"old program");
+    }
+
+    #[test]
+    fn rejected_downloads_preserve_the_program_and_remove_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("ladder.exe");
+        fs::write(&target, b"old program").unwrap();
+        let (release, archive, _) = package();
+        for scenario in ["truncated", "oversized", "wrong-hash"] {
+            let mut release = release.clone();
+            let mut bytes = archive.clone();
+            match scenario {
+                "truncated" => {
+                    bytes.pop();
+                }
+                "oversized" => bytes.push(0),
+                "wrong-hash" => release.sha256 = [0; 32],
+                _ => unreachable!(),
+            }
+            let result = download_to(&release, target.clone(), || Ok(bytes.as_slice()), |_| {});
+            let error = result.err().expect(scenario);
+            assert!(
+                error.contains(if scenario == "oversized" {
+                    "大小与发布信息不符"
+                } else {
+                    "大小或 SHA-256 校验失败"
+                }),
+                "{scenario}: {error}"
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"old program", "{scenario}");
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1, "{scenario}");
+        }
     }
 
     #[test]
@@ -533,7 +673,21 @@ mod tests {
             stage: Some(stage),
         };
         assert!(helper.process.try_wait().unwrap().is_none());
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                0,
+                helper.process.id(),
+            )
+        };
+        assert!(!handle.is_null());
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
         drop(helper);
+        let status = unsafe { WaitForSingleObject(handle.as_raw_handle(), 5000) };
+        if status != WAIT_OBJECT_0 {
+            unsafe { TerminateProcess(handle.as_raw_handle(), 1) };
+        }
+        assert_eq!(status, WAIT_OBJECT_0, "uncommitted helper remained alive");
         assert!(!path.exists());
     }
 }

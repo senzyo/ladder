@@ -1553,6 +1553,7 @@ mod tests {
     use super::*;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::process::{Child, Command};
+    use std::sync::OnceLock;
 
     #[test]
     fn mihomo_config_extensions_and_saved_selections_are_independent() {
@@ -1772,27 +1773,35 @@ mod tests {
         }
     }
 
+    fn core_fixture() -> &'static [u8] {
+        static FIXTURE: OnceLock<Vec<u8>> = OnceLock::new();
+        FIXTURE.get_or_init(|| {
+            let directory = tempfile::tempdir().unwrap();
+            let exe = directory.path().join("fixture.exe");
+            let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/core.rs");
+            let build = Command::new("rustc")
+                .arg(source)
+                .arg("-o")
+                .arg(&exe)
+                .output()
+                .unwrap();
+            assert!(
+                build.status.success(),
+                "{}",
+                String::from_utf8_lossy(&build.stderr)
+            );
+            fs::read(exe).unwrap()
+        })
+    }
+
     fn lock_and_install_fixture_cores(root: &Path) -> std::sync::MutexGuard<'static, ()> {
         // 外部测试进程可能继承另一用例创建核心时短暂开放的管道写端, 使其退出时等不到 EOF。
         static PROCESS_TESTS: Mutex<()> = Mutex::new(());
         let guard = PROCESS_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/core.rs");
-        let exe = root.join("fixture.exe");
-        let build = Command::new("rustc")
-            .arg(&source)
-            .arg("-o")
-            .arg(&exe)
-            .output()
-            .unwrap();
-        assert!(
-            build.status.success(),
-            "{}",
-            String::from_utf8_lossy(&build.stderr)
-        );
         for core in Core::ALL {
             let dir = core.executable(root).parent().unwrap().to_owned();
             fs::create_dir_all(&dir).unwrap();
-            fs::copy(&exe, dir.join(format!("{}.exe", core.label()))).unwrap();
+            fs::write(dir.join(format!("{}.exe", core.label())), core_fixture()).unwrap();
             fs::create_dir_all(core.config_dir(root)).unwrap();
             let config = match core {
                 Core::SingBox => "{ /* comment */ \"log\": {}, }",
@@ -1815,6 +1824,135 @@ mod tests {
         }
         saved.store(root).unwrap();
         guard
+    }
+
+    fn validation_done(runtime: &Runtime, core: Core) -> CoreState {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = runtime.snapshot().core(core).clone();
+            if !state.validation_busy {
+                return state;
+            }
+            assert!(Instant::now() < deadline, "等待配置验证超时: {state:?}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn validation_started(config: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !config.with_extension("started").is_file() {
+            assert!(Instant::now() < deadline, "验证进程未启动");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn validation_requests_complete_and_reject_duplicates() {
+        let root = tempfile::tempdir().unwrap();
+        let _guard = lock_and_install_fixture_cores(root.path());
+        let core = Core::Mihomo;
+        let config = core.config_dir(root.path()).join("wait.json");
+        fs::write(&config, "{\"fixture_validation_wait\":true}").unwrap();
+        let runtime = Runtime::open(root.path().to_owned()).unwrap();
+        runtime
+            .set_theme(ThemePreference::Light)
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        runtime.send(Action::ValidateAllConfigs(core)).unwrap();
+        validation_started(&config);
+        assert_eq!(
+            runtime.snapshot().core(core).validation.get("wait.json"),
+            Some(&ConfigValidation::Checking)
+        );
+        for action in [
+            Action::ValidateConfig(core, "wait.json".into()),
+            Action::ValidateAllConfigs(core),
+        ] {
+            assert_eq!(runtime.send(action).unwrap_err(), "正在验证配置, 请稍候");
+        }
+        fs::write(config.with_extension("continue"), []).unwrap();
+        let state = validation_done(&runtime, core);
+        assert_eq!(
+            state.validation.get("wait.json"),
+            Some(&ConfigValidation::Valid)
+        );
+        assert_eq!(
+            state.validation.get("日常.JSON"),
+            Some(&ConfigValidation::Valid)
+        );
+        assert_eq!(
+            state.validation.get("失败.json"),
+            Some(&ConfigValidation::Invalid(
+                "fixture configuration rejected".into()
+            ))
+        );
+        runtime
+            .send(Action::ValidateConfig(core, "wait.json".into()))
+            .unwrap();
+        assert_eq!(
+            validation_done(&runtime, core).validation.get("wait.json"),
+            Some(&ConfigValidation::Valid)
+        );
+        assert!(runtime.shutdown().unwrap().is_none());
+    }
+
+    #[test]
+    fn validation_results_are_discarded_after_inputs_change() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for change in ["config", "version", "executable"] {
+            let root = tempfile::tempdir().unwrap();
+            let _guard = lock_and_install_fixture_cores(root.path());
+            let core = Core::Mihomo;
+            let config = core.config_dir(root.path()).join("wait.json");
+            fs::write(&config, "{\"fixture_validation_wait\":true}").unwrap();
+            let runtime = Runtime::open(root.path().to_owned()).unwrap();
+            runtime
+                .set_theme(ThemePreference::Light)
+                .unwrap()
+                .recv_blocking()
+                .unwrap();
+            runtime
+                .send(Action::ValidateConfig(core, "wait.json".into()))
+                .unwrap();
+            validation_started(&config);
+            match change {
+                "config" => fs::write(&config, "{\"changed\":true}").unwrap(),
+                "version" => {
+                    let directory = update::version_directory(core, root.path(), "2.0.0").unwrap();
+                    fs::create_dir_all(&directory).unwrap();
+                    fs::write(directory.join("mihomo.exe"), core_fixture()).unwrap();
+                    runtime
+                        .send(Action::SwitchVersion(core, "2.0.0".into()))
+                        .unwrap();
+                    assert_eq!(
+                        idle(&runtime, core).selected_version.as_deref(),
+                        Some("2.0.0")
+                    );
+                }
+                "executable" => {
+                    let exe = core.executable(root.path());
+                    let before = executable_stamp(&exe);
+                    fs::OpenOptions::new()
+                        .access_mode(0x100 /* FILE_WRITE_ATTRIBUTES */)
+                        .open(&exe)
+                        .unwrap()
+                        .set_modified(SystemTime::now() + Duration::from_secs(60))
+                        .unwrap();
+                    assert_ne!(executable_stamp(&exe), before);
+                }
+                _ => unreachable!(),
+            }
+            fs::write(config.with_extension("continue"), []).unwrap();
+            let state = validation_done(&runtime, core);
+            assert!(
+                !state.validation.contains_key("wait.json"),
+                "{change}: {state:?}"
+            );
+            assert!(!state.validation_stamps.contains_key("wait.json"));
+            assert!(runtime.shutdown().unwrap().is_none());
+        }
     }
 
     #[test]
@@ -3079,6 +3217,51 @@ mod tests {
             assert!(idle(&runtime, core).running);
             assert!(journal.exists());
         }
+        assert!(runtime.shutdown().unwrap().is_none());
+    }
+
+    #[test]
+    fn app_update_preparation_recovers_after_dns_failure_and_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path().join("dns-recovery.json");
+        let damaged = b"not a DNS recovery record";
+        fs::write(&journal, damaged).unwrap();
+        let runtime = Runtime::open(root.path().to_owned()).unwrap();
+        let error = runtime.snapshot().dns_recovery_error.unwrap();
+        assert_eq!(runtime.prepare_app_update().unwrap_err(), error);
+        assert_eq!(fs::read(&journal).unwrap(), damaged);
+        runtime
+            .send(Action::Set(Setting::MinimizeToTray, true))
+            .unwrap();
+        runtime
+            .set_theme(ThemePreference::Dark)
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        assert!(runtime.snapshot().settings.minimize_to_tray);
+        assert!(Saved::load(root.path()).unwrap().settings.minimize_to_tray);
+
+        fs::write(&journal, b"[]").unwrap();
+        runtime.prepare_app_update().unwrap();
+        assert!(!journal.exists());
+        assert_eq!(
+            runtime
+                .send(Action::Set(Setting::MinimizeToTray, false))
+                .unwrap_err(),
+            "正在退出或准备更新, 请稍候"
+        );
+        assert!(runtime.snapshot().settings.minimize_to_tray);
+        runtime.cancel_app_update();
+        runtime
+            .send(Action::Set(Setting::MinimizeToTray, false))
+            .unwrap();
+        runtime
+            .set_theme(ThemePreference::Light)
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        assert!(!runtime.snapshot().settings.minimize_to_tray);
+        assert!(!Saved::load(root.path()).unwrap().settings.minimize_to_tray);
         assert!(runtime.shutdown().unwrap().is_none());
     }
 

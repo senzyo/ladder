@@ -344,7 +344,7 @@ impl CappedFile {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     #[test]
@@ -468,36 +468,66 @@ mod tests {
 
     #[test]
     fn concurrent_records_remain_whole_and_immediately_readable() {
+        const CHILD_LOG: &str = "LADDER_TEST_CONCURRENT_LOG";
+        if let Some(path) = std::env::var_os(CHILD_LOG) {
+            let path = PathBuf::from(path);
+            init(&path).unwrap();
+            let start = Arc::new(Barrier::new(4));
+            let workers: Vec<_> = (0..4)
+                .map(|worker| {
+                    let start = start.clone();
+                    let path = path.clone();
+                    thread::spawn(move || {
+                        start.wait();
+                        for index in 0..100 {
+                            let message = format!("worker={worker} record={index}");
+                            info("test", &message);
+                            if index == 0 {
+                                assert!(
+                                    fs::read_to_string(&path)
+                                        .unwrap()
+                                        .contains(&format!("[INFO] [test] {message}\n"))
+                                );
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert_eq!(recent_for(LogSource::App).len(), 400);
+            return;
+        }
+
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("ladder.log");
-        let mut state = LogState::default();
-        state.open(&path).unwrap();
-        let state = Arc::new(Mutex::new(state));
-        let workers: Vec<_> = (0..4)
-            .map(|worker| {
-                let state = state.clone();
-                thread::spawn(move || {
-                    for index in 0..100 {
-                        state
-                            .lock()
-                            .unwrap()
-                            .record(format!("worker={worker} record={index}"));
-                    }
-                })
-            })
-            .collect();
-        for worker in workers {
-            worker.join().unwrap();
-        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "logging::tests::concurrent_records_remain_whole_and_immediately_readable",
+                "--nocapture",
+            ])
+            .env(CHILD_LOG, &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let text = fs::read_to_string(&path).unwrap();
-        let lines: std::collections::HashSet<_> = text.lines().collect();
+        assert_eq!(text.lines().count(), 400);
+        let lines: std::collections::HashSet<_> = text
+            .lines()
+            .map(|line| line.split_once(" [INFO] [test] ").unwrap().1)
+            .collect();
         assert_eq!(lines.len(), 400);
         for worker in 0..4 {
             for index in 0..100 {
                 assert!(lines.contains(format!("worker={worker} record={index}").as_str()));
             }
         }
-        assert_eq!(state.lock().unwrap().recent.len(), 400);
     }
 
     #[test]

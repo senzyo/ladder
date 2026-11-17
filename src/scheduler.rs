@@ -193,14 +193,18 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
 }
 
 pub(crate) fn restore_on_boot() -> Result<()> {
-    let directory = recovery_directory()?;
-    let session = session_file(&directory)?;
+    restore_on_boot_with(&DnsLease::new(&recovery_directory()?))
+}
+
+fn restore_on_boot_with(lease: &DnsLease) -> Result<()> {
+    let (directory, _) = lease.recovery_paths();
+    let session = session_file(directory)?;
     match session.try_lock() {
         Ok(()) => {
             // 取得快照锁后才覆盖本次日志, 避免与其他恢复进程争用文件。
             let _ = logging::init(&directory.join("app.log"));
             logging::info("dns", "开始开机 DNS 恢复");
-            let result = DnsLease::new(&directory).restore_if_pending();
+            let result = lease.restore_if_pending();
             match &result {
                 Ok(()) => logging::info("dns", "开机 DNS 恢复完成"),
                 Err(message) => logging::error("dns", message),
@@ -394,13 +398,54 @@ mod tests {
 
     #[test]
     fn boot_leaves_an_active_session_alone_and_retries_after_exit() {
+        const CHILD_DIRECTORY: &str = "LADDER_TEST_BOOT_RECOVERY_DIRECTORY";
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            let directory = Path::new(&directory);
+            let journal = directory.join("dns-recovery.json");
+            let log = directory.join("app.log");
+            fs::write(&journal, b"do not read an active session's journal").unwrap();
+            fs::write(&log, b"active session\n").unwrap();
+            let desktop = session_file(directory).unwrap();
+            desktop.lock().unwrap();
+            let lease = DnsLease::for_tests(directory);
+
+            restore_on_boot_with(&lease).unwrap();
+            assert_eq!(
+                fs::read(&journal).unwrap(),
+                b"do not read an active session's journal"
+            );
+            assert_eq!(fs::read(&log).unwrap(), b"active session\n");
+
+            drop(desktop);
+            fs::write(&journal, b"[]").unwrap();
+            lease.apply().unwrap();
+            restore_on_boot_with(&lease).unwrap();
+            assert!(!journal.exists());
+            let log = fs::read_to_string(log).unwrap();
+            assert!(log.contains("开始开机 DNS 恢复"));
+            assert!(log.contains("开机 DNS 恢复完成"));
+            assert!(!log.contains("active session"));
+            return;
+        }
+
+        // 开机恢复会初始化全局日志, 在独立进程验证以免干扰其他测试。
         let dir = tempfile::tempdir().unwrap();
-        let desktop = session_file(dir.path()).unwrap();
-        desktop.lock().unwrap();
-        let boot = session_file(dir.path()).unwrap();
-        assert!(matches!(boot.try_lock(), Err(TryLockError::WouldBlock)));
-        drop(desktop);
-        boot.try_lock().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "scheduler::tests::boot_leaves_an_active_session_alone_and_retries_after_exit",
+                "--nocapture",
+            ])
+            .env(CHILD_DIRECTORY, dir.path())
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

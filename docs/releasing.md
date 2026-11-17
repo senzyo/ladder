@@ -33,7 +33,7 @@ ZIP 顶层只包含 `ladder.exe`、`README.md`、`LICENSE`。不打包核心、�
 
 | 触发                   | 行为                                                                |
 | ---------------------- | ------------------------------------------------------------------- |
-| main/dev 分支推送、PR  | rustfmt、clippy、完整 Rust 测试                                     |
+| main/dev 分支推送、PR  | rustfmt、clippy、完整 Rust 测试、打包与更新助手测试                  |
 | 手动 workflow_dispatch | 检查后构建两种架构, 上传工作流产物, 不创建 Release                  |
 | 推送 `v*` 标签         | 校验标签与 Cargo.toml 版本一致, 构建、校验并发布两种 ZIP 及 SHA-256 |
 

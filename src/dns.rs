@@ -769,18 +769,119 @@ mod tests {
     }
 
     #[test]
-    fn padded_registry_values_preserve_static_auto_and_loopback_settings() {
-        for (text, expected) in [
-            ("127.0.0.1\0\0\0", "127.0.0.1"),
-            ("0:0:0:0:0:0:0:1\0\0", "0:0:0:0:0:0:0:1"),
-            ("\0\0", ""),
-            ("192.0.2.1,192.0.2.2\0\0", "192.0.2.1,192.0.2.2"),
+    fn offline_adapter_restoration_preserves_static_auto_and_loopback_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = format!(
+            r"Software\LadderDnsTest-{}",
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+        // 所有注册表写入仅存在于此事务, 退出或断言失败时自动回滚。
+        let transaction = windows_registry::Transaction::new().unwrap();
+        let key = windows_registry::CURRENT_USER
+            .options()
+            .read()
+            .write()
+            .create()
+            .transaction(&transaction)
+            .open(&path)
+            .unwrap();
+        for status in [
+            ERROR_NOT_FOUND,
+            ERROR_FILE_NOT_FOUND,
+            ERROR_PATH_NOT_FOUND,
+            ERROR_NOT_SUPPORTED,
         ] {
-            // 使用与 Key::get_string 相同的 REG_SZ 转换, 无需写入系统注册表。
-            let value = windows_registry::Value::from(text);
-            assert!(value.as_wide().ends_with(&[0, 0]));
-            let current = String::try_from(value).unwrap();
-            assert_eq!(current, expected);
+            for (target, raw, expected) in [
+                (V4, "127.0.0.1\0\0\0", "127.0.0.1"),
+                (V6, "0:0:0:0:0:0:0:1\0\0", "0:0:0:0:0:0:0:1"),
+                (V4, "\0\0", ""),
+                (V4, "192.0.2.1,192.0.2.2\0\0", "192.0.2.1,192.0.2.2"),
+            ] {
+                key.set_string("NameServer", raw).unwrap();
+                let lease = DnsLease::new(dir.path());
+                lease
+                    .install(
+                        vec![target],
+                        |_| {
+                            key.get_string("NameServer")
+                                .map_err(|error| error.to_string())
+                        },
+                        |_, value| {
+                            key.set_string("NameServer", value)
+                                .map_err(|error| error.to_string())
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(key.get_string("NameServer").unwrap(), target.loopback());
+                lease
+                    .restore_with(|_, previous| {
+                        let key = windows_registry::CURRENT_USER
+                            .options()
+                            .read()
+                            .write()
+                            .transaction(&transaction)
+                            .open(&path);
+                        restore_existing(key, previous, || Err(status))
+                    })
+                    .unwrap();
+                assert_eq!(key.get_string("NameServer").unwrap(), expected);
+                assert!(!lease.journal.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn offline_adapter_restore_failures_keep_the_journal_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = format!(
+            r"Software\LadderDnsTest-{}",
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+        let transaction = windows_registry::Transaction::new().unwrap();
+        let key = windows_registry::CURRENT_USER
+            .options()
+            .read()
+            .write()
+            .create()
+            .transaction(&transaction)
+            .open(&path)
+            .unwrap();
+        for (writable, status) in [(false, ERROR_NOT_FOUND), (true, ERROR_ACCESS_DENIED)] {
+            key.set_string("NameServer", "192.0.2.53").unwrap();
+            let lease = DnsLease::new(dir.path());
+            lease
+                .install(
+                    vec![V4],
+                    |_| {
+                        key.get_string("NameServer")
+                            .map_err(|error| error.to_string())
+                    },
+                    |_, value| {
+                        key.set_string("NameServer", value)
+                            .map_err(|error| error.to_string())
+                    },
+                )
+                .unwrap();
+            let restore = |writable, status| {
+                lease.restore_with(|_, previous| {
+                    let mut options = windows_registry::CURRENT_USER.options();
+                    options.read().transaction(&transaction);
+                    if writable {
+                        options.write();
+                    }
+                    restore_existing(options.open(&path), previous, || Err(status))
+                })
+            };
+            assert!(restore(writable, status).is_err());
+            assert_eq!(key.get_string("NameServer").unwrap(), "127.0.0.1");
+            let pending = Journal::load(&lease.journal).unwrap().unwrap();
+            assert_eq!(pending.changes.len(), 1);
+            assert_eq!(pending.changes[0].target, V4);
+            assert_eq!(pending.changes[0].previous, "192.0.2.53");
+
+            restore(true, ERROR_NOT_SUPPORTED).unwrap();
+            assert_eq!(key.get_string("NameServer").unwrap(), "192.0.2.53");
+            assert!(!lease.journal.exists());
         }
     }
 
