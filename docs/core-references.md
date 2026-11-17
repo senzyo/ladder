@@ -46,7 +46,16 @@ Xray 的[规则解析](https://github.com/XTLS/Xray-core/blob/v26.11.9/common/ge
 
 mihomo `1.19.34` 的 [`-t` 分支](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/main.go#L175-L190)完成配置解析后返回，不进入运行时的 provider 初始化；解析仍会[检查引用的 provider 是否已声明](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/config/config.go#L1121-L1125)。运行时 [`loadProvider`](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/hub/executor/executor.go#L318-L352)仅记录初始化错误，[随后仍进入运行状态](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/hub/executor/executor.go#L115-L119)。因此加载成功不是这一启动路径的硬条件，但 `-t` 通过也不能说明配置不需要该 provider。
 
-本次 mihomo 配置为 `mode: rule`，声明了一个没有 `payload` 回退内容的 file/domain provider，规则依次为 `RULE-SET,local,DIRECT` 和 `MATCH,DIRECT`。源码中 provider [先创建空规则策略，也支持可选 payload 回退](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/rules/provider/provider.go#L125-L144)；[空 domain 规则集不匹配](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/rules/provider/domain_strategy.go#L26-L28)，[`RULE-SET` 委托该 provider 匹配](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/rules/provider/rule_set.go#L23-L35)，[未命中则继续后续规则](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/tunnel/tunnel.go#L663-L690)。据此推断，这份缺文件配置会落到 `MATCH,DIRECT`，仍可能正常直连；它不能验证 provider 中预期的分流已生效。本轮只实测了检查通过、加载错误和进程继续运行，没有实测该回退流量。其他配置若有可用缓存、payload 或不同后续规则，结果可能不同，不能把所有 provider 都称为启动必需资源。
+源码中 provider [先创建空规则策略，也支持可选 payload 回退](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/rules/provider/provider.go#L125-L144)；[空 domain 规则集不匹配](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/rules/provider/domain_strategy.go#L26-L28)，[`RULE-SET` 委托该 provider 匹配](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/rules/provider/rule_set.go#L23-L35)，[未命中则继续后续规则](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/tunnel/tunnel.go#L663-L690)。
+
+随后用 mihomo `1.19.34` 完成真实 HTTP 请求对照：两份隔离配置均为 `mode: rule`，file/domain provider 没有配置内的 `payload` 备用规则，规则依次为 `RULE-SET,local,REJECT`、`MATCH,DIRECT`。有效文件仅匹配 `localhost`；另一份缺失同名文件。请求直接发送到核心的环回代理端口，目标为自建环回 HTTP 服务；配置内将 `localhost` 映射到 `127.0.0.1`，不修改系统 hosts，不启用 DNS/TUN，也不请求外网。
+
+| 对照 | 原生检查与进程 | 实际请求与日志 |
+| --- | --- | --- |
+| provider 文件有效 | `-t` 退出 `0`；请求后核心仍运行 | `RuleSet(local) using REJECT`，客户端收到 HTTP `502`，目标服务器收到 `0` 次请求。 |
+| provider 文件缺失 | `-t` 退出 `0`；记录 provider 加载 `ERROR`，请求后核心仍运行 | `Match using DIRECT`，客户端收到 HTTP `200` 和服务器生成的唯一标记，目标服务器收到 `1` 次请求。 |
+
+证据位于 `target/handoff-20261117/output/run-30.log` 及同目录的 `mihomo-fallback/20261117-013649-4d8f2b/`；后者保存二进制版本/哈希、两份配置、原生检查与运行日志、逐项请求及服务器计数。结果证明此 provider 不是进程启动的硬条件，但缺失时原本应被拒绝的请求改走了后续 `DIRECT`，不能视为预期分流完整。其他配置若有可用缓存、备用 payload 或不同后续规则，影响可能不同；本例也不代表外网连通性或 Ladder 界面验收。
 
 Xray 与 sing-box 的独立资源验收共 18 项全部通过，包含无需资源的基线、有效本地规则集及上述负例；证据位于本机忽略目录 `target/handoff-20261117/output/run-18.log` 和同目录 `resource-evidence/`。这些原生进程使用无入站、无 DNS/TUN 的隔离配置；正例运行只观察短时存活，不能据此宣称网络功能或 Ladder 界面已通过验收。mihomo 的检查与运行边界见[本轮验收记录](verification-2026-11-17.md)。
 
