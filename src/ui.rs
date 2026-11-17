@@ -689,7 +689,7 @@ impl MainWindow {
                                 .text_size(px(TEXT_PRIMARY))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(colors.error)
-                                .child("点击右侧“管理版本”安装核心 -->"),
+                                .child("点击右侧“管理核心版本”安装核心 -->"),
                         )
                     })
                     .when(state.installed, |el| {
@@ -706,7 +706,7 @@ impl MainWindow {
                         )
                     })
                     .child(action_button(
-                        "管理版本",
+                        "管理核心版本",
                         7,
                         Some(UiAction::ShowVersions(core, true)),
                         true,

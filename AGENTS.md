@@ -2,7 +2,9 @@
 尽可能减少次要标签和描述, 让布局自己说话。
 
 ## 测试
-
 测试软件时不要影响到本机网络, 比如不要使用 TUN、更改 DNS 等。
 尽量在 Windows 沙盒中测试。
 Windows 沙盒中的 PowerShell 是 5.1 版本, 注意区别。
+
+## Git
+git commit message 遵循 Conventional Commits, 使用简体中文。
