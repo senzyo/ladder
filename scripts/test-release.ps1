@@ -6,7 +6,8 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 $Version = [Diagnostics.FileVersionInfo]::GetVersionInfo($Executable).ProductVersion
-$TestRoot = Join-Path ([IO.Path]::GetTempPath()) ('ladder-release-test-' + [Guid]::NewGuid().ToString('N'))
+$TestId = [Guid]::NewGuid().ToString('N')
+$TestRoot = Join-Path ([IO.Path]::GetTempPath()) "ladder-release-test-$TestId"
 [IO.Directory]::CreateDirectory($TestRoot) | Out-Null
 
 function Assert-True {
@@ -14,16 +15,13 @@ function Assert-True {
     if (-not $Value) { throw $Message }
 }
 
-function Invoke-TestHelper {
+function Start-TestHelper {
     param([string]$Stage)
     $script = Join-Path $Stage 'apply-update.ps1'
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'apply-update.ps1') -Destination $script
-    $fixtureScript = [IO.File]::ReadAllText($script).Replace('    if ($Replaced -and', '    [IO.File]::WriteAllText((Join-Path $Root "fixture-error.txt"), $_.Exception.ToString())' + "`n" + '    if ($Replaced -and')
-    [IO.File]::WriteAllText($script, $fixtureScript)
     $powershell = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
     $process = Start-Process -FilePath $powershell -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $script)) -WindowStyle Hidden -PassThru
-    if (-not $process.WaitForExit(15000)) { $process.Kill(); throw 'Update helper timed out.' }
-    return $process.ExitCode
+    return $process
 }
 
 try {
@@ -53,40 +51,110 @@ try {
     Assert-True ((Get-FileHash -LiteralPath $zipPath).Hash -ceq $hash) 'Packaging was not reproducible for identical input files.'
 
     $fixtureSource = Join-Path $TestRoot 'fixture.rs'
-    [IO.File]::WriteAllText($fixtureSource, 'fn main() { let path = std::env::current_exe().unwrap().with_file_name("launched.txt"); std::fs::write(path, "launched").unwrap(); }')
-    $fixture = Join-Path $TestRoot 'fixture.exe'
+    $fixtureCode = @'
+fn main() {
+    if let Some(signal) = std::env::args_os().nth(1) {
+        let signal = std::path::PathBuf::from(signal);
+        while !signal.is_file() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        return;
+    }
+    let path = std::env::current_exe().unwrap().with_file_name("launched.txt");
+    std::fs::write(path, "launched").unwrap();
+}
+'@
+    [IO.File]::WriteAllText($fixtureSource, $fixtureCode)
+    $fixture = Join-Path $TestRoot "ladder-release-fixture-$TestId.exe"
     & rustc --edition 2024 $fixtureSource -o $fixture
     if ($LASTEXITCODE) { throw 'Unable to compile harmless update fixture.' }
-    foreach ($scenario in @('success', 'rollback', 'cancel')) {
+    foreach ($scenario in @('success', 'rollback', 'cancel', 'checksum-failure', 'file-in-use', 'cancel-after-ready')) {
         $success = $scenario -eq 'success'
         $root = Join-Path $TestRoot "$scenario update"
         $stage = Join-Path $root '.ladder-app-update-test123'
         [IO.Directory]::CreateDirectory($stage) | Out-Null
-        $target = Join-Path $root 'ladder-test.exe'
+        $targetName = "ladder-release-target-$TestId.exe"
+        $target = Join-Path $root $targetName
         Copy-Item -LiteralPath $fixture -Destination $target
         $oldFile = [IO.File]::Open($target, [IO.FileMode]::Append)
         try { $oldFile.WriteByte(42) } finally { $oldFile.Dispose() }
         $oldHash = (Get-FileHash -LiteralPath $target).Hash
         $source = Join-Path $stage 'ladder.exe'
         if ($scenario -ne 'rollback') { Copy-Item -LiteralPath $fixture -Destination $source } else { [IO.File]::WriteAllText($source, 'Invalid executable for rollback test') }
-        [IO.File]::WriteAllText((Join-Path $root 'ladder-state.json'), 'preserve-this-state')
-        $plan = @{ target = 'ladder-test.exe'; parent = 2147483647; sha256 = (Get-FileHash -LiteralPath $source).Hash.ToLowerInvariant() }
-        $plan | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'update.json') -Encoding utf8
-        if ($scenario -ne 'cancel') { [IO.File]::WriteAllText((Join-Path $stage 'commit'), 'commit') }
-        $result = Invoke-TestHelper $stage
-        foreach ($fixtureProcess in @(Get-Process -Name 'ladder-test' -ErrorAction SilentlyContinue)) {
+        $preserved = [ordered]@{
+            'ladder-state.json' = 'preserve-this-state'
+            'configs/mihomo/test.yaml' = "mode: rule`ntun:`n  enable: false`n"
+            'configs/sing-box/test.json' = '{"outbounds":[{"type":"direct"}]}'
+            'configs/xray/test.json' = '{"outbounds":[{"protocol":"freedom"}]}'
+            'configs/mihomo/rules/local.yaml' = "payload:`n  - DOMAIN,example.test`n"
+        }
+        foreach ($entry in $preserved.GetEnumerator()) {
+            $path = Join-Path $root $entry.Key
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path)) | Out-Null
+            [IO.File]::WriteAllText($path, $entry.Value)
+        }
+        $plan = @{ target = $targetName; parent = 2147483647; sha256 = (Get-FileHash -LiteralPath $source).Hash.ToLowerInvariant() }
+        if ($scenario -eq 'checksum-failure') { $plan.sha256 = '0' * 64 }
+        $helper = $null
+        $parentProcess = $null
+        $lockedFile = $null
+        try {
+            if ($scenario -eq 'cancel-after-ready') {
+                $exitSignal = Join-Path $root 'exit-parent'
+                $parentProcess = Start-Process -FilePath $fixture -ArgumentList ('"{0}"' -f $exitSignal) -WindowStyle Hidden -PassThru
+                $plan.parent = $parentProcess.Id
+            }
+            if ($scenario -eq 'file-in-use') {
+                $lockedFile = [IO.File]::Open($target, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            }
+            $plan | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'update.json') -Encoding utf8
+            if ($scenario -notin @('cancel', 'cancel-after-ready')) {
+                [IO.File]::WriteAllText((Join-Path $stage 'commit'), 'commit')
+            }
+            $helper = Start-TestHelper $stage
+            if ($scenario -eq 'cancel-after-ready') {
+                $timer = [Diagnostics.Stopwatch]::StartNew()
+                while (-not (Test-Path -LiteralPath (Join-Path $stage 'ready'))) {
+                    if ($helper.HasExited -or $timer.ElapsedMilliseconds -gt 10000) { throw 'Update helper did not become ready.' }
+                    Start-Sleep -Milliseconds 25
+                }
+                Assert-True (-not $helper.HasExited -and -not $parentProcess.HasExited) 'Update helper did not wait for its live parent.'
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $stage 'commit'))) 'Cancellation test unexpectedly committed the update.'
+                Assert-True ((Get-FileHash -LiteralPath $target).Hash -ceq $oldHash) 'Update replaced the program before cancellation.'
+                $helper.Kill()
+                Assert-True ($helper.WaitForExit(5000)) 'Cancelled update helper did not exit.'
+                [IO.File]::WriteAllText($exitSignal, 'exit normally')
+                Assert-True ($parentProcess.WaitForExit(5000)) 'Cancelled update parent did not exit normally.'
+                Assert-True ($parentProcess.ExitCode -eq 0) 'Cancelled update parent failed during normal exit.'
+            }
+            if (-not $helper.WaitForExit(15000)) { throw "Update helper timed out: $scenario" }
+            $result = $helper.ExitCode
+        } finally {
+            if ($null -ne $lockedFile) { $lockedFile.Dispose() }
+            foreach ($process in @($helper, $parentProcess)) {
+                if ($null -ne $process) {
+                    if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
+                    $process.Dispose()
+                }
+            }
+        }
+        foreach ($fixtureProcess in @(Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($target)) -ErrorAction SilentlyContinue)) {
             if ($fixtureProcess.Path -eq $target -and -not $fixtureProcess.WaitForExit(5000)) { throw 'Harmless restart fixture did not finish.' }
         }
-        if (($result -eq 0) -ne $success) { Get-Content -LiteralPath (Join-Path $root 'fixture-error.txt') }
-        Assert-True (($result -eq 0) -eq $success) 'Update helper returned an unexpected result.'
-        Assert-True ((Get-Content -LiteralPath (Join-Path $root 'ladder-state.json') -Raw) -ceq 'preserve-this-state') 'Update modified user settings.'
+        Assert-True (($result -eq 0) -eq $success) "Update helper returned an unexpected result: $scenario"
+        foreach ($entry in $preserved.GetEnumerator()) {
+            Assert-True ([IO.File]::ReadAllText((Join-Path $root $entry.Key)) -ceq $entry.Value) "Update modified user data: $scenario / $($entry.Key)"
+        }
         $expectedHash = if ($success) { (Get-FileHash -LiteralPath $fixture).Hash } else { $oldHash }
         Assert-True ((Get-FileHash -LiteralPath $target).Hash -ceq $expectedHash) 'Update or rollback left the wrong executable.'
-        Assert-True ((Test-Path -LiteralPath (Join-Path $root 'launched.txt')) -eq ($scenario -ne 'cancel')) 'Unexpected restart behavior.'
+        Assert-True ((Test-Path -LiteralPath (Join-Path $root 'launched.txt')) -eq ($scenario -in @('success', 'rollback'))) "Unexpected restart behavior: $scenario"
         if ($success) { Assert-True (-not (Test-Path -LiteralPath $stage)) 'Successful update left its staging directory.' }
-        else { Assert-True (Test-Path -LiteralPath (Join-Path $root 'update-error.log')) 'Failed update did not leave a diagnostic.' }
+        else {
+            Assert-True ((Test-Path -LiteralPath (Join-Path $root 'update-error.log')) -eq ($scenario -ne 'cancel-after-ready')) "Unexpected update diagnostic: $scenario"
+        }
+        Write-Host "PASS: update helper $scenario; settings and configuration preserved."
     }
-    Write-Host 'PASS: package allowlist, deterministic ZIP, SHA-256, Windows PowerShell 5.1 update/restart/rollback/cancellation, settings preservation.'
+    Write-Host 'PASS: package allowlist, deterministic ZIP, SHA-256, Windows PowerShell 5.1 update/restart/rollback/checksum/locked-file/ready-cancellation, settings and configuration preservation.'
 } finally {
     $resolved = [IO.Path]::GetFullPath($TestRoot)
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
