@@ -1267,23 +1267,23 @@ impl MainWindow {
                     })),
             );
         }
-        let update_busy = matches!(
-            self.app_update,
-            AppUpdateState::Checking | AppUpdateState::Downloading(_) | AppUpdateState::Installing
-        );
         let update_status = match &self.app_update {
-            AppUpdateState::Idle | AppUpdateState::Failed(_) => None,
-            AppUpdateState::Checking => Some("正在检查更新…".into()),
+            AppUpdateState::Idle
+            | AppUpdateState::Checking
+            | AppUpdateState::Installing
+            | AppUpdateState::Failed(_) => None,
             AppUpdateState::Latest => Some("已是最新版本".into()),
             AppUpdateState::Available(version) => Some(format!("新版本 {version}")),
             AppUpdateState::Downloading(progress) => Some(update_progress_text(progress)),
             AppUpdateState::Ready(version) => Some(format!("{version} 已准备好")),
-            AppUpdateState::Installing => Some("正在退出并更新…".into()),
         };
-        let update_action = match self.app_update {
-            AppUpdateState::Available(_) => Some(("下载更新", UiAction::DownloadAppUpdate)),
-            AppUpdateState::Ready(_) => Some(("退出并更新", UiAction::InstallAppUpdate)),
-            _ => None,
+        let (update_label, update_action) = match self.app_update {
+            AppUpdateState::Checking => ("检查中…", None),
+            AppUpdateState::Downloading(_) => ("下载中…", None),
+            AppUpdateState::Installing => ("重启中…", None),
+            AppUpdateState::Available(_) => ("下载更新", Some(UiAction::DownloadAppUpdate)),
+            AppUpdateState::Ready(_) => ("重启以更新", Some(UiAction::InstallAppUpdate)),
+            _ => ("检查更新", Some(UiAction::CheckAppUpdate)),
         };
         let content = div()
             .id("settings-content")
@@ -1345,7 +1345,7 @@ impl MainWindow {
                             .child(img(self.icon.clone()).size(px(32.)).flex_shrink_0())
                             .child(
                                 div()
-                                    .flex_1()
+                                    .flex_shrink_0()
                                     .min_w(px(0.))
                                     .flex()
                                     .flex_col()
@@ -1382,35 +1382,32 @@ impl MainWindow {
                                             ),
                                         ),
                                     ),
+                            )
+                            .child(
+                                div().flex_1().min_w(px(0.)).when_some(
+                                    update_status,
+                                    |el, status| {
+                                        el.child(caption(status, colors).whitespace_normal())
+                                    },
+                                ),
+                            )
+                            .child(
+                                action_button(
+                                    update_label,
+                                    19,
+                                    update_action,
+                                    matches!(
+                                        self.app_update,
+                                        AppUpdateState::Available(_) | AppUpdateState::Ready(_)
+                                    ),
+                                    colors,
+                                    cx,
+                                )
+                                .id("app-update")
+                                .min_w(px(100.)),
                             ),
                     )
                     .child(caption("MIT License", colors))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(action_button(
-                                "检查更新",
-                                19,
-                                (!update_busy).then_some(UiAction::CheckAppUpdate),
-                                false,
-                                colors,
-                                cx,
-                            ))
-                            .when_some(update_action, |el, (label, action)| {
-                                el.child(action_button(label, 20, Some(action), true, colors, cx))
-                            })
-                            .when_some(update_status, |el, status| {
-                                el.child(
-                                    caption(status, colors)
-                                        .min_w(px(0.))
-                                        .max_w_full()
-                                        .whitespace_normal(),
-                                )
-                            }),
-                    )
                     .when(matches!(self.app_update, AppUpdateState::Ready(_)), |el| {
                         el.child(
                             caption("更新时将停止所有核心，完成后重新打开 Ladder。", colors)
@@ -1752,7 +1749,6 @@ fn repository_link(
 ) -> Stateful<Div> {
     control(url, index, colors, false)
         .text_color(colors.accent)
-        .underline()
         .child(label.into())
         .on_click(move |_, _, cx| cx.open_url(url))
 }

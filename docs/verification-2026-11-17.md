@@ -46,3 +46,10 @@ Computer Use 操作独立 `Ladder TODO 隔离验收` 窗口，生产 UI 文件�
 - `cargo fmt --all -- --check`、`cargo check --locked`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --locked` 通过；安全回归集合 74 项通过。主程序仅构建，未启动。
 - 规范与需求两条独立审查均通过。已修复日志显示顺序与 Tab 顺序不一致，以及前次保存未完成时可能丢弃 Tab 保存请求的问题。
 - 本机证据位于忽略目录 `target/todo-ui-check/evidence/followup-*`；验收程序和临时打开的仓库页面均已关闭。
+
+## 关于页更新操作调整
+
+- 四个仓库链接去除下划线；更新操作合并为最右侧单个按钮，按状态显示“检查更新”“下载更新”“重启以更新”。进行中禁用，进度和版本状态位于链接右侧。
+- 使用同步生产 UI 的内存 harness，在 900×600 逻辑像素、完整 `3.0.0-alpha.1` 版本文本下验收浅/深色布局。模拟检查、下载进度、准备完成、重启中、失败后键盘重试及已是最新版本，按钮位置保持稳定。未执行真实更新、核心或系统网络操作。
+- `cargo fmt --all -- --check`、`cargo check --locked`、`cargo clippy --locked --all-targets -- -D warnings`、harness 与生产构建通过。规范和需求独立审查均无发现。
+- 本轮证据保存在 `target/todo-ui-check/evidence/about-update-*`，验收窗口已关闭。
