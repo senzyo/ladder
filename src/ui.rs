@@ -43,6 +43,7 @@ enum FeedbackScope {
     Config(Core),
     Versions(Core),
     Settings,
+    GithubProxy,
     Logs,
 }
 
@@ -242,10 +243,10 @@ impl MainWindow {
         let result = match action {
             UiAction::CheckAppUpdate => self
                 .updater
-                .check(self.snapshot.settings.github_proxy.clone()),
+                .check(self.snapshot.settings.github_request_prefix().to_owned()),
             UiAction::DownloadAppUpdate => self
                 .updater
-                .download(self.snapshot.settings.github_proxy.clone()),
+                .download(self.snapshot.settings.github_request_prefix().to_owned()),
             UiAction::InstallAppUpdate => self
                 .events
                 .try_send(crate::TrayAction::InstallUpdate)
@@ -385,8 +386,8 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn save_github_proxy(&mut self, core: Core, cx: &mut Context<Self>) {
-        let scope = FeedbackScope::Versions(core);
+    fn save_github_proxy(&mut self, cx: &mut Context<Self>) {
+        let scope = FeedbackScope::GithubProxy;
         let requested = self.github_proxy.value().to_owned();
         match self.runtime.set_github_proxy(requested.clone()) {
             Ok(saved) => {
@@ -402,9 +403,9 @@ impl MainWindow {
                             );
                         }
                         view.refresh(cx);
-                        if view.snapshot.settings_error.is_none()
-                            && view.github_proxy.value() == requested
-                        {
+                        if let Some(message) = view.snapshot.settings_error.clone() {
+                            view.set_command_result(scope, Err(message));
+                        } else if view.github_proxy.value() == requested {
                             view.github_proxy
                                 .set_value(view.snapshot.settings.github_proxy.clone());
                         }
@@ -1038,30 +1039,6 @@ impl MainWindow {
                             ),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(div().child("GitHub 加速前缀"))
-                    .child(self.github_proxy.render(core, colors, cx))
-                    .child(action_button("保存", 12, None, false, colors, cx).when(
-                        self.pending_github_proxy.is_none(),
-                        |el| {
-                            el.tab_index(12)
-                                .cursor_pointer()
-                                .text_color(colors.text)
-                                .bg(colors.panel)
-                                .hover(|el| el.bg(colors.hover))
-                                .focus(|el| el.border_color(colors.accent))
-                                .active(|el| el.bg(colors.selection))
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.save_github_proxy(core, cx)
-                                }))
-                        },
-                    )),
-            )
             .when_some(self.snapshot.settings_error.clone(), |el, message| {
                 el.child(error_message(message, colors))
             })
@@ -1212,6 +1189,12 @@ impl MainWindow {
                 Setting::HijackDns,
                 settings.hijack_dns,
             ),
+            (
+                "GitHub 加速",
+                "用于核心和软件的版本检查与下载",
+                Setting::GithubProxyEnabled,
+                settings.github_proxy_enabled,
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -1269,6 +1252,42 @@ impl MainWindow {
                     })),
             );
         }
+        rows = rows
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .min_h(px(52.))
+                    .px(px(12.))
+                    .gap(px(8.))
+                    .items_center()
+                    .child(div().flex_shrink_0().child("加速前缀"))
+                    .child(self.github_proxy.render(colors, cx))
+                    .child(action_button("保存", 16, None, false, colors, cx).when(
+                        self.pending_github_proxy.is_none(),
+                        |el| {
+                            el.tab_index(16)
+                                .cursor_pointer()
+                                .text_color(colors.text)
+                                .bg(colors.panel)
+                                .hover(|el| el.bg(colors.hover))
+                                .focus(|el| el.border_color(colors.accent))
+                                .active(|el| el.bg(colors.selection))
+                                .on_click(cx.listener(|view, _, _, cx| view.save_github_proxy(cx)))
+                        },
+                    )),
+            )
+            .when_some(
+                self.command_error(FeedbackScope::GithubProxy).cloned(),
+                |el, message| {
+                    el.child(
+                        div()
+                            .mx(px(12.))
+                            .mb(px(8.))
+                            .child(error_message(message, colors)),
+                    )
+                },
+            );
         let update_status = match &self.app_update {
             AppUpdateState::Idle
             | AppUpdateState::Checking
@@ -1319,7 +1338,7 @@ impl MainWindow {
                             } else {
                                 "重试恢复 DNS"
                             },
-                            14,
+                            17,
                             (!busy).then_some(UiAction::Run(Action::RetryDns)),
                             false,
                             colors,
@@ -1362,7 +1381,7 @@ impl MainWindow {
                                             .child(repository_link(
                                                 format!("Ladder {}", env!("CARGO_PKG_VERSION")),
                                                 "https://github.com/senzyo/ladder",
-                                                15,
+                                                18,
                                                 colors,
                                             ))
                                             .child(caption("MIT License", colors)),
@@ -1384,7 +1403,7 @@ impl MainWindow {
                                                     repository_link(
                                                         label,
                                                         url,
-                                                        16 + index as isize,
+                                                        19 + index as isize,
                                                         colors,
                                                     )
                                                 },
@@ -1403,7 +1422,7 @@ impl MainWindow {
                             .child(
                                 action_button(
                                     update_label,
-                                    19,
+                                    22,
                                     update_action,
                                     matches!(
                                         self.app_update,

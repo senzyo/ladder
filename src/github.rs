@@ -1,5 +1,7 @@
 use ureq::http::Uri;
 
+pub(crate) const DEFAULT_PROXY: &str = "https://axisnow.gh-proxy.org/";
+
 pub(crate) fn normalized_prefix(prefix: &str) -> Result<String, String> {
     let prefix = prefix.trim();
     if prefix.is_empty() {

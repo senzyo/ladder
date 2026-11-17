@@ -16,6 +16,14 @@ ladder 是 Windows 上的 mihomo、sing-box 和 Xray 轻量启动器。用户维
 如果提示缺少 `VCRUNTIME140.dll`, 安装与程序架构对应的 [Microsoft Visual C++ v14 Redistributable](https://learn.microsoft.com/zh-cn/cpp/windows/latest-supported-vc-redist)。amd64 选择 x64, arm64 选择 ARM64；虚拟机和沙盒需在其内部安装。
 
 ## 一些注意事项
+### GitHub 加速
+
+在软件“设置”中统一开启 GitHub 加速，默认关闭。加速前缀预填 `https://axisnow.gh-proxy.org/`，可修改后保存；关闭开关会保留前缀并恢复直连。
+
+升级后保留原有自定义前缀，空前缀补为默认地址；旧配置没有开关状态时，需在设置中手动开启。
+
+开启后，三个核心的版本查询、下载，以及 Ladder 自身检查更新和下载安装包都使用该前缀，按 [GitHub 加速文档](https://gh-proxy.com/docs/github-accelerator) 在资源地址前拼接。关于页的仓库链接仍在浏览器打开原始主页；核心进程自身的网络请求由各自配置控制。
+
 ### 配置合法检查
 
 | 核心     | 配置目录            | 文件格式                                | 验证命令                   |

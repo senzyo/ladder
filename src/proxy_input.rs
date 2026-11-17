@@ -1,12 +1,9 @@
 use super::{Colors, MainWindow, TEXT_PRIMARY};
-use crate::runtime::Core;
 use gpui::{
     Bounds, ClipboardItem, Context, Div, FocusHandle, MouseButton, Pixels, Point, ShapedLine,
     Stateful, TextRun, canvas, div, fill, point, prelude::*, px, size,
 };
 use std::{cell::RefCell, ops::Range, rc::Rc};
-
-const PROXY_SUGGESTION: &str = "https://gh-proxy.org/";
 
 struct InputLayout {
     line: ShapedLine,
@@ -29,7 +26,7 @@ impl ProxyInput {
             text,
             cursor,
             anchor: cursor,
-            focus: cx.focus_handle().tab_index(11),
+            focus: cx.focus_handle().tab_index(15).tab_stop(true),
             layout: Rc::default(),
         }
     }
@@ -96,12 +93,7 @@ impl ProxyInput {
         }
     }
 
-    pub(super) fn render(
-        &self,
-        core: Core,
-        colors: Colors,
-        cx: &Context<MainWindow>,
-    ) -> Stateful<Div> {
+    pub(super) fn render(&self, colors: Colors, cx: &Context<MainWindow>) -> Stateful<Div> {
         let text = self.text.clone();
         let selection = self.selection();
         let cursor = self.cursor;
@@ -110,7 +102,7 @@ impl ProxyInput {
         div()
             .id("github-proxy-input")
             .track_focus(&self.focus)
-            .tab_index(11)
+            .tab_index(15)
             .flex_1()
             .min_w(px(100.))
             .h(px(30.))
@@ -142,16 +134,10 @@ impl ProxyInput {
                     let key = &event.keystroke.key;
                     let modifiers = event.keystroke.modifiers;
                     if key == "tab" {
-                        if !modifiers.modified() && input.text.is_empty() {
-                            input.set_value(PROXY_SUGGESTION.into());
-                            view.save_github_proxy(core, cx);
-                            cx.notify();
-                            cx.stop_propagation();
-                        }
                         return;
                     }
                     if key == "enter" {
-                        view.save_github_proxy(core, cx);
+                        view.save_github_proxy(cx);
                     } else if modifiers.control {
                         match key.as_str() {
                             "a" => {
@@ -240,27 +226,16 @@ impl ProxyInput {
             .child(
                 canvas(
                     move |bounds, window, _| {
-                        let placeholder = text.is_empty();
-                        let display = if placeholder {
-                            PROXY_SUGGESTION.to_string()
-                        } else {
-                            text.clone()
-                        };
                         let run = TextRun {
-                            len: display.len(),
+                            len: text.len(),
                             font: window.text_style().font(),
-                            color: if placeholder {
-                                colors.muted
-                            } else {
-                                colors.text
-                            }
-                            .into(),
+                            color: colors.text.into(),
                             background_color: None,
                             underline: None,
                             strikethrough: None,
                         };
                         let line = window.text_system().shape_line(
-                            display.into(),
+                            text.clone().into(),
                             px(TEXT_PRIMARY),
                             &[run],
                             None,

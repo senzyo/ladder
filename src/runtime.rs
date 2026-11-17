@@ -61,7 +61,7 @@ pub enum ThemePreference {
     Dark,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Settings {
     pub theme: ThemePreference,
     pub minimize_to_tray: bool,
@@ -71,7 +71,52 @@ pub struct Settings {
     pub auto_mihomo: bool,
     pub hijack_dns: bool,
     #[serde(default)]
+    pub github_proxy_enabled: bool,
+    #[serde(
+        default = "default_github_proxy",
+        deserialize_with = "deserialize_github_proxy"
+    )]
     pub github_proxy: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: ThemePreference::default(),
+            minimize_to_tray: false,
+            auto_sing_box: false,
+            auto_xray: false,
+            auto_mihomo: false,
+            hijack_dns: false,
+            github_proxy_enabled: false,
+            github_proxy: default_github_proxy(),
+        }
+    }
+}
+
+impl Settings {
+    pub fn github_request_prefix(&self) -> &str {
+        if self.github_proxy_enabled {
+            &self.github_proxy
+        } else {
+            ""
+        }
+    }
+}
+
+fn default_github_proxy() -> String {
+    crate::github::DEFAULT_PROXY.into()
+}
+
+fn deserialize_github_proxy<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let prefix = String::deserialize(deserializer)?;
+    Ok(if prefix.trim().is_empty() {
+        default_github_proxy()
+    } else {
+        prefix
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +199,7 @@ pub enum Setting {
     AutoXray,
     AutoMihomo,
     HijackDns,
+    GithubProxyEnabled,
 }
 
 #[derive(Clone)]
@@ -450,6 +496,9 @@ impl Runtime {
 
     pub fn set_github_proxy(&self, prefix: String) -> Result<async_channel::Receiver<()>, String> {
         let prefix = crate::github::normalized_prefix(&prefix)?;
+        if prefix.is_empty() {
+            return Err("GitHub 加速前缀不能为空".into());
+        }
         let (tx, rx) = async_channel::bounded(1);
         self.tx
             .send(Request::SetGithubProxy(prefix, tx))
@@ -595,7 +644,7 @@ impl Runtime {
             return Err("正在退出，无法获取版本列表".into());
         }
         let mut snapshot = self.state.lock().unwrap();
-        let prefix = snapshot.settings.github_proxy.clone();
+        let prefix = snapshot.settings.github_request_prefix().to_owned();
         let state = snapshot.core_mut(core);
         if state.versions_loading {
             return Err("正在获取版本列表".into());
@@ -710,7 +759,7 @@ impl Runtime {
     }
 
     fn prepare_download(&self, core: Core, release: &CoreVersion) -> Result<(), String> {
-        let prefix = self.snapshot().settings.github_proxy;
+        let prefix = self.snapshot().settings.github_request_prefix().to_owned();
         let prepared = update::prepare_version(
             core,
             &self.root,
@@ -1052,6 +1101,7 @@ impl Worker {
                     Setting::AutoXray => settings.auto_xray = value,
                     Setting::AutoMihomo => settings.auto_mihomo = value,
                     Setting::HijackDns => settings.hijack_dns = value,
+                    Setting::GithubProxyEnabled => settings.github_proxy_enabled = value,
                 });
             }
             Action::Stop(core) => (core, self.stop(core)),
@@ -3136,6 +3186,107 @@ mod tests {
             assert!(error.contains("ladder-state.json 格式无效"));
             assert_eq!(fs::read_to_string(&path).unwrap(), data);
         }
+    }
+
+    #[test]
+    fn github_proxy_defaults_and_legacy_settings_keep_acceleration_disabled() {
+        let folder = tempfile::tempdir().unwrap();
+        let defaults = Saved::load(folder.path()).unwrap().settings;
+        assert_eq!(defaults.github_proxy, crate::github::DEFAULT_PROXY);
+        assert!(!defaults.github_proxy_enabled);
+        assert_eq!(defaults.github_request_prefix(), "");
+
+        let path = folder.path().join("ladder-state.json");
+        for prefix in [
+            None,
+            Some(""),
+            Some(" \t "),
+            Some("https://example.com/proxy/"),
+        ] {
+            let mut legacy = serde_json::to_value(Saved::default()).unwrap();
+            let settings = legacy["settings"].as_object_mut().unwrap();
+            settings.remove("github_proxy_enabled");
+            if let Some(prefix) = prefix {
+                settings.insert("github_proxy".into(), prefix.into());
+            } else {
+                settings.remove("github_proxy");
+            }
+            let data = serde_json::to_vec(&legacy).unwrap();
+            fs::write(&path, &data).unwrap();
+            let settings = Saved::load(folder.path()).unwrap().settings;
+            assert!(!settings.github_proxy_enabled);
+            assert_eq!(settings.github_request_prefix(), "");
+            assert_eq!(
+                settings.github_proxy,
+                prefix
+                    .filter(|prefix| !prefix.trim().is_empty())
+                    .unwrap_or(crate::github::DEFAULT_PROXY)
+            );
+            assert_eq!(fs::read(&path).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn github_proxy_switch_persists_and_preserves_the_configured_prefix() {
+        let folder = tempfile::tempdir().unwrap();
+        let saved = Saved {
+            settings: Settings {
+                github_proxy: "https://example.com/proxy/".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut worker = Worker {
+            root: folder.path().to_owned(),
+            state: Arc::new(Mutex::new(Snapshot {
+                settings: saved.settings.clone(),
+                ..Default::default()
+            })),
+            saved,
+            children: Default::default(),
+            dns: DesktopDns::Unavailable("测试不访问 DNS".into()),
+            quitting: Arc::new(AtomicBool::new(false)),
+            version_files: Default::default(),
+        };
+        for enabled in [true, false, true] {
+            worker.action(Action::Set(Setting::GithubProxyEnabled, enabled));
+            let stored = Saved::load(folder.path()).unwrap().settings;
+            assert_eq!(stored.github_proxy_enabled, enabled);
+            assert_eq!(stored.github_proxy, "https://example.com/proxy/");
+            assert_eq!(
+                stored.github_request_prefix(),
+                if enabled {
+                    stored.github_proxy.as_str()
+                } else {
+                    ""
+                }
+            );
+            assert_eq!(worker.state.lock().unwrap().settings, stored);
+        }
+    }
+
+    #[test]
+    fn github_proxy_save_rejects_empty_values_without_enabling_acceleration() {
+        let folder = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let runtime = Runtime {
+            root: folder.path().to_owned(),
+            state: Arc::new(Mutex::new(Snapshot::default())),
+            tx,
+            quitting: Arc::new(AtomicBool::new(false)),
+        };
+        for prefix in ["", " \t "] {
+            assert!(runtime.set_github_proxy(prefix.into()).is_err());
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        let _saved = runtime
+            .set_github_proxy("  https://example.com/proxy  ".into())
+            .unwrap();
+        let Request::SetGithubProxy(prefix, _) = rx.try_recv().unwrap() else {
+            panic!("预期收到 GitHub 前缀保存请求");
+        };
+        assert_eq!(prefix, "https://example.com/proxy/");
+        assert!(!runtime.snapshot().settings.github_proxy_enabled);
     }
 
     #[test]
