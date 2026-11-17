@@ -58,7 +58,8 @@ fn parse_release(data: &[u8], current: &str) -> Result<Option<AppRelease>, Strin
         .tag_name
         .strip_prefix('v')
         .ok_or("软件发布版本号无效")?;
-    if release.draft || release.prerelease {
+    let version_without_build = version.split('+').next().unwrap();
+    if release.draft || release.prerelease || version_without_build.contains('-') {
         return Err("软件更新只接受正式发布版本".into());
     }
     match compare_versions(version, current) {
@@ -462,6 +463,24 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(stable.version, "3.0.0");
+    }
+
+    #[test]
+    fn releases_reject_prerelease_tags_even_without_github_flag() {
+        for version in ["3.0.0-alpha.2", "3.1.0-beta.1", "3.1.0-rc.1+build-2"] {
+            let result = parse_release(
+                &serde_json::to_vec(&release(version)).unwrap(),
+                "3.0.0-alpha.1",
+            );
+            assert!(result.is_err(), "accepted prerelease tag {version}");
+        }
+        let stable = parse_release(
+            &serde_json::to_vec(&release("3.0.0+build-2")).unwrap(),
+            "3.0.0-alpha.1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(stable.version, "3.0.0+build-2");
     }
 
     #[test]
