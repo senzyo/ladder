@@ -48,7 +48,7 @@ fn main() {
     }
     if config.contains("fixture_tun") {
         let exe = env::current_exe().unwrap();
-        let root = file.ancestors().nth(3).unwrap();
+        let root = file.ancestors().nth(2).unwrap();
         let label = exe.file_stem().unwrap().to_str().unwrap();
         fs::write(
             root.join(format!("{label}.config-path")),
@@ -86,7 +86,7 @@ fn main() {
         let assets = exe.parent().unwrap().canonicalize().unwrap();
         assert_eq!(
             env::current_dir().unwrap().canonicalize().unwrap(),
-            file.ancestors().nth(3).unwrap().canonicalize().unwrap()
+            file.ancestors().nth(2).unwrap().canonicalize().unwrap()
         );
         let (resource_path, expected) = match exe.file_stem().unwrap().to_str().unwrap() {
             "xray" => (env::var_os("XRAY_LOCATION_ASSET").unwrap(), assets),

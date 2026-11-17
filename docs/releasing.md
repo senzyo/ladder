@@ -37,6 +37,8 @@ ZIP 顶层只包含 `ladder.exe`、`README.md`、`LICENSE`。不打包核心、�
 | 手动 workflow_dispatch | 检查后构建两种架构, 上传工作流产物, 不创建 Release                  |
 | 推送 `v*` 标签         | 校验标签与 Cargo.toml 版本一致, 构建、校验并发布两种 ZIP 及 SHA-256 |
 
+main 分支推送或 PR 的变更如果全部位于 `README.md`、`LICENSE`、`AGENTS.md`、`docs/` 或 `screenshots/`, 则跳过工作流；只要包含其他文件的变更就照常运行。推送 `v*` 标签和手动运行不受此过滤影响。
+
 发布作业才授予 `contents: write`, 使用工作流的 GitHub token, 不需要提交个人 token。外部 Actions 固定到核实过的 commit SHA。预发布版本创建 GitHub prerelease, 内置自动更新只接受正式发布。
 
 ## 发版步骤
