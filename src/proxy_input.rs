@@ -1,7 +1,7 @@
 use super::{Colors, MainWindow, TEXT_PRIMARY};
 use gpui::{
     Bounds, ClipboardItem, Context, Div, FocusHandle, MouseButton, Pixels, Point, ShapedLine,
-    Stateful, TextRun, canvas, div, fill, point, prelude::*, px, size,
+    Stateful, TextRun, Window, canvas, div, fill, point, prelude::*, px, size,
 };
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
@@ -20,13 +20,16 @@ pub(super) struct ProxyInput {
 }
 
 impl ProxyInput {
-    pub(super) fn new(text: String, cx: &mut Context<MainWindow>) -> Self {
+    pub(super) fn new(text: String, window: &mut Window, cx: &mut Context<MainWindow>) -> Self {
         let cursor = text.len();
+        let focus = cx.focus_handle().tab_index(18).tab_stop(true);
+        cx.on_blur(&focus, window, |view, _, cx| view.save_github_proxy(cx))
+            .detach();
         Self {
             text,
             cursor,
             anchor: cursor,
-            focus: cx.focus_handle().tab_index(15).tab_stop(true),
+            focus,
             layout: Rc::default(),
         }
     }
@@ -102,7 +105,7 @@ impl ProxyInput {
         div()
             .id("github-proxy-input")
             .track_focus(&self.focus)
-            .tab_index(15)
+            .tab_index(18)
             .flex_1()
             .min_w(px(100.))
             .h(px(30.))
@@ -115,6 +118,11 @@ impl ProxyInput {
             .focus(|el| el.border_color(colors.accent))
             .cursor_text()
             .overflow_hidden()
+            .on_mouse_down_out(cx.listener(|view, _, window, _| {
+                if view.github_proxy.focus.is_focused(window) {
+                    window.focus(&view.focus);
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, event: &gpui::MouseDownEvent, window, cx| {

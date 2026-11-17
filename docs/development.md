@@ -8,7 +8,7 @@
 | `runtime.rs`                                                   | 设置、核心选择、工作线程、验证状态、核心升级及退出协调 |
 | `managed_child.rs`                                             | Windows Job、命令行和进程树生命周期                    |
 | `update.rs`                                                    | 核心 Release 列表、资产选择、下载、解包、版本检测      |
-| `github.rs`                                                    | HTTPS 加速前缀校验和 API/资产地址拼接                  |
+| `github.rs`                                                    | HTTPS 加速链接前缀校验和 API/资产地址拼接              |
 | `app_update.rs` / `app_updater.rs`                             | Ladder 下载校验、可取消更新助手、异步界面状态          |
 | `ui.rs` / `proxy_input.rs` / `log_view.rs` / `scrollbar.rs`    | 页面、前缀编辑、日志显示、滚动条                       |
 | `lib.rs`                                                       | 程序入口、单实例、托盘和更新退出流程                   |
@@ -40,6 +40,8 @@ cargo test --locked --lib mihomo_config_extensions
 cargo test --locked --lib validation_command
 cargo test --locked --lib validation_failures_for_locked_configs
 cargo test --locked --lib app_update_preparation_recovers_after_dns_failure_and_cancellation
+cargo test --locked --lib runtime::tests::startup_
+cargo test --locked --lib runtime::tests::github_proxy_
 cargo test --locked --lib scheduler::tests::boot_leaves_an_active_session_alone_and_retries_after_exit -- --exact
 ```
 

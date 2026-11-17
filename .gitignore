@@ -5,7 +5,9 @@
 /dns-recovery.json
 /dns-recovery.tmp
 /dns-session.lock
-/configs/
+/mihomo_config/
+/sing-box_config/
+/xray_config/
 /sing-box_core/
 /xray_core/
 /mihomo_core/

@@ -134,7 +134,9 @@ pub fn check_latest(prefix: &str) -> Result<Option<AppRelease>, String> {
 
 fn network_error(error: ureq::Error) -> String {
     match error {
-        ureq::Error::StatusCode(403 | 429) => "GitHub 请求受限, 请稍后重试或更换加速前缀".into(),
+        ureq::Error::StatusCode(403 | 429) => {
+            "GitHub 请求受限, 请稍后重试或更换加速链接前缀".into()
+        }
         ureq::Error::StatusCode(404) => "软件安装包已不存在, 请重新检查更新".into(),
         _ => "软件更新请求失败或超时, 请检查网络后重试".into(),
     }

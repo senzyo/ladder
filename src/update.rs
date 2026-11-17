@@ -1279,7 +1279,7 @@ mod tests {
         let first = version_directory(core, root.path(), "1.0.0").unwrap();
         fs::create_dir_all(&first).unwrap();
         fs::write(first.join("sing-box.exe"), b"old").unwrap();
-        let configs = root.path().join("configs");
+        let configs = core.config_dir(root.path());
         fs::create_dir(&configs).unwrap();
         fs::write(configs.join("user.json"), b"private config").unwrap();
         let archive = zip_file(

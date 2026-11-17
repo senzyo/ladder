@@ -31,6 +31,8 @@ pub enum ThemePreference {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Settings {
     pub theme: ThemePreference,
+    #[serde(default)]
+    pub startup_core: Core,
     pub minimize_to_tray: bool,
     pub auto_sing_box: bool,
     pub auto_xray: bool,
@@ -50,6 +52,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemePreference::default(),
+            startup_core: Core::default(),
             minimize_to_tray: false,
             auto_sing_box: false,
             auto_xray: false,
@@ -200,6 +203,7 @@ pub enum Action {
 enum Request {
     Action(Action),
     SetTheme(ThemePreference, async_channel::Sender<()>),
+    SetStartupCore(Core, async_channel::Sender<()>),
     SetGithubProxy(String, async_channel::Sender<()>),
     Shutdown(mpsc::Sender<Result<Option<String>, String>>),
     PrepareAppUpdate(mpsc::Sender<Result<(), String>>),
@@ -340,6 +344,8 @@ impl Runtime {
             let dir = core.config_dir(&root);
             fs::create_dir_all(&dir)
                 .map_err(|e| format!("创建 {} 配置目录失败: {e}", core.label()))?;
+            fs::create_dir_all(core.core_dir(&root))
+                .map_err(|e| format!("创建 {} 核心目录失败: {e}", core.label()))?;
             cleanup_runtime_configs(&dir);
             let state = snapshot.core_mut(core);
             state.configs = list_configs(core, &dir)?;
@@ -472,10 +478,18 @@ impl Runtime {
         Ok(rx)
     }
 
+    pub fn set_startup_core(&self, core: Core) -> Result<async_channel::Receiver<()>, String> {
+        let (tx, rx) = async_channel::bounded(1);
+        self.tx
+            .send(Request::SetStartupCore(core, tx))
+            .map_err(|_| "核心管理线程已关闭".to_string())?;
+        Ok(rx)
+    }
+
     pub fn set_github_proxy(&self, prefix: String) -> Result<async_channel::Receiver<()>, String> {
         let prefix = crate::github::normalized_prefix(&prefix)?;
         if prefix.is_empty() {
-            return Err("GitHub 加速前缀不能为空".into());
+            return Err("GitHub 加速链接前缀不能为空".into());
         }
         let (tx, rx) = async_channel::bounded(1);
         self.tx
@@ -1012,6 +1026,11 @@ impl Worker {
                 Ok(Request::SetTheme(theme, reply)) => {
                     logging::info("settings", format_args!("更改主题: {theme:?}"));
                     self.update_settings(|settings| settings.theme = theme);
+                    let _ = reply.try_send(());
+                }
+                Ok(Request::SetStartupCore(core, reply)) => {
+                    logging::info("settings", format_args!("更改启动界面: {}", core.label()));
+                    self.update_settings(|settings| settings.startup_core = core);
                     let _ = reply.try_send(());
                 }
                 Ok(Request::SetGithubProxy(prefix, reply)) => {
@@ -3342,6 +3361,111 @@ mod tests {
             assert!(error.contains("ladder-state.json 格式无效"));
             assert_eq!(fs::read_to_string(&path).unwrap(), data);
         }
+    }
+
+    #[test]
+    fn startup_core_defaults_and_legacy_settings_open_xray() {
+        let folder = tempfile::tempdir().unwrap();
+        assert_eq!(
+            Saved::load(folder.path()).unwrap().settings.startup_core,
+            Core::Xray
+        );
+        let mut legacy = serde_json::to_value(Saved::default()).unwrap();
+        legacy["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("startup_core");
+        let data = serde_json::to_vec(&legacy).unwrap();
+        let path = folder.path().join("ladder-state.json");
+        fs::write(&path, &data).unwrap();
+        assert_eq!(
+            Saved::load(folder.path()).unwrap().settings.startup_core,
+            Core::Xray
+        );
+        assert_eq!(fs::read(path).unwrap(), data);
+    }
+
+    #[test]
+    fn startup_core_choices_persist_and_failed_saves_keep_the_previous_choice() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let path = root.join("ladder-state.json");
+        let mut runtime = Runtime::open(root.to_owned()).unwrap();
+        for core in Core::ALL {
+            runtime
+                .set_startup_core(core)
+                .unwrap()
+                .recv_blocking()
+                .unwrap();
+            assert_eq!(runtime.snapshot().settings.startup_core, core);
+            let stored: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(stored["settings"]["startup_core"], core.label());
+            runtime.shutdown().unwrap();
+            runtime = Runtime::open(root.to_owned()).unwrap();
+            assert_eq!(runtime.snapshot().settings.startup_core, core);
+        }
+        let previous = fs::read(&path).unwrap();
+        fs::create_dir(root.join("ladder-state.json.tmp")).unwrap();
+        runtime
+            .set_startup_core(Core::Mihomo)
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.settings.startup_core, Core::Xray);
+        assert!(
+            snapshot
+                .settings_error
+                .unwrap()
+                .contains("保存软件设置失败")
+        );
+        assert_eq!(fs::read(path).unwrap(), previous);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn startup_creates_all_core_and_config_directories_without_replacing_files() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        assert!(!root.join("configs").exists());
+        for (core, directory) in [
+            (Core::Mihomo, "mihomo_config"),
+            (Core::SingBox, "sing-box_config"),
+            (Core::Xray, "xray_config"),
+        ] {
+            let config_dir = root.join(directory);
+            assert!(config_dir.is_dir());
+            assert!(core.core_dir(root).is_dir());
+            assert!(!runtime.snapshot().core(core).installed);
+            fs::write(config_dir.join("keep.json"), b"{}").unwrap();
+            fs::write(core.core_dir(root).join("keep.txt"), b"keep").unwrap();
+        }
+        runtime.shutdown().unwrap();
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        for core in Core::ALL {
+            assert_eq!(runtime.snapshot().core(core).configs, ["keep.json"]);
+            assert_eq!(
+                fs::read(core.config_dir(root).join("keep.json")).unwrap(),
+                b"{}"
+            );
+            assert_eq!(
+                fs::read(core.core_dir(root).join("keep.txt")).unwrap(),
+                b"keep"
+            );
+        }
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn startup_reports_a_blocked_core_directory_without_replacing_the_file() {
+        let folder = tempfile::tempdir().unwrap();
+        let blocked = Core::SingBox.core_dir(folder.path());
+        fs::write(&blocked, b"keep").unwrap();
+        let error = Runtime::open(folder.path().to_owned()).err().unwrap();
+        assert!(error.contains("创建 sing-box 核心目录失败"), "{error}");
+        assert_eq!(fs::read(blocked).unwrap(), b"keep");
     }
 
     #[test]

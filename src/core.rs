@@ -1,8 +1,12 @@
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Core {
     SingBox,
+    #[default]
     Xray,
     Mihomo,
 }
@@ -19,7 +23,7 @@ impl Core {
     }
 
     pub(crate) fn config_dir(self, root: &Path) -> PathBuf {
-        root.join("configs").join(self.label())
+        root.join(format!("{}_config", self.label()))
     }
 
     pub(crate) fn core_dir(self, root: &Path) -> PathBuf {

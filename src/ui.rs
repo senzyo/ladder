@@ -66,6 +66,7 @@ enum UiAction {
     CheckAppUpdate,
     DownloadAppUpdate,
     InstallAppUpdate,
+    SaveGithubProxy,
 }
 
 pub(crate) struct MainWindow {
@@ -76,6 +77,7 @@ pub(crate) struct MainWindow {
     config_scroll: [ScrollHandle; 3],
     core_page_scroll: [ScrollHandle; 3],
     pending_theme: Option<(ThemePreference, Task<()>)>,
+    pending_startup_core: Option<(Core, Task<()>)>,
     show_versions: [bool; 3],
     versions_auto_requested: [bool; 3],
     downloaded_only: [bool; 3],
@@ -90,7 +92,7 @@ pub(crate) struct MainWindow {
     logs: LogView,
     icon: Arc<Image>,
     github_proxy: ProxyInput,
-    pending_github_proxy: Option<Task<()>>,
+    pending_github_proxy: Option<(String, Task<()>)>,
     updater: AppUpdater,
     app_update: AppUpdateState,
     events: async_channel::Sender<crate::TrayAction>,
@@ -121,15 +123,17 @@ impl MainWindow {
             }
         })
         .detach();
-        let github_proxy = ProxyInput::new(runtime.snapshot().settings.github_proxy, cx);
+        let settings = runtime.snapshot().settings;
+        let github_proxy = ProxyInput::new(settings.github_proxy, window, cx);
         let mut view = Self {
             runtime,
             snapshot: Snapshot::default(),
-            page: Page::Core(Core::Mihomo),
+            page: Page::Core(settings.startup_core),
             config_focus: Default::default(),
             config_scroll: Default::default(),
             core_page_scroll: Default::default(),
             pending_theme: None,
+            pending_startup_core: None,
             show_versions: [false; 3],
             versions_auto_requested: [false; 3],
             downloaded_only: [false; 3],
@@ -237,11 +241,13 @@ impl MainWindow {
             }
             UiAction::Run(Action::Set(..)) => FeedbackScope::Settings,
             UiAction::Run(Action::RetryDns) => FeedbackScope::Settings,
+            UiAction::SaveGithubProxy => FeedbackScope::GithubProxy,
             UiAction::CheckAppUpdate | UiAction::DownloadAppUpdate | UiAction::InstallAppUpdate => {
                 FeedbackScope::Settings
             }
         };
         let result = match action {
+            UiAction::SaveGithubProxy => return self.save_github_proxy(cx),
             UiAction::CheckAppUpdate => self
                 .updater
                 .check(self.snapshot.settings.github_request_prefix().to_owned()),
@@ -343,6 +349,40 @@ impl MainWindow {
             .map_or(self.snapshot.settings.theme, |(theme, _)| *theme)
     }
 
+    fn selected_startup_core(&self) -> Core {
+        self.pending_startup_core
+            .as_ref()
+            .map_or(self.snapshot.settings.startup_core, |(core, _)| *core)
+    }
+
+    fn set_startup_core(&mut self, core: Core, cx: &mut Context<Self>) {
+        if self.selected_startup_core() == core {
+            return;
+        }
+        match self.runtime.set_startup_core(core) {
+            Ok(saved) => {
+                self.set_command_result(FeedbackScope::Settings, Ok(()));
+                let task = cx.spawn(async move |view, cx| {
+                    let result = saved.recv().await;
+                    let _ = view.update(cx, |view, cx| {
+                        view.pending_startup_core = None;
+                        if result.is_err() {
+                            view.set_command_result(
+                                FeedbackScope::Settings,
+                                Err("启动界面未保存, 管理线程已关闭。".into()),
+                            );
+                        }
+                        view.refresh(cx);
+                        cx.notify();
+                    });
+                });
+                self.pending_startup_core = Some((core, task));
+            }
+            Err(message) => self.set_command_result(FeedbackScope::Settings, Err(message)),
+        }
+        cx.notify();
+    }
+
     fn command_error(&self, scope: FeedbackScope) -> Option<&String> {
         self.command_errors
             .iter()
@@ -387,32 +427,49 @@ impl MainWindow {
         cx.notify();
     }
 
+    fn github_proxy_changed(&self) -> bool {
+        let saved = self.pending_github_proxy.as_ref().map_or(
+            self.snapshot.settings.github_proxy.as_str(),
+            |(prefix, _)| prefix.as_str(),
+        );
+        self.github_proxy.value() != saved
+    }
+
     fn save_github_proxy(&mut self, cx: &mut Context<Self>) {
         let scope = FeedbackScope::GithubProxy;
+        if !self.github_proxy_changed() {
+            if self.command_error(scope).is_some() {
+                self.set_command_result(scope, Ok(()));
+                cx.notify();
+            }
+            return;
+        }
         let requested = self.github_proxy.value().to_owned();
         match self.runtime.set_github_proxy(requested.clone()) {
             Ok(saved) => {
                 self.set_command_result(scope, Ok(()));
-                self.pending_github_proxy = Some(cx.spawn(async move |view, cx| {
+                let pending = requested.clone();
+                let task = cx.spawn(async move |view, cx| {
                     let result = saved.recv().await;
                     let _ = view.update(cx, |view, cx| {
                         view.pending_github_proxy = None;
                         if result.is_err() {
                             view.set_command_result(
                                 scope,
-                                Err("GitHub 加速前缀未保存, 管理线程已关闭。".into()),
+                                Err("GitHub 加速链接前缀未保存, 管理线程已关闭。".into()),
                             );
                         }
                         view.refresh(cx);
                         if let Some(message) = view.snapshot.settings_error.clone() {
                             view.set_command_result(scope, Err(message));
-                        } else if view.github_proxy.value() == requested {
+                        } else if result.is_ok() && view.github_proxy.value() == requested {
                             view.github_proxy
                                 .set_value(view.snapshot.settings.github_proxy.clone());
                         }
                         cx.notify();
                     });
-                }));
+                });
+                self.pending_github_proxy = Some((pending, task));
             }
             Err(message) => self.set_command_result(scope, Err(message)),
         }
@@ -1138,6 +1195,33 @@ impl MainWindow {
                     .on_click(cx.listener(move |view, _, _, cx| view.set_theme(theme, cx))),
             );
         }
+        let mut startup_choices = div()
+            .flex()
+            .gap(px(2.))
+            .p(px(2.))
+            .bg(colors.canvas)
+            .border_1()
+            .border_color(colors.line)
+            .rounded(px(6.));
+        for (index, (core, label)) in [
+            (Core::Mihomo, "mihomo"),
+            (Core::SingBox, "sing-box"),
+            (Core::Xray, "Xray"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            startup_choices = startup_choices.child(
+                control(("startup-core", index), 9 + index as isize, colors, false)
+                    .h(px(28.))
+                    .px(px(8.))
+                    .when(self.selected_startup_core() == core, |el| {
+                        el.bg(colors.selection).text_color(colors.accent)
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |view, _, _, cx| view.set_startup_core(core, cx))),
+            );
+        }
         let mut rows = panel(colors)
             .flex_shrink_0()
             .flex()
@@ -1153,6 +1237,17 @@ impl MainWindow {
                     .justify_between()
                     .child("主题")
                     .child(choices),
+            )
+            .child(
+                div()
+                    .flex()
+                    .min_h(px(52.))
+                    .px(px(12.))
+                    .gap(px(12.))
+                    .items_center()
+                    .justify_between()
+                    .child("启动界面")
+                    .child(startup_choices),
             );
         for (index, (label, description, key, value)) in [
             (
@@ -1216,7 +1311,7 @@ impl MainWindow {
                         .bg(colors.on_accent),
                 );
             rows = rows.child(
-                control(label, 9 + index as isize, colors, false)
+                control(label, 12 + index as isize, colors, false)
                     .flex_shrink_0()
                     .min_h(px(68.))
                     .px(px(12.))
@@ -1257,21 +1352,21 @@ impl MainWindow {
                     .px(px(12.))
                     .gap(px(8.))
                     .items_center()
-                    .child(div().flex_shrink_0().child("加速前缀"))
+                    .child(div().flex_shrink_0().child("加速链接前缀"))
                     .child(self.github_proxy.render(colors, cx))
-                    .child(action_button("保存", 16, None, false, colors, cx).when(
-                        self.pending_github_proxy.is_none(),
-                        |el| {
-                            el.tab_index(16)
-                                .cursor_pointer()
-                                .text_color(colors.text)
-                                .bg(colors.panel)
-                                .hover(|el| el.bg(colors.hover))
-                                .focus(|el| el.border_color(colors.accent))
-                                .active(|el| el.bg(colors.selection))
-                                .on_click(cx.listener(|view, _, _, cx| view.save_github_proxy(cx)))
-                        },
-                    )),
+                    .child(
+                        action_button(
+                            "保存",
+                            19,
+                            self.github_proxy_changed()
+                                .then_some(UiAction::SaveGithubProxy),
+                            true,
+                            colors,
+                            cx,
+                        )
+                        .tab_index(19)
+                        .tab_stop(self.github_proxy_changed()),
+                    ),
             )
             .when_some(
                 self.command_error(FeedbackScope::GithubProxy).cloned(),
@@ -1334,7 +1429,7 @@ impl MainWindow {
                             } else {
                                 "重试恢复 DNS"
                             },
-                            17,
+                            20,
                             (!busy).then_some(UiAction::Run(Action::RetryDns)),
                             false,
                             colors,
@@ -1377,7 +1472,7 @@ impl MainWindow {
                                             .child(repository_link(
                                                 format!("Ladder {}", env!("CARGO_PKG_VERSION")),
                                                 "https://github.com/senzyo/ladder",
-                                                18,
+                                                21,
                                                 colors,
                                             ))
                                             .child(caption("MIT License", colors)),
@@ -1399,7 +1494,7 @@ impl MainWindow {
                                                     repository_link(
                                                         label,
                                                         url,
-                                                        19 + index as isize,
+                                                        22 + index as isize,
                                                         colors,
                                                     )
                                                 },
@@ -1418,7 +1513,7 @@ impl MainWindow {
                             .child(
                                 action_button(
                                     update_label,
-                                    22,
+                                    25,
                                     update_action,
                                     matches!(
                                         self.app_update,

@@ -83,10 +83,10 @@ fn main() {
         if ($scenario -ne 'rollback') { Copy-Item -LiteralPath $fixture -Destination $source } else { [IO.File]::WriteAllText($source, 'Invalid executable for rollback test') }
         $preserved = [ordered]@{
             'ladder-state.json' = 'preserve-this-state'
-            'configs/mihomo/test.yaml' = "mode: rule`ntun:`n  enable: false`n"
-            'configs/sing-box/test.json' = '{"outbounds":[{"type":"direct"}]}'
-            'configs/xray/test.json' = '{"outbounds":[{"protocol":"freedom"}]}'
-            'configs/mihomo/rules/local.yaml' = "payload:`n  - DOMAIN,example.test`n"
+            'mihomo_config/test.yaml' = "mode: rule`ntun:`n  enable: false`n"
+            'sing-box_config/test.json' = '{"outbounds":[{"type":"direct"}]}'
+            'xray_config/test.json' = '{"outbounds":[{"protocol":"freedom"}]}'
+            'mihomo_config/rules/local.yaml' = "payload:`n  - DOMAIN,example.test`n"
         }
         foreach ($entry in $preserved.GetEnumerator()) {
             $path = Join-Path $root $entry.Key

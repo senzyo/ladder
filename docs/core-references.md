@@ -23,7 +23,7 @@ Ladder 将路径作为单独的带引号参数传递, 不改写用户配置。
 - ZIP 名称带版本号, 内部 EXE 不带版本号, 例如 `mihomo-windows-amd64-v1.exe`。安装时仅将核心程序归一命名为 `mihomo.exe`, 保留其他归档文件。
 - [滚动预览发布](https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/Prerelease-Alpha)使用固定标签 `Prerelease-Alpha`, 资产名和版本输出包含 `alpha-<提交哈希>`。Ladder 按该哈希保存独立本地版本, 标记为预览版。下载前重新获取发布详情；若滚动发布已变化, 拒绝安装不匹配资产并提示刷新列表。
 
-所有核心下载均校验官方资产地址、声明大小、SHA-256 和暂存程序的版本。GitHub 加速前缀只包装请求地址, 不改变官方地址校验依据。
+所有核心下载均校验官方资产地址、声明大小、SHA-256 和暂存程序的版本。GitHub 加速链接前缀只包装请求地址, 不改变官方地址校验依据。
 
 ## 验证结果
 
