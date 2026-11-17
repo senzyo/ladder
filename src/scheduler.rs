@@ -378,6 +378,13 @@ mod tests {
             .replace(
                 ";;;BA)",
                 ";;;' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value + ')",
+            )
+            .replace(
+                "function Sorted-Aces",
+                // Windows 会将内置管理员测试账户的原始 SID 规范为 LA。
+                "$descriptor = [Security.AccessControl.RawSecurityDescriptor]::new('D:' + $aces)\n\
+                 $aces = $descriptor.GetSddlForm([Security.AccessControl.AccessControlSections]::Access).Substring(2)\n\
+                 function Sorted-Aces",
             );
         check_directory(&machine, &script).unwrap();
         fs::write(machine.join("dns-recovery.json"), b"[]").unwrap();

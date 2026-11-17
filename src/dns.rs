@@ -865,7 +865,7 @@ mod tests {
         for broken_machine in [false, true] {
             let portable = tempfile::tempdir().unwrap();
             let machine = tempfile::tempdir().unwrap();
-            let lease = DnsLease::with_legacy(machine.path(), portable.path());
+            let lease = DnsLease::with_legacy(machine.path(), &portable.path().join("."));
             let legacy = lease.legacy.as_ref().unwrap();
             let (broken, good) = if broken_machine {
                 (&lease.journal, legacy)
@@ -888,7 +888,12 @@ mod tests {
                     Ok(())
                 })
                 .unwrap_err();
-            assert!(error.contains(&broken.display().to_string()));
+            let resolved = fs::canonicalize(broken).unwrap();
+            assert!(
+                error.contains(&broken.display().to_string())
+                    || error.contains(&resolved.display().to_string()),
+                "{error}"
+            );
             assert_eq!(*restored.borrow(), [(V4, "192.0.2.1".into())]);
             assert_eq!(fs::read(broken).unwrap(), b"invalid");
         }
