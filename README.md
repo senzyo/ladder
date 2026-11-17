@@ -1,9 +1,16 @@
-# Ladder
-ladder 是 Windows 上的 mihomo、sing-box 和 Xray 轻量启动器。用户维护核心配置, Ladder 负责版本管理、配置验证、进程启停等操作。
+<p align="center">
+    <img src="icons/ladder.ico" width="100px" align="center" />
+    <h2 align="center">Ladder</h2>
+    <p align="center">
+        一个 Windows 上的 mihomo、sing-box 和 Xray 轻量启动器。
+    </p>
+</p>
 
-适用于自己搭建节点、并希望掌控配置全部细节的用户。
+用户维护核心配置, Ladder 负责版本管理、配置验证、进程启停等操作。仅适用于自己搭建节点、并希望掌控配置全部细节的用户。
 
-> 注意, 不支持导入分享链接来简单地使用, 你必须写完整的配置文件。
+**注意, 不支持导入分享链接来简单地使用, 你必须写完整的配置文件。**
+
+![运行截图](screenshots/main.png)
 
 ## 开始使用
 
@@ -69,10 +76,10 @@ Ladder 按网卡、地址族记录原 DNS (静态服务器或自动获取) 。
 
 启用 TUN 的配置使用同目录下的 `.ladder-tun-*` 运行副本, 为接口生成随机 `tun-` 名称；源配置不改写。正常停止、启动失败或核心退出时删除副本, 强制结束后的残留在下次启动清理。此文件名前缀保留给运行副本。
 
-TUN 残留清理沿用 ladder-main 的范围: 孤立或异常 WinTUN 设备, 以及描述以 `tun-` 开头的网络历史记录, 可能包含其他 VPN 的残留；保护正在托管的接口和系统现存接口。清理失败只记日志, 不阻止核心启动。
+TUN 残留清理沿用 ladder-tray 的范围: 孤立或异常 WinTUN 设备, 以及描述以 `tun-` 开头的网络历史记录, 可能包含其他 VPN 的残留；保护正在托管的接口和系统现存接口。清理失败只记日志, 不阻止核心启动。
 
 ## 开发与发布
 
-- [开发与测试说明](https://github.com/senzyo/ladder/blob/dev/docs/development-plan.md): 模块、验收范围与安全测试约束。
-- [构建和发布](https://github.com/senzyo/ladder/blob/dev/docs/releasing.md): 本地脚本、GitHub Actions、版本与产物约定。
-- [官方验证命令依据](https://github.com/senzyo/ladder/blob/dev/docs/core-references.md)。
+- [开发与测试说明](https://github.com/senzyo/ladder/blob/main/docs/development-plan.md): 模块、验收范围与安全测试约束。
+- [构建和发布](https://github.com/senzyo/ladder/blob/main/docs/releasing.md): 本地脚本、GitHub Actions、版本与产物约定。
+- [官方验证命令依据](https://github.com/senzyo/ladder/blob/main/docs/core-references.md)。

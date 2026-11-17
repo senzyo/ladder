@@ -30,7 +30,7 @@ Debug GPUI 从构建机的 Cargo 源码目录读取着色器, 复制到其他机
 
 ## 不影响主机网络的验证
 
-不要在运行 VPN/核心的主机直接执行完整测试或真实 Ladder。启动真实程序可能恢复 DNS、注册开机恢复任务或清理 TUN；部分旧测试创建 `sing-box.exe` / `xray.exe` 同名模拟进程, 可能被同时运行的 ladder-main 识别。完整进程与系统集成测试放到独立 Windows 沙盒或 GitHub Actions 临时 runner。
+不要在运行 VPN/核心的主机直接执行完整测试或真实 Ladder。启动真实程序可能恢复 DNS、注册开机恢复任务或清理 TUN；部分旧测试创建 `sing-box.exe` / `xray.exe` 同名模拟进程, 可能被同时运行的 ladder-tray 识别。完整进程与系统集成测试放到独立 Windows 沙盒或 GitHub Actions 临时 runner。
 
 以下集合使用纯解析、临时文件、模拟 DNS 或本机回环 HTTP, 不启动真实核心, 不更改主机 DNS/TUN。离线 DNS 恢复测试只在事务中创建临时 HKCU 键, 结束时自动回滚:
 
