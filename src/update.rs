@@ -12,8 +12,8 @@ use tempfile::TempDir;
 use ureq::{RequestBuilder, typestate::WithoutBody};
 use zip::ZipArchive;
 
+use crate::core::Core;
 use crate::managed_child::JobProcess;
-use crate::runtime::Core;
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(3);

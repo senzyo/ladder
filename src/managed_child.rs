@@ -32,8 +32,8 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+use crate::core::Core;
 use crate::core_output::CoreOutput;
-use crate::runtime::Core;
 use crate::tun_config::PreparedConfig;
 
 pub(crate) struct ManagedChild {

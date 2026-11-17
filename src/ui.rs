@@ -1,9 +1,10 @@
 use crate::app_updater::{AppUpdateState, AppUpdater};
+use crate::core::Core;
 use crate::desktop;
 use crate::runtime::{
-    Action, ConfigValidation, Core, CoreOperation, Runtime, Setting, Snapshot, ThemePreference,
+    Action, ConfigValidation, CoreOperation, CoreState, Runtime, Setting, Snapshot, ThemePreference,
 };
-use crate::update::{UpdateChannel, UpdateProgress};
+use crate::update::{CoreVersion, UpdateChannel, UpdateProgress};
 use gpui::{
     Animation, AnimationExt, App, Context, Div, ElementId, FocusHandle, FontWeight, Image,
     ImageFormat, PathBuilder, Rgba, ScrollHandle, SharedString, Stateful, Task, Timer, Window,
@@ -533,14 +534,13 @@ impl MainWindow {
             .min_h(px(0.))
             .flex()
             .flex_col();
-        let mut configs: Vec<_> = state.configs.iter().collect();
-        configs.sort_by_key(|name| state.current.as_ref() != Some(*name));
+        let configs = visible_configs(state);
         for (index, name) in configs.iter().copied().enumerate() {
             let current = state.current.as_ref() == Some(name);
             let target = DeleteTarget::Config(core, name.clone());
             let confirming = self.confirm_delete.as_ref() == Some(&target);
             let mut buttons = div().flex().items_center().flex_shrink_0().gap(px(8.));
-            let validation = state.validation.get(name);
+            let validation = state.validation(name);
             let checking = matches!(validation, Some(ConfigValidation::Checking));
             if matches!(validation, Some(ConfigValidation::Valid)) {
                 buttons = buttons.child(badge("配置合法", colors.version_stable, colors));
@@ -792,11 +792,7 @@ impl MainWindow {
         let state = self.snapshot.core(core);
         let can_manage = state.operation.is_none() && state.update.is_none();
         let downloaded_only = self.downloaded_only[core_index(core)];
-        let versions: Vec<_> = state
-            .versions
-            .iter()
-            .filter(|version| !downloaded_only || version.installed)
-            .collect();
+        let versions = visible_versions(state, downloaded_only);
         let mut rows = div()
             .id(("version-list", core_index(core)))
             .flex_1()
@@ -1487,27 +1483,22 @@ impl Render for MainWindow {
                     if let Page::Core(core) = view.page {
                         if view.show_versions[core_index(core)] {
                             let handles = &view.version_focus[core_index(core)];
-                            if let Some(index) = view
-                                .snapshot
-                                .core(core)
-                                .versions
-                                .iter()
-                                .filter(|version| {
-                                    !view.downloaded_only[core_index(core)] || version.installed
+                            if let Some(index) = visible_versions(
+                                view.snapshot.core(core),
+                                view.downloaded_only[core_index(core)],
+                            )
+                            .iter()
+                            .position(|version| {
+                                handles.get(&version.version).is_some_and(|handles| {
+                                    handles.iter().any(|handle| handle.is_focused(window))
                                 })
-                                .position(|version| {
-                                    handles.get(&version.version).is_some_and(|handles| {
-                                        handles.iter().any(|handle| handle.is_focused(window))
-                                    })
-                                })
-                            {
+                            }) {
                                 view.version_scroll[core_index(core)].scroll_to_item(index);
                                 cx.notify();
                             }
                         } else {
                             let state = view.snapshot.core(core);
-                            let mut configs: Vec<_> = state.configs.iter().collect();
-                            configs.sort_by_key(|name| state.current.as_ref() != Some(*name));
+                            let configs = visible_configs(state);
                             let handles = &view.config_focus[core_index(core)];
                             if let Some(index) = configs.iter().position(|name| {
                                 handles.get(*name).is_some_and(|handles| {
@@ -1542,6 +1533,20 @@ impl Render for MainWindow {
                     .child(div().flex_1().min_h(px(0.)).child(page)),
             )
     }
+}
+
+fn visible_configs(state: &CoreState) -> Vec<&String> {
+    let mut configs: Vec<_> = state.configs.iter().collect();
+    configs.sort_by_key(|name| state.current.as_ref() != Some(*name));
+    configs
+}
+
+fn visible_versions(state: &CoreState, downloaded_only: bool) -> Vec<&CoreVersion> {
+    state
+        .versions
+        .iter()
+        .filter(|version| !downloaded_only || version.installed)
+        .collect()
 }
 
 fn core_index(core: Core) -> usize {

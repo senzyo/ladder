@@ -2,7 +2,7 @@ use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use crate::{logging, runtime::Core};
+use crate::{core::Core, logging};
 
 pub(crate) struct CoreOutput {
     stdout: JoinHandle<Option<&'static str>>,

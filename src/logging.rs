@@ -10,7 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::SYSTEMTIME;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
-use crate::runtime::Core;
+use crate::core::Core;
 
 const FILE_LIMIT: u64 = 2 * 1024 * 1024;
 const RECENT_LIMIT: usize = 500;

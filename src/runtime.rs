@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::Core;
 use crate::core_output::CoreDiagnostics;
 use crate::dns::DnsLease;
 use crate::logging;
@@ -17,40 +18,6 @@ use crate::managed_child::{JobProcess, ManagedChild};
 use crate::scheduler::{DesktopDns, desktop_dns};
 use crate::update::{self, CoreVersion, PreparedUpdate, UpdateProgress};
 use crate::{tun_cleanup, tun_config};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Core {
-    SingBox,
-    Xray,
-    Mihomo,
-}
-
-impl Core {
-    pub const ALL: [Core; 3] = [Core::Mihomo, Core::SingBox, Core::Xray];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::SingBox => "sing-box",
-            Self::Xray => "xray",
-            Self::Mihomo => "mihomo",
-        }
-    }
-
-    fn config_dir(self, root: &Path) -> PathBuf {
-        root.join("configs").join(self.label())
-    }
-
-    pub(crate) fn core_dir(self, root: &Path) -> PathBuf {
-        root.join(format!("{}_core", self.label()))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn executable(self, root: &Path) -> PathBuf {
-        self.core_dir(root)
-            .join("1.0.0")
-            .join(format!("{}.exe", self.label()))
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,6 +93,12 @@ pub enum ConfigValidation {
     Invalid(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ValidationRecord {
+    result: ConfigValidation,
+    stamp: Option<(u64, Option<SystemTime>)>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreOperation {
     Starting,
@@ -156,10 +129,15 @@ pub struct CoreState {
     pub versions_error: Option<String>,
     pub local_versions_error: Option<String>,
     pub downloading_version: Option<String>,
-    pub validation: BTreeMap<String, ConfigValidation>,
-    validation_stamps: BTreeMap<String, (u64, Option<SystemTime>)>,
+    validation: BTreeMap<String, ValidationRecord>,
     pub validation_busy: bool,
     versions_page: u32,
+}
+
+impl CoreState {
+    pub fn validation(&self, name: &str) -> Option<&ConfigValidation> {
+        self.validation.get(name).map(|record| &record.result)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -538,12 +516,16 @@ impl Runtime {
             })
             .collect::<Vec<_>>();
         for (name, _, stamp) in &jobs {
-            state
-                .validation
-                .insert(name.clone(), ConfigValidation::Checking);
-            if let Some(stamp) = stamp {
-                state.validation_stamps.insert(name.clone(), *stamp);
-            }
+            // 读取失败时保留已有指纹, 延续刷新时的失效判断。
+            let stamp =
+                stamp.or_else(|| state.validation.get(name).and_then(|record| record.stamp));
+            state.validation.insert(
+                name.clone(),
+                ValidationRecord {
+                    result: ConfigValidation::Checking,
+                    stamp,
+                },
+            );
         }
         state.validation_busy = true;
         let runtime = self.clone();
@@ -564,7 +546,7 @@ impl Runtime {
                         || path
                             .as_ref()
                             .is_ok_and(|path| executable_stamp(path) != stamp)
-                        || state.validation.get(&name) != Some(&ConfigValidation::Checking)
+                        || state.validation(&name) != Some(&ConfigValidation::Checking)
                     {
                         state.validation.remove(&name);
                         continue;
@@ -578,16 +560,13 @@ impl Runtime {
                             ConfigValidation::Invalid(error)
                         }
                     };
-                    state.validation.insert(name, value);
+                    state.validation.get_mut(&name).unwrap().result = value;
                 }
                 let mut snapshot = runtime.state.lock().unwrap();
                 let state = snapshot.core_mut(core);
                 state
                     .validation
-                    .retain(|_, value| *value != ConfigValidation::Checking);
-                state
-                    .validation_stamps
-                    .retain(|name, _| state.validation.contains_key(name));
+                    .retain(|_, record| record.result != ConfigValidation::Checking);
                 state.validation_busy = false;
             })
             .map_err(|error| {
@@ -1239,14 +1218,10 @@ impl Worker {
             let local_versions = update::installed_versions(core, &self.root);
             let mut snapshot = self.state.lock().unwrap();
             let state = snapshot.core_mut(core);
-            state.validation.retain(|name, _| {
+            state.validation.retain(|name, record| {
                 state.selected_version == *self.saved.selected_version(core)
-                    && state.validation_stamps.get(name).copied()
-                        == executable_stamp(&core.config_dir(&self.root).join(name))
+                    && record.stamp == executable_stamp(&core.config_dir(&self.root).join(name))
             });
-            state
-                .validation_stamps
-                .retain(|name, _| state.validation.contains_key(name));
             state.installed = installed;
             state.selected_version = self.saved.selected_version(core).clone();
             match local_versions {
@@ -1291,7 +1266,6 @@ impl Worker {
             let stamp = exe.as_deref().and_then(executable_stamp);
             if self.version_files[core as usize] != stamp {
                 state.validation.clear();
-                state.validation_stamps.clear();
                 self.version_files[core as usize] = stamp;
                 state.version = None;
                 state.version_error = None;
@@ -1691,7 +1665,7 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(matches!(
-            runtime.snapshot().core(core).validation.get("locked.yaml"),
+            runtime.snapshot().core(core).validation("locked.yaml"),
             Some(ConfigValidation::Invalid(_))
         ));
         let mut worker = Worker {
@@ -1705,7 +1679,7 @@ mod tests {
         };
         worker.refresh();
         assert!(matches!(
-            runtime.snapshot().core(core).validation.get("locked.yaml"),
+            runtime.snapshot().core(core).validation("locked.yaml"),
             Some(ConfigValidation::Invalid(_))
         ));
     }
@@ -1862,7 +1836,7 @@ mod tests {
         runtime.send(Action::ValidateAllConfigs(core)).unwrap();
         validation_started(&config);
         assert_eq!(
-            runtime.snapshot().core(core).validation.get("wait.json"),
+            runtime.snapshot().core(core).validation("wait.json"),
             Some(&ConfigValidation::Checking)
         );
         for action in [
@@ -1874,15 +1848,15 @@ mod tests {
         fs::write(config.with_extension("continue"), []).unwrap();
         let state = validation_done(&runtime, core);
         assert_eq!(
-            state.validation.get("wait.json"),
+            state.validation("wait.json"),
             Some(&ConfigValidation::Valid)
         );
         assert_eq!(
-            state.validation.get("日常.JSON"),
+            state.validation("日常.JSON"),
             Some(&ConfigValidation::Valid)
         );
         assert_eq!(
-            state.validation.get("失败.json"),
+            state.validation("失败.json"),
             Some(&ConfigValidation::Invalid(
                 "fixture configuration rejected".into()
             ))
@@ -1891,7 +1865,7 @@ mod tests {
             .send(Action::ValidateConfig(core, "wait.json".into()))
             .unwrap();
         assert_eq!(
-            validation_done(&runtime, core).validation.get("wait.json"),
+            validation_done(&runtime, core).validation("wait.json"),
             Some(&ConfigValidation::Valid)
         );
         assert!(runtime.shutdown().unwrap().is_none());
@@ -1950,7 +1924,6 @@ mod tests {
                 !state.validation.contains_key("wait.json"),
                 "{change}: {state:?}"
             );
-            assert!(!state.validation_stamps.contains_key("wait.json"));
             assert!(runtime.shutdown().unwrap().is_none());
         }
     }

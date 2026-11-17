@@ -1,5 +1,6 @@
 mod app_update;
 mod app_updater;
+mod core;
 mod core_output;
 mod desktop;
 mod dns;

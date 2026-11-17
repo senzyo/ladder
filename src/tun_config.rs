@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use tempfile::NamedTempFile;
 
-use crate::runtime::Core;
+use crate::core::Core;
 
 pub(crate) const TUN_PREFIX: &str = "tun-";
 pub(crate) const RUNTIME_PREFIX: &str = ".ladder-tun-";
