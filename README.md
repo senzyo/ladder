@@ -71,6 +71,6 @@ TUN 残留清理沿用 ladder-main 的范围: 孤立或异常 WinTUN 设备, 以
 
 ## 开发与发布
 
-- [开发与测试说明](docs/development-plan.md): 模块、验收范围与安全测试约束。
-- [构建和发布](docs/releasing.md): 本地脚本、GitHub Actions、版本与产物约定。
-- [官方验证命令依据](docs/core-references.md)。
+- [开发与测试说明](https://github.com/senzyo/ladder/blob/dev/docs/development-plan.md): 模块、验收范围与安全测试约束。
+- [构建和发布](https://github.com/senzyo/ladder/blob/dev/docs/releasing.md): 本地脚本、GitHub Actions、版本与产物约定。
+- [官方验证命令依据](https://github.com/senzyo/ladder/blob/dev/docs/core-references.md)。

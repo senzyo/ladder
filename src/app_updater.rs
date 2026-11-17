@@ -49,7 +49,7 @@ impl Default for AppUpdater {
             .unwrap_or(false)
         {
             state.status = AppUpdateState::Failed(
-                "上次软件更新未完成, 配置已保留。请重试更新, 或退出后手动替换 ladder.exe；详情见程序目录的 update-error.log。".into(),
+                "上次软件更新未完成, 配置已保留。请重试更新, 或退出后手动替换 ladder.exe。".into(),
             );
         }
         Self(Arc::new(Mutex::new(state)))
