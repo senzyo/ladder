@@ -29,7 +29,7 @@ ZIP 顶层只包含 `ladder.exe`、`README.md`、`LICENSE`。不打包核心、�
 
 ## GitHub Actions
 
-`.github/workflows/release.yml` 在临时 Windows runner 上执行：
+`.github/workflows/release.yml` 定义了以下临时 Windows runner 作业；定义存在不代表已经运行，实际记录见[验收记录](verification-2026-11-17.md)：
 
 | 触发 | 行为 |
 | --- | --- |
@@ -43,19 +43,23 @@ ZIP 顶层只包含 `ladder.exe`、`README.md`、`LICENSE`。不打包核心、�
 
 ## 发版步骤
 
+本轮本地任务仅编译和核对两种架构的 Release 包，不执行 `-Publish`。以下为通用发版流程，不表示本轮已执行标签发布或本地发布；实际运行结果见[验收记录](verification-2026-11-17.md)。
+
 1. 修改 Cargo.toml 版本并更新 Cargo.lock，完成代码审核和检查。
 2. 在隔离环境验证真实核心/托盘/DNS恢复，在两种架构检查启动。
 3. 提交代码，将对应提交推送到 GitHub。
 4. 创建并推送与 Cargo 版本一致的标签，如 `v3.0.0-alpha.1`；Actions 自动发布。
-5. 查看工作流结果和四个发布资产，用上一个发行版测试“检查更新→下载→退出并更新”。
+5. 查看工作流结果和四个发布资产，用本次重写实现的前一版本测试“检查更新→下载更新→重启以更新”。旧 `2.34.0` 仅用于检查更新目标过滤，不承担新实现的完整升级验收。
 
-也支持本地发布（需要已登录 `gh`）：
+也支持本地发布（需要已登录 `gh`，本轮不执行）：
 
 ```powershell
 ./scripts/release.ps1 -Publish
 ```
 
-本地发布要求干净工作区、两种架构重新构建，且远端精确版本标签指向当前 HEAD。禁止 `-SkipBuild -Publish`。它创建新 Release，不覆盖现有 Release；同一标签选择本地或 Actions 一种方式发布，避免并行创建。
+本地发布要求干净工作区、两种架构重新构建，且远端精确版本标签指向当前 HEAD。禁止 `-SkipBuild -Publish`。它创建新 Release，不覆盖现有 Release。
+
+同一标签应选择 Actions 或本地一种发布路径。若未来使用本地发布，须先安排该标签的 Actions 发布不同时执行；这不属于本轮本地编译任务，也不作为本轮构建的阻塞条件。
 
 ## 软件升级契约
 
@@ -66,4 +70,4 @@ ZIP 顶层只包含 `ladder.exe`、`README.md`、`LICENSE`。不打包核心、�
 - PowerShell 5.1 助手等待原 PID 结束，再校验 EXE 哈希并使用原子替换。替换或新进程启动失败时恢复旧 EXE；设置与配置不在替换范围。
 - 失败诊断为程序目录 `update-error.log`，下次启动在“关于”提示。成功清除该标记。
 
-流程脚本已提供；本次开发任务不推送标签、不创建真实 Release，也不修改远端仓库。
+本地构建、远端检查、手动工作流打包与真正发布须分别记录证据；在[验收记录](verification-2026-11-17.md)核对提交号、运行链接、版本及资产校验结果。本轮不执行的本地 `-Publish` 不记为失败或待解除的阻塞。
