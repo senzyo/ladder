@@ -2,20 +2,14 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, TryLockError};
-use std::io;
+use std::io::{self, Write};
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY, UnmapViewOfFile,
-};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows_sys::Win32::UI::Shell::{CSIDL_PROGRAM_FILES, CSIDL_SYSTEM, SHGetFolderPathW};
 
@@ -24,6 +18,8 @@ use crate::logging;
 
 pub(crate) const BOOT_ARGUMENT: &str = "--restore-dns-on-boot";
 const TASK_NAME: &str = "Reset_DNS_On_Boot";
+const RECOVERY_EXECUTABLE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ladder-dns-recovery.exe"));
 
 fn system_folder(id: u32) -> Result<PathBuf> {
     let mut buffer = [0u16; 260];
@@ -173,9 +169,7 @@ pub(crate) fn desktop_dns(portable: &Path) -> (DesktopDns, Option<String>) {
     if let Err(error) = lock_desktop_session(&session) {
         return unavailable(error);
     }
-    let warning = std::env::current_exe()
-        .context("无法定位 Ladder 程序")
-        .and_then(|exe| ensure_boot_dns_reset_task(&exe, &directory))
+    let warning = ensure_boot_dns_reset_task(&directory)
         .err()
         .map(|error| format!("更新开机 DNS 恢复任务失败: {error:#}"));
     if let Some(message) = &warning {
@@ -253,60 +247,22 @@ fn task_xml(helper: &Path) -> String {
     )
 }
 
-fn running_image(exe: &Path) -> Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    let source = File::options()
-        .read(true)
-        .share_mode(1 /* FILE_SHARE_READ */)
-        .open(exe)?;
-    // 文件名所在的便携目录可以被移动。确认同一个文件对象后, 从此句柄读取 SYSTEM 副本。
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        fn NtAreMappedFilesTheSame(
-            image: *const std::ffi::c_void,
-            data: *const std::ffi::c_void,
-        ) -> i32;
-    }
-    // 仅映射文件开头用于查询内核对象身份, 不执行或解引用其中的内容。
-    let same = unsafe {
-        let mapping = CreateFileMappingW(
-            source.as_raw_handle(),
-            std::ptr::null(),
-            PAGE_READONLY,
-            0,
-            0,
-            std::ptr::null(),
-        );
-        if mapping.is_null() {
-            return Err(io::Error::last_os_error().into());
-        }
-        let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 1);
-        CloseHandle(mapping);
-        if view.Value.is_null() {
-            bail!("无法映射开机 DNS 恢复程序");
-        }
-        let status = NtAreMappedFilesTheSame(GetModuleHandleW(std::ptr::null()), view.Value);
-        UnmapViewOfFile(view);
-        status == 0
-    };
-    if !same {
-        bail!("Ladder 程序路径已变化, 无法核实开机 DNS 恢复程序");
-    }
-    Ok(source)
-}
-
-fn ensure_boot_dns_reset_task(exe: &Path, directory: &Path) -> Result<()> {
+fn install_recovery_helper(directory: &Path) -> Result<PathBuf> {
     let helper = directory.join("ladder-dns-recovery.exe");
-    // 从运行中的映像复制内容, 新文件继承受保护目录的权限。完整写入后才替换恢复程序。
+    // 内嵌程序来自运行中的映像, 新文件继承受保护目录的权限。
     let staged = helper.with_extension("tmp");
     {
-        let mut source = running_image(exe)?;
         let mut dest = File::create(&staged)?;
-        io::copy(&mut source, &mut dest).context("复制开机 DNS 恢复程序失败")?;
+        dest.write_all(RECOVERY_EXECUTABLE)
+            .context("写入开机 DNS 恢复程序失败")?;
         dest.sync_all()?;
     }
     fs::rename(&staged, &helper).context("更新开机 DNS 恢复程序失败")?;
+    Ok(helper)
+}
 
+fn ensure_boot_dns_reset_task(directory: &Path) -> Result<()> {
+    let helper = install_recovery_helper(directory)?;
     let xml = directory.join("dns-task.xml");
     let contents: Vec<_> = std::iter::once(0xfeff)
         .chain(task_xml(&helper).encode_utf16())
@@ -338,13 +294,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn helper_source_must_be_the_running_image() {
-        let exe = std::env::current_exe().unwrap();
-        running_image(&exe).unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let copy = temp.path().join("other.exe");
-        fs::write(&copy, b"test fixture").unwrap();
-        assert!(running_image(&copy).is_err());
+    fn installed_recovery_helper_is_small() {
+        let directory = tempfile::tempdir().unwrap();
+        let helper = install_recovery_helper(directory.path()).unwrap();
+        let size = fs::metadata(&helper).unwrap().len();
+        assert!(size < 2 * 1024 * 1024, "DNS 恢复程序过大: {size} 字节");
+        // 无效参数必须直接退出, 不能启动桌面或访问真实恢复目录。
+        let status = Command::new(helper)
+            .arg("--invalid-test-argument")
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

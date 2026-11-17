@@ -12,7 +12,7 @@
 ./scripts/release.ps1 -Architecture arm64
 ```
 
-构建读取 Cargo.toml 版本, 使用 `cargo build --release --locked --target ...`。已经构建时可加 `-SkipBuild` 仅打包；脚本仍验证 EXE 的产品版本和 PE 架构。
+构建读取 Cargo.toml 版本, 使用 `cargo build --release --locked --target ...`。构建脚本会先编译同架构的小型 DNS 恢复助手并嵌入主程序, 无需另行分发助手。已经构建时可加 `-SkipBuild` 仅打包；脚本仍验证 EXE 的产品版本和 PE 架构。
 
 产物位于 `dist/`:
 
@@ -41,7 +41,7 @@ ZIP 顶层只包含 `ladder.exe`、`README.md`、`LICENSE`。不打包核心、�
 
 ## 发版步骤
 
-1. 修改 Cargo.toml 版本并更新 Cargo.lock, 完成代码审核和检查。
+1. 同步修改根目录和 `dns-recovery/` 的 Cargo.toml 版本并更新各自的 Cargo.lock, 完成代码审核和检查。
 2. 在隔离环境验证真实核心/托盘/DNS恢复, 在两种架构检查启动。
 3. 提交代码, 将对应提交推送到 GitHub。
 4. 创建并推送与 Cargo 版本一致的标签, 格式为 `v<版本>`；Actions 自动发布。

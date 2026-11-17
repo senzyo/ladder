@@ -32,9 +32,15 @@ jobs:
         run: |
           cargo fmt --check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo fmt --manifest-path dns-recovery/Cargo.toml --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo clippy --locked --all-targets -- -D warnings
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo clippy --manifest-path dns-recovery/Cargo.toml --locked --all-targets -- -D warnings
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test --locked --lib
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --manifest-path dns-recovery/Cargo.toml --locked
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Verify package and update helper before merge
         run: |
