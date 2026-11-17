@@ -9,8 +9,9 @@ use windows_sys::Win32::Foundation::{GetLastError, HWND};
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::UI::Shell::{
-    SE_ERR_ASSOCINCOMPLETE, SE_ERR_NOASSOC, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW,
-    ShellExecuteExW, ShellExecuteW,
+    ASSOCF_INIT_IGNOREUNKNOWN, ASSOCF_NOFIXUPS, ASSOCSTR_COMMAND, ASSOCSTR_DELEGATEEXECUTE,
+    ASSOCSTR_DROPTARGET, AssocQueryStringW, SE_ERR_ASSOCINCOMPLETE, SE_ERR_NOASSOC,
+    SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetForegroundWindow, SW_SHOWNORMAL, WM_NCACTIVATE,
@@ -74,16 +75,25 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
     if !metadata.is_file() {
         return Err("所选路径不是配置文件".into());
     }
-    if !path.extension().is_some_and(|extension| {
-        ["json", "yaml", "yml"]
-            .iter()
-            .any(|kind| extension.eq_ignore_ascii_case(kind))
-    }) {
-        return Err("只能编辑 JSON 或 YAML 配置文件".into());
-    }
+    let extension = path
+        .extension()
+        .filter(|extension| {
+            ["json", "yaml", "yml"]
+                .iter()
+                .any(|kind| extension.eq_ignore_ascii_case(kind))
+        })
+        .ok_or_else(|| "只能编辑 JSON 或 YAML 配置文件".to_string())?;
+    let wide_extension: Vec<u16> = Some(b'.' as u16)
+        .into_iter()
+        .chain(extension.encode_wide())
+        .chain(Some(0))
+        .collect();
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     // 部分编辑器仅注册 open；让 Shell 解析用户关联，不自行拼接注册表命令。
     for verb in [w!("edit"), w!("open")] {
+        if !has_editor_association(&wide_extension, verb) {
+            continue;
+        }
         match launch_editor(verb, &wide_path, None) {
             Ok(()) => return Ok(()),
             Err((SE_ERR_NOASSOC | SE_ERR_ASSOCINCOMPLETE, _)) => {}
@@ -117,6 +127,31 @@ pub(crate) fn edit_config(path: &Path) -> Result<(), String> {
         .map_err(|(_, error)| format!("无法启动系统记事本 (Windows 错误码 {error})"))
 }
 
+fn has_editor_association(extension: &[u16], verb: *const u16) -> bool {
+    [
+        ASSOCSTR_COMMAND,
+        ASSOCSTR_DELEGATEEXECUTE,
+        ASSOCSTR_DROPTARGET,
+    ]
+    .into_iter()
+    .any(|kind| {
+        let mut length = 0;
+        // 只查询长度，排除会打开选择器的 Unknown 关联；COM 处理器不一定有命令行。
+        // 输入均以 NUL 结尾，查询不修复注册表，也不启动处理器。
+        let result = unsafe {
+            AssocQueryStringW(
+                ASSOCF_INIT_IGNOREUNKNOWN | ASSOCF_NOFIXUPS,
+                kind,
+                extension.as_ptr(),
+                verb,
+                ptr::null_mut(),
+                &mut length,
+            )
+        };
+        result >= 0 && length > 1
+    })
+}
+
 fn launch_editor(
     verb: *const u16,
     file: &[u16],
@@ -142,6 +177,19 @@ fn launch_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_extension_has_no_editor_association() {
+        let directory = tempfile::tempdir().unwrap();
+        let extension = format!(
+            ".ladder-no-editor-{}",
+            directory.path().file_name().unwrap().to_string_lossy()
+        );
+        let extension: Vec<u16> = extension.encode_utf16().chain(Some(0)).collect();
+        for verb in [w!("edit"), w!("open")] {
+            assert!(!has_editor_association(&extension, verb));
+        }
+    }
 
     #[test]
     fn missing_paths_fail_before_launching_shell() {
