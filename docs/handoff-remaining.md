@@ -1,12 +1,12 @@
 # ladder-dev 交接结果与剩余边界
 
-更新于 2026-11-17。接手基准为 `7102fdd`；当前生产源码为 `0b35edde8a97193c0277b1d42ff3be6d2013b41e`，已仅推送到 GitHub dev。生产实现、增量 review、本地双架构构建和既定真实 UI 验收已结束；本文件与另外两份交付文档待最终 review/提交，随后按确认方案执行标签预发布。ladder-main 仅作参考，未修改 main。
+更新于 2026-11-17。接手基准为 `7102fdd`；生产源码为 `0b35edde8a97193c0277b1d42ff3be6d2013b41e`，交付文档已在 `aaa5d2869ee745d79938a1c1a086a2c634ba7d14` review/提交。生产实现、增量 review、本地双架构构建、既定真实 UI 验收及 `v3.0.0-alpha.1` 标签预发布均已完成。代码和标签只推送到 GitHub，ladder-main 仅作参考，未修改 main。
 
 完整版本、提交、截图、日志与历史失败记录见 [验收记录](verification-2026-11-17.md)。本机证据位于忽略目录 `target/handoff-20261117/`，不进入发行包。
 
 ## 已完成
 
-- **代码与构建**：正式更新过滤、原生运行错误显示、简化托盘和默认编辑器回退已修复并独立 review。最新 [push CI](https://github.com/senzyo/ladder/actions/runs/44000070418) 的 fmt/clippy 和默认测试为 125 通过、0 失败、4 忽略；本地 AMD64/ARM64 Release 的 ZIP 白名单、版本、PE 和 SHA-256 均独立核对通过。前序 [手动双架构工作流](https://github.com/senzyo/ladder/actions/runs/43995383477)及助手 6 场景通过，保留其实际提交 `4fd63bb`，不混作最新构建。
+- **代码与构建**：正式更新过滤、原生运行错误显示、简化托盘和默认编辑器回退已修复并独立 review。生产提交 `0b35edd` 的 [push CI](https://github.com/senzyo/ladder/actions/runs/44000070418)及最终[标签工作流](https://github.com/senzyo/ladder/actions/runs/44004507258)均通过 fmt/clippy 和 125 通过、0 失败、4 忽略的默认测试。最终标签还完成双架构构建、助手 6 场景与预发布；已下载四个发布资产，ZIP 白名单、版本、PE、配套 SHA-256 和全部 GitHub API digest 独立核对通过。前序构建保留对应提交历史，不混作最新发行资产。
 - **真实核心与恢复**：稳定/预览两组三核心下载、配置、生命周期、自动启动和真实共存通过，每核均有两个同伴监听检查。mihomo 正常停止、sing-box 核心异常退出、Xray 所在应用异常退出后重启三类 DNS 恢复通过。最终三核同时运行后从新托盘退出，command 67 独立复核确认应用/核心进程、运行副本、journal、MIB/PnP/NetAdapter TUN 全部为空，DNS 回基线，源配置和默认路由不变。command 66 仅取证脚本编码失败，以 67 完整结果为准。
 - **简化托盘**：仅保留打开 Ladder、打开程序目录、退出。菜单打开、隐藏后左键恢复、正确目录及三核运行后的退出/恢复/清理全部实测通过。用户撤销的旧三核心托盘操作仅保留历史证据，不再列为需求。
 - **真实配置验证**：三核心原生错误进入主界面与对应日志，sing-box/Xray 批量失败后继续，18 项原生资源探针通过。mihomo 缺 provider 的真实请求对照证实会继续运行并命中后续规则；按用户选择保持原生检查，不加本地预检。
@@ -23,10 +23,10 @@
 - **Xray 加速链路**：一次受控重试仍在版本列表阶段被 API 限流，保留失败，不再连续重试。
 - **其他边界**：验证超时/进行中退出使用真实生产 UI 与无害 fixture，不代表官方核心解析或联网资源卡死的专项验收。核心更新失败后的实际系统恢复、其他缩放比例及未逐项复测的键盘组合不补推为通过；已有纯 UI 记录仍按原范围使用。
 
-## 标签发布等待
+## 预发布结果
 
-当前没有创建或推送 `v3.0.0-alpha.1`，也未创建对应 Release。等待最终三份文档 review/提交确认后，仅向 GitHub 推送确认提交的标签，由工作流重新检查、构建两架构并发布 prerelease；不合并 main，不再重复 manual，不使用本地 `-Publish`，不替换正式版 latest。
+[v3.0.0-alpha.1 预发布](https://github.com/senzyo/ladder/releases/tag/v3.0.0-alpha.1)已由[标签工作流](https://github.com/senzyo/ladder/actions/runs/44004507258)完成，标签指向 `aaa5d2869ee745d79938a1c1a086a2c634ba7d14`。发布后核对 `prerelease=true`、`draft=false`，四资产均完整上传；正式版 latest 仍为 `v2.34.0`，main 未改变。本地只构建与核验，没有执行 `-Publish`，没有删除旧 dist 文件。
 
-标题及正文草稿已 review，位于 `target/handoff-20261117/prerelease-notes-3.0.0-alpha.1.txt`；发布后补记实际 tag SHA、运行链接、四资产校验与 Release URL。发布方法和更新契约见 [发布说明](releasing.md)。
+已将审核通过的标题和正文写入预发布并逐字核对，文案为 `target/handoff-20261117/prerelease-notes-3.0.0-alpha.1.txt`。最终 API/标签/latest/资产审计为 `published-release-audit.json`，下载包核验为 `published-v3.0.0-alpha.1/verified-packages.json`，两者均在上述证据根目录；准确发布 ZIP 校验值见[验收记录](verification-2026-11-17.md)。发布方法和更新契约见 [发布说明](releasing.md)。
 
 后续如继续验收，仍遵守仓库 AGENTS.md：真实核心、完整进程及 DNS/TUN 操作放在 Windows 沙盒或独立虚拟机，避免影响主机网络。不得把上列受限项或历史 harness 结果写成全部完成。

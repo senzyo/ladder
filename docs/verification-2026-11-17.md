@@ -78,7 +78,7 @@ Computer Use 操作独立 `Ladder TODO 隔离验收` 窗口，生产 UI 文件�
 
 用户随后要求删除托盘中的三核心操作，仅保留打开 Ladder、打开程序目录和退出。`dc0a1d20fbc27b07ed08c443ba8369846927b577` 已完成该实现及独立 review，本地双架构重建、包校验和真实菜单操作通过；最终 `0b35edd` 上的三核心运行后托盘退出与恢复清理也已通过。下述 `4fd63bb` 的构建及校验保留为对应生产版本的历史证据。
 
-真实编辑检查另发现默认关联为 Unknown/OpenWith 时绕过 Notepad 回退。`0b35edde8a97193c0277b1d42ff3be6d2013b41e` 已仅修复 `desktop.rs`：优先查找有效 edit/open 关联，忽略 Unknown/OpenWith 回退，无有效处理程序时直接打开系统记事本，有效用户关联仍交给 Shell。独立 review、3 项 desktop 纯测试及 fmt/clippy 通过。该提交已只推送 GitHub `dev`，本地双架构增量构建及独立包校验通过，[push CI](https://github.com/senzyo/ladder/actions/runs/44000070418)也成功：fmt/clippy 和默认测试 **125 通过、0 失败、4 忽略，23.52 秒**，日志为 `target/handoff-20261117/actions-push-0b35edd.log`。同一 AMD64 EXE 的真实编辑器复验已通过；未触发新的 manual 或标签发布，不因该单文件改动重复原三核心全量沙盒矩阵。
+真实编辑检查另发现默认关联为 Unknown/OpenWith 时绕过 Notepad 回退。`0b35edde8a97193c0277b1d42ff3be6d2013b41e` 已仅修复 `desktop.rs`：优先查找有效 edit/open 关联，忽略 Unknown/OpenWith 回退，无有效处理程序时直接打开系统记事本，有效用户关联仍交给 Shell。独立 review、3 项 desktop 纯测试及 fmt/clippy 通过。该提交已只推送 GitHub `dev`，本地双架构增量构建及独立包校验通过，[push CI](https://github.com/senzyo/ladder/actions/runs/44000070418)也成功：fmt/clippy 和默认测试 **125 通过、0 失败、4 忽略，23.52 秒**，日志为 `target/handoff-20261117/actions-push-0b35edd.log`。同一 AMD64 EXE 的真实编辑器复验已通过；该阶段未触发新的 manual 或标签发布，不因该单文件改动重复原三核心全量沙盒矩阵。
 
 新 Release 的真实菜单已验证：仅有上述三项；右键菜单打开 Ladder、关闭窗口隐藏后左键恢复、打开正确程序目录 `C:\ladder-real` 均通过。证据为 `output/simple-tray-menu.png`、`output/simple-tray-directory.png`；最终三核心运行后的托盘退出与 DNS 恢复/清理结果见后文。真实检查更新显示“已是最新版本”，截图为 `output/check-update-current-and-dns-on.png`；截图中开关状态本身不证明实际 DNS 接管。
 
@@ -86,14 +86,27 @@ Computer Use 操作独立 `Ladder TODO 隔离验收` 窗口，生产 UI 文件�
 
 真实下载官方 mihomo `1.19.33` 后，从 `1.19.34` 切换到 `1.19.33`，旧绿色验证结果清除；command 61 的状态与日志确认切换成功，随后已切回 `1.19.34`。证据为 `output/version-validation-before.png`、`output/version-validation-after.png`、`output/version-switched-settings.json`。前缀连续保存也实测落盘：Tab 补全默认前缀后追加 `qa` 再保存，command 59 确认最终值为 `https://gh-proxy.org/qa/`；清空再保存后 command 60 确认 `github_proxy` 为空，随后使用直连下载。`qa` 路径只用于保存核对，没有向该路径发出网络请求。输入 `v` 时的格式错误提示也实际出现；证据为 `output/prefix-last-saved.png`、`output/prefix-second-settings.json`、`output/prefix-cleared-settings.json`。
 
-最初未找到 `gh`；用户随后完成配置，GitHub CLI `2.104.0` 登录和仓库写入权限已核实。本轮只向 GitHub 推送 `dev`，未修改 `main`、推送标签或创建 Release；本地按用户要求只编译 Release 包，`-Publish` 不属于本轮任务，不再作为阻塞条件。
+最初未找到 `gh`；用户随后完成配置，GitHub CLI `2.104.0` 登录和仓库写入权限已核实。本轮只向 GitHub 推送 `dev` 和已确认的 `v3.0.0-alpha.1` 标签，由标签工作流创建预发布；未修改 `main`。本地按用户要求只编译和核对 Release 包，没有执行 `-Publish`。
 
 新 `Build and release` 工作流已实际运行：
 
 - `6ab19ea8daca2a1c80bad635cee25da9584164fc` 的 [push 检查](https://github.com/senzyo/ladder/actions/runs/43991029651)中 fmt/clippy 通过，测试为 118 通过、2 失败、4 忽略。失败分别是错误消息中的路径别名和测试账户 SID 的 SDDL 表示差异，日志为 `target/handoff-20261117/actions-push-6ab19ea.log`。
 - `64d35b7ec95357dfb078585359876afbb4ef89c0` 仅修正这两项测试后，[远端复测](https://github.com/senzyo/ladder/actions/runs/43993016349)成功，fmt/clippy 和默认测试 120 通过、0 失败、4 忽略，日志为 `actions-push-64d35b7.log`。同提交的[手动双架构工作流](https://github.com/senzyo/ladder/actions/runs/43993826825)通过 `--ref dev` 成功触发；因生产修复随后提交，主动取消这次过时构建以放行最终提交检查，不记为构建失败。
 - `4fd63bb98157245073d06c641a976f4d247eb211` 已只推送到 GitHub `dev`，其 [push 检查](https://github.com/senzyo/ladder/actions/runs/43994241082)成功：fmt/clippy 通过，默认测试 **124 通过、0 失败、4 忽略**。日志为 `actions-push-4fd63bb.log`。随后核实远端分支仍指向该提交，再触发[最终手动双架构打包](https://github.com/senzyo/ladder/actions/runs/43995383477)，API 确认实际运行 SHA 与上述完整提交一致。该运行已成功：完整检查再次 124 通过、0 失败、4 忽略，AMD64/ARM64 均打包成功，AMD64 的生产更新助手 6 场景全部通过。日志为 `actions-manual-4fd63bb.log`；Release 作业按手动触发规则跳过，没有创建标签或 Release。
-- `dc0a1d20fbc27b07ed08c443ba8369846927b577` 已显式只推送到 GitHub `dev`，新 [push 检查](https://github.com/senzyo/ladder/actions/runs/43998391327)成功：fmt/clippy 通过，默认测试 **124 通过、0 失败、4 忽略，24.22 秒**，日志为 `actions-push-dc0a1d2.log`。本次不再重复触发 manual，待真实界面及 DNS 验收后按确认的标签方案执行最终构建/预发布；目前仍未推送标签。
+- `dc0a1d20fbc27b07ed08c443ba8369846927b577` 已显式只推送到 GitHub `dev`，新 [push 检查](https://github.com/senzyo/ladder/actions/runs/43998391327)成功：fmt/clippy 通过，默认测试 **124 通过、0 失败、4 忽略，24.22 秒**，日志为 `actions-push-dc0a1d2.log`。此后没有重复触发 manual，真实界面及 DNS 验收完成后统一执行最终标签发布。
+
+### 最终标签预发布
+
+最终交付文档已在 `aaa5d2869ee745d79938a1c1a086a2c634ba7d14` review/提交，生产源码与 `0b35edd` 相同。确认工作区干净、远端 dev 与提交一致、Cargo 版本为 `3.0.0-alpha.1`、本地/远端标签和 Release 均不存在后，创建注释标签 `v3.0.0-alpha.1` 并仅推送 GitHub。标签对象为 `b5fca224684a23ded6940d449ca56bd510e3d6a0`，解引用准确指向上述交付提交。
+
+[标签工作流 44004507258](https://github.com/senzyo/ladder/actions/runs/44004507258)全部成功：fmt/clippy、默认测试 **125 通过、0 失败、4 忽略，23.36 秒**、AMD64/ARM64 Release 构建、生产更新助手 6 场景和发布作业均通过。日志为 `target/handoff-20261117/actions-tag-v3.0.0-alpha.1.log`。实际[预发布](https://github.com/senzyo/ladder/releases/tag/v3.0.0-alpha.1)恰有两 ZIP 及各自 `.sha256` 共四个上传资产；全部下载后独立核对文件集合、ZIP 白名单、产品版本、PE 架构和校验文件，四个文件的实算 SHA-256 也都与 GitHub API `digest` 一致。
+
+| 实际发布 ZIP | 字节 | PE 架构 | SHA-256 |
+| --- | ---: | --- | --- |
+| `ladder-amd64-v3.0.0-alpha.1.zip` | 6506729 | `0x8664` | `bcd1d878af62cb4dc72f191bd4f0eb3e79c54bf6b98bc0a03e4973beb7516ad2` |
+| `ladder-arm64-v3.0.0-alpha.1.zip` | 6142385 | `0xaa64` | `008e7b9e6162dd6c55c58b32ac4eff4dbbb946461151c16a885f1bde1dc1747c` |
+
+随后用审核通过的 notes-file 更新标题/正文，并从 API 逐字核对。2026-11-17 02:57:53 UTC 最终审计确认 `prerelease=true`、`draft=false`、latest 仍为 `v2.34.0`，main 仍为 `a02ce9d672bcee9f7d5cd1ce447fed90076241c6`，标签与四资产均未变化。证据为 `published-release-audit.json`、`published-release-final.json` 和 `published-v3.0.0-alpha.1/verified-packages.json`，均位于上述证据根目录。本地没有执行 `-Publish`，旧 dist 包未删除，所有检查精确选四个 v3 资产；下面的本地及早期远端 ZIP 校验值保留为对应构建历史，不混作本次发布资产。
 
 未改变默认分支或合并 main；不能用旧版 [CI 记录](https://github.com/senzyo/ladder/actions/runs/42049042931)替代本轮证据。
 
@@ -192,7 +205,7 @@ command 45–49 验证 sing-box 运行并实际接管 DNS，强制结束核心�
 
 | 项目 | 状态 | 已有证据与剩余工作 |
 | --- | --- | --- |
-| 1. GitHub Actions 与本地发行包 | 部分 | 最新 `0b35edd` 本地双架构构建、独立包校验及 push CI 125/0/4 通过；前序远端双架构及助手场景保留对应提交证据。本地 `-Publish` 不在本轮范围；标签发布未执行。 |
+| 1. GitHub Actions 与本地发行包 | 完成 | 最终标签对应提交 `aaa5d28` 的完整检查、双架构构建、助手场景和预发布全部通过；四发布资产独立核验通过，latest 保持 `v2.34.0`。本地只构建/校验，未执行 `-Publish`。 |
 | 2. 三核心真实运行及 mihomo 补齐 | 部分 | 真实共存/生命周期、三种 DNS 正常/异常恢复，以及最终三核同时运行后退出、DNS 恢复、进程/TUN/副本/记录清理通过。更新失败后的实际恢复等未单独执行场景保留边界。 |
 | 3. 简化托盘 | 完成 | 三项菜单、打开/隐藏后恢复、正确程序目录和三核运行后的退出/清理全部实测通过；旧托盘证据只作历史。 |
 | 4. 软件完整升级 | 部分 | 过滤回归和无害程序生产助手 6 场景通过；当前没有可接受的更高正式版本，完整联网升级无法完成，Rust Drop/退出失败完整链路等未验收。 |
@@ -200,6 +213,6 @@ command 45–49 验证 sing-box 运行并实际接管 DNS，强制结束核心�
 | 6. 真实配置验证 | 完成（所列场景） | 真实核心配置/资源/错误、批量继续、编辑及版本失效通过；生产 UI 搭配无害 fixture 的超时与验证中退出取消通过，明确不等于官方核心卡死专项验收。 |
 | 7. 发行包与真实界面 | 部分 | 最新 `0b35edd` 本地双架构 Release 与包校验通过；AMD64 编辑器、浅/深色、125% 最小窗口及前述功能已有实际证据。ARM64 无机器，实机启动未验收。 |
 | 8. 全仓死代码审查 | 完成 | 全仓静态审查已完成；唯一特性删除候选经编译证伪并恢复，无可确认删除项，恢复路径保留。 |
-| 9. 文档与最终交付 | 待提交/标签 | 本轮代码和既定验收已收尾，交接改为已完成项与未验证边界；三份最终文档待 review/提交，随后执行确认的标签预发布并补记结果。 |
+| 9. 文档与最终交付 | 完成 | 三份交付文档已在 `aaa5d28` review/提交，交接区分完成项与未验证边界；实际预发布链接、工作流和四资产核验结果已补记。 |
 
-既定生产修改与本轮验收已结束；当前仅等待最终文档提交和确认后的标签预发布。完整联网升级、ARM64 实机启动、Xray 加速及明确未执行的其他场景保留受限/未验证结论，不笼统宣称所有场景完成。
+既定生产修改、本轮验收和标签预发布均已完成。完整联网升级、ARM64 实机启动、Xray 加速及明确未执行的其他场景保留受限/未验证结论，不笼统宣称所有场景完成。
