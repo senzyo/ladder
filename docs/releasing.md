@@ -23,7 +23,7 @@ ladder-arm64-v<版本>.zip
 ladder-arm64-v<版本>.zip.sha256
 ```
 
-ZIP 顶层只包含 `ladder.exe`、`README.md`、`LICENSE`。不打包核心、配置、状态、日志、恢复记录或环境文件。文件顺序和 ZIP 时间戳固定, 相同输入文件产生相同 ZIP；这不宣称不同工具链编译出的 EXE 按位一致。
+ZIP 顶层只包含 `ladder.exe` 和 `LICENSE`。不打包 README、核心、配置、状态、日志、恢复记录或环境文件。文件顺序和 ZIP 时间戳固定, 相同输入文件产生相同 ZIP；这不宣称不同工具链编译出的 EXE 按位一致。
 
 `.zip.sha256` 供手动核对；内置更新器使用 GitHub Release API 提供的资产 `digest` 校验下载包。
 

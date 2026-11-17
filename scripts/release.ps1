@@ -59,7 +59,6 @@ function New-ReleaseArchive {
     $temporary = Join-Path $DistRoot ([IO.Path]::GetRandomFileName())
     $files = [ordered]@{
         'LICENSE' = (Join-Path $ProjectRoot 'LICENSE')
-        'README.md' = (Join-Path $ProjectRoot 'README.md')
         'ladder.exe' = $Executable
     }
     try {

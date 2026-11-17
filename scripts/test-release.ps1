@@ -34,7 +34,9 @@ try {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'release.ps1') -Destination (Join-Path $project 'scripts/release.ps1')
     [IO.File]::WriteAllText((Join-Path $project 'Cargo.toml'), "[package]`nname = `"ladder`"`nversion = `"$Version`"`nedition = `"2024`"`n")
     [IO.File]::WriteAllText((Join-Path $project 'src/main.rs'), 'fn main() {}')
-    [IO.File]::WriteAllText((Join-Path $project 'README.md'), 'Test documentation')
+    foreach ($readme in @('README.md', 'README.zh-CN.md', 'README.ru.md')) {
+        [IO.File]::WriteAllText((Join-Path $project $readme), 'must-not-be-packaged')
+    }
     [IO.File]::WriteAllText((Join-Path $project 'LICENSE'), 'Test license')
     [IO.File]::WriteAllText((Join-Path $project '.env'), 'must-not-be-packaged')
     [IO.File]::WriteAllText((Join-Path $project 'ladder-state.json'), 'must-not-be-packaged')
@@ -43,7 +45,7 @@ try {
     $hash = (Get-FileHash -LiteralPath $zipPath).Hash
     $archive = [IO.Compression.ZipFile]::OpenRead($zipPath)
     try {
-        Assert-True (($archive.Entries.FullName -join ',') -ceq 'LICENSE,README.md,ladder.exe') 'Package allowlist was violated.'
+        Assert-True (($archive.Entries.FullName -join ',') -ceq 'LICENSE,ladder.exe') 'Package allowlist was violated.'
     } finally { $archive.Dispose() }
     $checksum = Get-Content -LiteralPath "$zipPath.sha256" -Raw
     Assert-True ($checksum.StartsWith($hash.ToLowerInvariant())) 'Checksum did not match the archive.'
