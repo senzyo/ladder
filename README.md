@@ -12,7 +12,7 @@
 
 本分支采用 Rust 构建, 程序运行后常驻系统托盘, 单击程序图标即可打开菜单进行管理。
 
-![运行截图](screenshots/main.png)
+![运行截图](screenshots/tray.png)
 
 ### 特性
 
@@ -92,7 +92,7 @@ flowchart LR
 | 配置项                               | 默认值           | 说明                                         |
 | ------------------------------------ | ---------------- | -------------------------------------------- |
 | `log.level`                          | `debug`          | 日志级别                                     |
-| `log.max_size_mb`                    | `5`              | 日志文件大小上限 (MB) , 0 表示不限制         |
+| `log.max_size_mb`                    | `5`              | 日志文件大小上限 (MB), 0 表示不限制         |
 | `download.core.gh_proxy`             | 为空时表示不启用 | GitHub CDN 代理地址前缀                      |
 | `download.retry.max_retries`         | `3`              | 下载重试次数                                 |
 | `download.retry.delay_secs`          | `2`              | 重试间隔 (秒)                                |
@@ -133,7 +133,7 @@ target\aarch64-pc-windows-msvc\release\ladder.exe   # arm64
 
 ### CI/CD
 
-推送到 `main` 分支时自动运行 `cargo clippy` 和 `cargo test`。
+推送到 `tray` 分支时自动运行 `cargo clippy` 和 `cargo test`。
 
 推送 `v*` 标签或手动触发 workflow 时, 自动构建双架构并发布 GitHub Release。
 

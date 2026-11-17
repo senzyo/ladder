@@ -330,7 +330,7 @@ fn parse_release(release: &Value) -> Result<ReleaseInfo, AppError> {
     Ok(ReleaseInfo { version, assets })
 }
 
-/// 调用 GitHub Releases API 获取 xray 最新版本（含 pre-release）的版本号和 assets 列表。
+/// 调用 GitHub Releases API 获取 xray 最新版本 (含 pre-release) 的版本号和 assets 列表。
 ///
 /// 遍历 `/releases` 返回的列表, 跳过 draft, 返回第一个包含 `zip_name` 的 release。
 fn fetch_xray_release(zip_name: &str) -> Result<ReleaseInfo, AppError> {

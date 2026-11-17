@@ -2,10 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [tray]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [tray]
   workflow_dispatch:
     inputs:
       publish:
