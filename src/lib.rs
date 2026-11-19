@@ -93,7 +93,6 @@ fn install_tray(events: &Sender<TrayAction>) -> Result<TrayIcon> {
     };
     let tray = TrayIconBuilder::new()
         .with_icon(Icon::from_resource(1, Some(icon_size))?)
-        .with_tooltip("Ladder")
         .with_menu(Box::new(tray_menu()?))
         .with_menu_on_left_click(false)
         .build()?;

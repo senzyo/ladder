@@ -352,7 +352,7 @@ fn wireguard_probe_reuses_the_live_inbound_and_skips_duplicate_identities() {
     runtime.send(Action::Start(core)).unwrap();
     wait(|| runtime.snapshot().core(core).operation.is_none());
     let started = runtime.snapshot().core(core).clone();
-    assert!(started.running, "{started:?}");
+    assert!(started.running(), "{started:?}");
     wait(|| TcpStream::connect(("127.0.0.1", port)).is_ok());
 
     runtime.send(Action::TestAllLatencies(core)).unwrap();
@@ -373,21 +373,21 @@ fn wireguard_probe_reuses_the_live_inbound_and_skips_duplicate_identities() {
         matches!(result.latency(duplicate), Some(ConfigLatency::Failed(ConfigFailure::Ladder(message))) if message.contains("WireGuard")),
         "{result:?}"
     );
-    assert!(result.running && result.current.as_deref() == Some(live));
+    assert!(result.running() && result.current.as_deref() == Some(live));
     listener.join().unwrap();
 
     runtime.send(Action::Stop(core)).unwrap();
     wait(|| {
         let snapshot = runtime.snapshot();
         let state = snapshot.core(core);
-        !state.running && state.operation.is_none()
+        !state.running() && state.operation.is_none()
     });
     let mut no_inbound = source;
     no_inbound.as_object_mut().unwrap().remove("inbounds");
     fs::write(configs.join(live), no_inbound.to_string()).unwrap();
     runtime.send(Action::Start(core)).unwrap();
     wait(|| runtime.snapshot().core(core).operation.is_none());
-    assert!(runtime.snapshot().core(core).running);
+    assert!(runtime.snapshot().core(core).running());
     runtime
         .send(Action::TestLatency(core, live.into()))
         .unwrap();
@@ -397,7 +397,7 @@ fn wireguard_probe_reuses_the_live_inbound_and_skips_duplicate_identities() {
         matches!(state.latency(live), Some(ConfigLatency::Failed(ConfigFailure::Ladder(message))) if message == crate::i18n::system::latency_wireguard_no_proxy()),
         "{state:?}"
     );
-    assert!(state.running);
+    assert!(state.running());
     runtime.shutdown().unwrap();
 }
 
@@ -464,7 +464,7 @@ fn startup_and_switch_check_the_original_file_before_changing_the_live_core() {
         };
 
         let failed = run(Action::Start(core));
-        assert!(!failed.running);
+        assert!(!failed.running());
         let start_error = native_error(initial);
         runtime
             .send(Action::ValidateConfig(core, initial.into()))
@@ -498,7 +498,7 @@ fn startup_and_switch_check_the_original_file_before_changing_the_live_core() {
         let port = write_valid(initial);
         let started = run(Action::Start(core));
         assert!(
-            started.running && started.run_error.is_none(),
+            started.running() && started.run_error.is_none(),
             "{core:?}: {started:?}"
         );
         assert_eq!(started.validation(initial), Some(&ConfigValidation::Valid));
@@ -506,7 +506,7 @@ fn startup_and_switch_check_the_original_file_before_changing_the_live_core() {
         let pending = start_request(port);
         let mut live_connection = read_through_node(&node);
         let rejected = run(Action::SwitchConfig(core, alternate.into()));
-        assert!(rejected.running);
+        assert!(rejected.running());
         assert_eq!(rejected.current.as_deref(), Some(initial));
         let switch_error = native_error(alternate);
         runtime
@@ -522,7 +522,7 @@ fn startup_and_switch_check_the_original_file_before_changing_the_live_core() {
         let port = write_valid(alternate);
         let switched = run(Action::SwitchConfig(core, alternate.into()));
         assert!(
-            switched.running && switched.run_error.is_none(),
+            switched.running() && switched.run_error.is_none(),
             "{core:?}: {switched:?}"
         );
         assert_eq!(switched.current.as_deref(), Some(alternate));

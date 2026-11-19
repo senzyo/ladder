@@ -17,7 +17,7 @@ messages! {
     testing_latency => ("测速中", "Testing…", "Измерение…");
     latency_ms(ms: u128) => ("{ms} ms", "{ms} ms", "{ms} мс");
     edit => ("编辑", "Edit", "Изменить");
-    current => ("当前使用", "In use", "Используется");
+    in_use => ("使用中", "In use", "Используется");
     switch => ("切换", "Switch", "Выбрать");
     confirm_delete => ("确认删除", "Confirm delete", "Да, удалить");
     delete => ("删除", "Delete", "Удалить");
@@ -84,8 +84,6 @@ messages! {
     verifying_download => ("正在校验下载文件…", "Verifying download…", "Проверка скачанного файла…");
     preparing_install => ("正在准备安装文件…", "Preparing installation files…", "Подготовка файлов для установки…");
     saving_core => ("正在保存核心版本…", "Saving core version…", "Сохранение версии ядра…");
-    fetching_versions => ("正在获取版本列表…", "Fetching versions…", "Загрузка списка версий…");
-    fetch_versions => ("获取版本列表", "Fetch versions", "Загрузить список версий");
     copy_logs => ("复制日志", "Copy logs", "Копировать журнал");
     open_log_folder => ("打开日志目录", "Log folder", "Папка журналов");
     log_folder_unavailable => ("应用日志目录尚未初始化", "The app log folder is not initialized", "Папка журналов приложения ещё не инициализирована");

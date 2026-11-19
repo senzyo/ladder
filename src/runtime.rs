@@ -223,7 +223,7 @@ pub struct CoreState {
     pub configs: Vec<String>,
     pub current: Option<String>,
     pub installed: bool,
-    pub running: bool,
+    pub running_since: Option<Instant>,
     pub operation: Option<CoreOperation>,
     pub run_error: Option<String>,
     pub output_error: Option<String>,
@@ -248,6 +248,10 @@ pub struct CoreState {
 }
 
 impl CoreState {
+    pub fn running(&self) -> bool {
+        self.running_since.is_some()
+    }
+
     pub fn latency(&self, name: &str) -> Option<&ConfigLatency> {
         if self
             .active_latency
@@ -656,7 +660,7 @@ impl Runtime {
             } else {
                 active.run_error = None;
             }
-            if !active.running && matches!(action, Action::Start(_) | Action::SwitchConfig(..)) {
+            if !active.running() && matches!(action, Action::Start(_) | Action::SwitchConfig(..)) {
                 active.output_error = None;
             }
         }
@@ -1445,7 +1449,12 @@ impl Worker {
         let result = if self.quitting.load(Ordering::Acquire) {
             Err(t::download_cancelled().into())
         } else {
-            prepared.install()
+            prepared.install().and_then(|()| {
+                if self.saved.selected_version(core).is_none() {
+                    self.switch_version(core, &prepared.version)?;
+                }
+                Ok(())
+            })
         };
         self.refresh();
         {
@@ -1463,7 +1472,10 @@ impl Worker {
                     state.update_error = None;
                 }
                 Err(error) => {
-                    logging::error("update", format_args!("{} 安装失败: {error}", core.label()));
+                    logging::error(
+                        "update",
+                        format_args!("{} 安装或选用版本失败: {error}", core.label()),
+                    );
                     state.update_error = Some(error);
                 }
             }
@@ -1659,7 +1671,6 @@ impl Worker {
         let mut snapshot = self.state.lock().unwrap();
         let status = snapshot.core_mut(core);
         status.operation = None;
-        status.running = self.children[core as usize].is_some();
         status.current = self.saved.current(core).clone();
         if version_action {
             status.update_error = result.err();
@@ -1954,6 +1965,7 @@ impl Worker {
         let child = ManagedChild::spawn(core, &self.root, exe, assets, config)
             .map_err(|e| t::start_core(core.label(), e))?;
         self.children[core as usize] = Some(child);
+        self.state.lock().unwrap().core_mut(core).running_since = Some(Instant::now());
         logging::info("core", format_args!("{} 托管进程已创建", core.label()));
         if hijack {
             logging::info(
@@ -2031,7 +2043,7 @@ impl Worker {
             .unwrap_or_default();
         let mut snapshot = self.state.lock().unwrap();
         let state = snapshot.core_mut(core);
-        state.running = false;
+        state.running_since = None;
         state.output_error = None;
         Ok(diagnostics)
     }
@@ -2349,7 +2361,7 @@ mod tests {
         loop {
             let state = runtime.snapshot().core(core).clone();
             if state.operation.is_none()
-                && !state.running
+                && !state.running()
                 && (state.run_error.is_some() || state.output_error.is_some())
             {
                 return state;
@@ -2363,7 +2375,7 @@ mod tests {
         runtime.send(Action::Stop(core)).unwrap();
         let stopped = idle(runtime, core);
         assert!(
-            !stopped.running && stopped.run_error.is_none(),
+            !stopped.running() && stopped.run_error.is_none(),
             "{stopped:?}"
         );
         runtime.send(Action::Start(core)).unwrap();
@@ -2586,7 +2598,7 @@ mod tests {
                 .send(Action::SwitchConfig(core, "日常.JSON".into()))
                 .unwrap();
             let state = idle(&runtime, core);
-            assert!(state.running);
+            assert!(state.running());
             assert_eq!(
                 state.validation("日常.JSON"),
                 Some(&ConfigValidation::Valid)
@@ -2624,7 +2636,7 @@ mod tests {
                 unsafe { WaitForSingleObject(previous.as_raw_handle(), 0) },
                 WAIT_TIMEOUT
             );
-            assert!(state.running && state.run_error.is_none() && state.output_error.is_none());
+            assert!(state.running() && state.run_error.is_none() && state.output_error.is_none());
             assert_eq!(state.current.as_deref(), Some("日常.JSON"));
             assert_eq!(
                 Saved::load(root).unwrap().current(core).as_deref(),
@@ -2665,7 +2677,7 @@ mod tests {
         let runtime = Runtime::open(root.to_owned()).unwrap();
         let state = idle(&runtime, core);
         assert!(started_file.exists());
-        assert!(!state.running && state.run_error.is_none() && state.output_error.is_none());
+        assert!(!state.running() && state.run_error.is_none() && state.output_error.is_none());
         assert_eq!(
             state.validation(name),
             Some(&ConfigValidation::Invalid(ConfigFailure::Core(
@@ -2689,7 +2701,7 @@ mod tests {
         assert!(!config.with_extension("pid").exists());
         fs::write(&continue_file, []).unwrap();
         let state = idle(&runtime, core);
-        assert!(state.running && state.run_error.is_none());
+        assert!(state.running() && state.run_error.is_none());
         assert_eq!(state.validation(name), Some(&ConfigValidation::Valid));
         runtime.shutdown().unwrap();
     }
@@ -2728,7 +2740,7 @@ mod tests {
                 WAIT_OBJECT_0
             );
             let state = runtime.snapshot().core(core).clone();
-            assert!(!state.running && !state.validation_busy && state.operation.is_none());
+            assert!(!state.running() && !state.validation_busy && state.operation.is_none());
             assert!(state.current.is_none());
             assert!(!config.with_extension("pid").exists());
             if !exiting {
@@ -2736,7 +2748,7 @@ mod tests {
                 runtime
                     .send(Action::SwitchConfig(core, name.into()))
                     .unwrap();
-                assert!(idle(&runtime, core).running);
+                assert!(idle(&runtime, core).running());
                 runtime.shutdown().unwrap();
             }
         }
@@ -2759,7 +2771,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 let state = runtime.snapshot().core(core).clone();
-                assert!(state.running, "core must still be running: {state:?}");
+                assert!(state.running(), "core must still be running: {state:?}");
                 if state.output_error.as_deref().is_some_and(|error| {
                     error.contains(&format!("fixture-live-output-{}", core.label()))
                 }) {
@@ -2776,23 +2788,27 @@ mod tests {
             runtime
                 .send(Action::SwitchConfig(core, "live-error.json".into()))
                 .unwrap();
-            assert!(idle(&runtime, core).running);
+            assert!(idle(&runtime, core).running());
             wait_error(core);
             assert!(runtime.snapshot().core(core).run_error.is_none());
         }
         for core in Core::ALL {
+            let first_start = runtime.snapshot().core(core).running_since.unwrap();
             runtime
                 .send(Action::SwitchConfig(core, "missing.json".into()))
                 .unwrap();
             let state = idle(&runtime, core);
-            assert!(state.running && state.run_error.is_some() && state.output_error.is_some());
+            assert_eq!(state.running_since, Some(first_start));
+            assert!(state.run_error.is_some() && state.output_error.is_some());
             wait_error(core);
             assert!(runtime.snapshot().core(core).run_error.is_some());
 
             fs::write(core.config_dir(root).join("live-error.json"), "{}").unwrap();
             stop_and_start(&runtime, core);
             let state = idle(&runtime, core);
-            assert!(state.running && state.run_error.is_none() && state.output_error.is_none());
+            let restarted_at = state.running_since.unwrap();
+            assert!(restarted_at > first_start);
+            assert!(state.run_error.is_none() && state.output_error.is_none());
             fs::write(
                 core.config_dir(root).join("again.json"),
                 r#"{"fixture_live_error":true}"#,
@@ -2801,24 +2817,24 @@ mod tests {
             runtime
                 .send(Action::SwitchConfig(core, "again.json".into()))
                 .unwrap();
-            assert!(idle(&runtime, core).running);
+            assert!(idle(&runtime, core).running_since.unwrap() > restarted_at);
             wait_error(core);
             runtime
                 .send(Action::SwitchConfig(core, "日常.JSON".into()))
                 .unwrap();
             let state = idle(&runtime, core);
-            assert!(state.running && state.output_error.is_none());
+            assert!(state.running() && state.output_error.is_none());
             runtime
                 .send(Action::SwitchConfig(core, "again.json".into()))
                 .unwrap();
-            assert!(idle(&runtime, core).running);
+            assert!(idle(&runtime, core).running());
             wait_error(core);
             runtime.send(Action::Stop(core)).unwrap();
             let state = idle(&runtime, core);
-            assert!(!state.running && state.output_error.is_none());
+            assert!(!state.running() && state.output_error.is_none());
             for other in Core::ALL.into_iter().filter(|other| *other != core) {
                 let state = runtime.snapshot().core(other).clone();
-                if state.running {
+                if state.running() {
                     assert!(
                         state
                             .output_error
@@ -2868,13 +2884,13 @@ mod tests {
                 .collect::<Vec<_>>();
             runtime.send(Action::Stop(core)).unwrap();
             let state = idle(&runtime, core);
-            assert!(!state.running && state.output_error.is_none() && state.run_error.is_none());
+            assert!(!state.running() && state.output_error.is_none() && state.run_error.is_none());
             runtime.send(Action::Start(core)).unwrap();
             assert!(failed(&runtime, core).output_error.is_some());
             fs::write(core.config_dir(root).join("native-exit.json"), "{}").unwrap();
             runtime.send(Action::Start(core)).unwrap();
             let state = idle(&runtime, core);
-            assert!(state.running && state.output_error.is_none() && state.run_error.is_none());
+            assert!(state.running() && state.output_error.is_none() && state.run_error.is_none());
             fs::write(core.config_dir(root).join("native-exit.json"), config).unwrap();
             stop_and_start(&runtime, core);
             assert!(failed(&runtime, core).output_error.is_some());
@@ -2882,7 +2898,7 @@ mod tests {
                 .send(Action::SwitchConfig(core, "日常.JSON".into()))
                 .unwrap();
             let state = idle(&runtime, core);
-            assert!(state.running && state.output_error.is_none());
+            assert!(state.running() && state.output_error.is_none());
             runtime.send(Action::Stop(core)).unwrap();
             assert!(idle(&runtime, core).output_error.is_none());
             for (other, expected) in peers {
@@ -2930,7 +2946,7 @@ mod tests {
                 .send(Action::SwitchConfig(core, "日常.JSON".into()))
                 .unwrap();
             let state = idle(&runtime, core);
-            assert!(state.running, "{state:?}");
+            assert!(state.running(), "{state:?}");
             assert_eq!(state.current.as_deref(), Some("日常.JSON"));
             pids[core as usize] =
                 next_pid(&core.config_dir(root).join("日常.pid"), pids[core as usize]);
@@ -2941,13 +2957,13 @@ mod tests {
         for core in Core::ALL {
             stop_and_start(&runtime, core);
             let restarted = idle(&runtime, core);
-            assert!(restarted.running, "{restarted:?}");
+            assert!(restarted.running(), "{restarted:?}");
             assert!(restarted.run_error.is_none(), "{restarted:?}");
             assert_eq!(restarted.current.as_deref(), Some("日常.JSON"));
             pids[core as usize] =
                 next_pid(&core.config_dir(root).join("日常.pid"), pids[core as usize]);
             for other in Core::ALL.into_iter().filter(|other| *other != core) {
-                assert!(runtime.snapshot().core(other).running);
+                assert!(runtime.snapshot().core(other).running());
                 assert_eq!(
                     fs::read_to_string(other.config_dir(root).join("日常.pid")).unwrap(),
                     pids[other as usize].to_string()
@@ -2963,7 +2979,7 @@ mod tests {
             .send(Action::SwitchConfig(Core::SingBox, "失败.json".into()))
             .unwrap();
         let unchanged = idle(&runtime, Core::SingBox);
-        assert!(unchanged.running);
+        assert!(unchanged.running());
         assert_eq!(unchanged.current.as_deref(), Some("日常.JSON"));
         assert!(unchanged.run_error.unwrap().contains("保存当前配置失败"));
         assert_eq!(
@@ -2976,7 +2992,7 @@ mod tests {
             .send(Action::SwitchConfig(Core::SingBox, "失败.json".into()))
             .unwrap();
         let stopped = failed(&runtime, Core::SingBox);
-        assert!(!stopped.running);
+        assert!(!stopped.running());
         assert_eq!(stopped.current.as_deref(), Some("失败.json"));
         assert_eq!(
             Saved::load(root).unwrap().sing_box.as_deref(),
@@ -2986,7 +3002,7 @@ mod tests {
         assert_eq!(error, "核心已退出");
         let logs = logging::recent().join("\n");
         assert!(logs.contains("sing-box 核心已退出"));
-        assert!(runtime.snapshot().xray.running);
+        assert!(runtime.snapshot().xray.running());
         runtime.send(Action::Start(Core::SingBox)).unwrap();
         let retry = failed(&runtime, Core::SingBox);
         assert_eq!(retry.current.as_deref(), Some("失败.json"));
@@ -3016,7 +3032,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let snapshot = runtime.snapshot();
-            if !snapshot.xray.running
+            if !snapshot.xray.running()
                 && snapshot
                     .xray
                     .run_error
@@ -3041,10 +3057,10 @@ mod tests {
         let restarted = failed(&reopened, Core::SingBox);
         assert_eq!(restarted.current.as_deref(), Some("失败.json"));
         assert_eq!(restarted.run_error.as_deref(), Some("核心已退出"));
-        assert!(!reopened.snapshot().xray.running);
+        assert!(!reopened.snapshot().xray.running());
         assert!(reopened.snapshot().settings.minimize_to_tray);
         reopened.shutdown().unwrap();
-        assert!(switch_without_file.running, "{switch_without_file:?}");
+        assert!(switch_without_file.running(), "{switch_without_file:?}");
         assert!(switch_without_file.run_error.is_some());
         assert_eq!(switch_without_file.current.as_deref(), Some("日常.JSON"));
         assert_eq!(
@@ -3070,7 +3086,7 @@ mod tests {
         runtime
             .send(Action::SwitchConfig(core, "日常.JSON".into()))
             .unwrap();
-        assert!(idle(&runtime, core).running);
+        assert!(idle(&runtime, core).running());
         let json_pid = next_pid(&config_dir.join("日常.pid"), 0);
         let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, json_pid) };
         assert!(!raw.is_null());
@@ -3079,7 +3095,7 @@ mod tests {
             .send(Action::SwitchConfig(core, "本地.yaml".into()))
             .unwrap();
         let selected = idle(&runtime, core);
-        assert!(selected.running, "{selected:?}");
+        assert!(selected.running(), "{selected:?}");
         assert_eq!(selected.current.as_deref(), Some("本地.yaml"));
         let yaml_pid = next_pid(&config_dir.join("本地.pid"), 0);
         assert_eq!(
@@ -3093,7 +3109,7 @@ mod tests {
 
         let runtime = Runtime::open(root.to_owned()).unwrap();
         let started = idle(&runtime, core);
-        assert!(started.running, "{started:?}");
+        assert!(started.running(), "{started:?}");
         assert_eq!(started.current.as_deref(), Some("本地.yaml"));
         let autostart_pid = next_pid(&config_dir.join("本地.pid"), yaml_pid);
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -3120,7 +3136,7 @@ mod tests {
         runtime
             .send(Action::SwitchConfig(core, "本地.yaml".into()))
             .unwrap();
-        assert!(idle(&runtime, core).running);
+        assert!(idle(&runtime, core).running());
         next_pid(&config_dir.join("本地.pid"), autostart_pid);
         runtime.shutdown().unwrap();
         assert_eq!(
@@ -3298,7 +3314,7 @@ mod tests {
             loop {
                 let state = runtime.snapshot().core(core).clone();
                 assert!(
-                    state.running && state.run_error.is_none(),
+                    state.running() && state.run_error.is_none(),
                     "{}: {state:?}",
                     core.label()
                 );
@@ -3317,12 +3333,12 @@ mod tests {
             runtime
                 .send(Action::SwitchConfig(*core, "valid.json".into()))
                 .unwrap();
-            assert!(idle(&runtime, *core).running);
+            assert!(idle(&runtime, *core).running());
             ready(&runtime, *core, *port);
         }
         for (core, version, port, alternate, files) in &fixtures {
             stop_and_start(&runtime, *core);
-            assert!(idle(&runtime, *core).running);
+            assert!(idle(&runtime, *core).running());
             ready(&runtime, *core, *port);
             runtime
                 .send(Action::SwitchConfig(*core, (*alternate).into()))
@@ -3330,7 +3346,7 @@ mod tests {
             assert_eq!(idle(&runtime, *core).current.as_deref(), Some(*alternate));
             ready(&runtime, *core, *port);
             runtime.send(Action::Stop(*core)).unwrap();
-            assert!(!idle(&runtime, *core).running);
+            assert!(!idle(&runtime, *core).running());
             drop(
                 TcpListener::bind(("127.0.0.1", *port))
                     .expect("stopped core retained its listener"),
@@ -3341,7 +3357,7 @@ mod tests {
                 }
             }
             runtime.send(Action::Start(*core)).unwrap();
-            assert!(idle(&runtime, *core).running);
+            assert!(idle(&runtime, *core).running());
             ready(&runtime, *core, *port);
             for (name, text) in files {
                 assert_eq!(
@@ -3429,7 +3445,7 @@ mod tests {
             runtime
                 .send(Action::SwitchConfig(core, source_name.into()))
                 .unwrap();
-            assert!(idle(&runtime, core).running);
+            assert!(idle(&runtime, core).running());
             let copy = copy_path(core, Path::new(""));
             assert!(is_runtime_config(&copy));
             assert_eq!(copy.parent(), Some(core.config_dir(root).as_path()));
@@ -3445,7 +3461,7 @@ mod tests {
         let mihomo_before: serde_yaml_ng::Value =
             serde_yaml_ng::from_slice(&fs::read(mihomo_copy).unwrap()).unwrap();
         stop_and_start(&runtime, Core::Mihomo);
-        assert!(idle(&runtime, Core::Mihomo).running);
+        assert!(idle(&runtime, Core::Mihomo).running());
         let mihomo_restarted = copy_path(Core::Mihomo, mihomo_copy);
         let mihomo_after: serde_yaml_ng::Value =
             serde_yaml_ng::from_slice(&fs::read(&mihomo_restarted).unwrap()).unwrap();
@@ -3474,13 +3490,13 @@ mod tests {
         runtime
             .send(Action::SwitchConfig(Core::Mihomo, source_name.into()))
             .unwrap();
-        assert!(idle(&runtime, Core::Mihomo).running);
+        assert!(idle(&runtime, Core::Mihomo).running());
         let mihomo_shutdown_copy = copy_path(Core::Mihomo, &mihomo_restarted);
         let xray_before = fs::read(&copies[1]).unwrap();
         let sing_before: serde_json::Value =
             serde_json::from_slice(&fs::read(&copies[0]).unwrap()).unwrap();
         stop_and_start(&runtime, Core::SingBox);
-        assert!(idle(&runtime, Core::SingBox).running);
+        assert!(idle(&runtime, Core::SingBox).running());
         let restarted = copy_path(Core::SingBox, &copies[0]);
         let sing_after: serde_json::Value =
             serde_json::from_slice(&fs::read(&restarted).unwrap()).unwrap();
@@ -3494,7 +3510,7 @@ mod tests {
         fs::write(restarted.with_extension("exit"), []).unwrap();
         failed(&runtime, Core::SingBox);
         assert!(!restarted.exists());
-        assert!(runtime.snapshot().xray.running);
+        assert!(runtime.snapshot().xray.running());
 
         fs::write(
             Core::SingBox.config_dir(root).join("失败TUN.json"),
@@ -3512,10 +3528,10 @@ mod tests {
         );
 
         runtime.send(Action::Stop(Core::Xray)).unwrap();
-        assert!(!idle(&runtime, Core::Xray).running);
+        assert!(!idle(&runtime, Core::Xray).running());
         assert!(!copies[1].exists());
         runtime.send(Action::Start(Core::Xray)).unwrap();
-        assert!(idle(&runtime, Core::Xray).running);
+        assert!(idle(&runtime, Core::Xray).running());
         let shutdown_copy = copy_path(Core::Xray, &copies[1]);
         runtime.shutdown().unwrap();
         assert!(!shutdown_copy.exists());
@@ -3667,7 +3683,7 @@ mod tests {
             session.lock().unwrap();
             let runtime = Runtime::open(root.clone()).unwrap();
             for core in Core::ALL {
-                assert!(idle(&runtime, core).running);
+                assert!(idle(&runtime, core).running());
             }
             crate::emergency::prepare_test_helper(scenario == "spawn-failure");
             if scenario == "restore-failure" {
@@ -3822,7 +3838,7 @@ mod tests {
             .send(Action::SwitchConfig(Core::Xray, "日常.JSON".into()))
             .unwrap();
         let state = idle(&runtime, Core::Xray);
-        assert!(state.running, "{state:?}");
+        assert!(state.running(), "{state:?}");
         assert!(runtime.snapshot().dns_recovery_error.is_some());
         assert!(runtime.shutdown().unwrap().is_some());
     }
@@ -3846,14 +3862,14 @@ mod tests {
         runtime
             .send(Action::SwitchConfig(Core::Xray, "日常.JSON".into()))
             .unwrap();
-        assert!(idle(&runtime, Core::Xray).running);
+        assert!(idle(&runtime, Core::Xray).running());
         runtime.send(Action::Set(Setting::HijackDns, true)).unwrap();
         runtime
             .send(Action::SwitchConfig(Core::SingBox, "日常.JSON".into()))
             .unwrap();
         let refused = idle(&runtime, Core::SingBox);
-        assert!(!refused.running && refused.run_error.is_some());
-        assert!(runtime.snapshot().xray.running);
+        assert!(!refused.running() && refused.run_error.is_some());
+        assert!(runtime.snapshot().xray.running());
         assert_eq!(runtime.shutdown().unwrap().as_deref(), Some(error));
         assert_eq!(fs::read(journal).unwrap(), bytes);
     }
@@ -3880,7 +3896,7 @@ mod tests {
         };
         saved.store(root).unwrap();
         let runtime = Runtime::open(root.to_owned()).unwrap();
-        assert!(idle(&runtime, Core::Xray).running);
+        assert!(idle(&runtime, Core::Xray).running());
         assert!(runtime.snapshot().dns_recovery_error.is_none());
         assert!(!journal.exists());
         assert!(runtime.shutdown().unwrap().is_none());
@@ -3962,7 +3978,7 @@ mod tests {
                 .send(Action::SwitchConfig(core, "日常.JSON".into()))
                 .unwrap();
             let state = idle(&runtime, core);
-            assert!(state.running && state.run_error.is_none(), "{state:?}");
+            assert!(state.running() && state.run_error.is_none(), "{state:?}");
             assert!(journal.is_file(), "{} 启动后缺少 DNS 原值", core.label());
         }
         for core in Core::ALL {
@@ -3971,15 +3987,15 @@ mod tests {
                 .send(Action::Set(Setting::HijackDns, false))
                 .unwrap();
             runtime.send(Action::Stop(core)).unwrap();
-            assert!(!idle(&runtime, core).running);
+            assert!(!idle(&runtime, core).running());
             assert!(!journal.exists());
             runtime.send(Action::Start(core)).unwrap();
-            assert!(idle(&runtime, core).running);
+            assert!(idle(&runtime, core).running());
             assert!(!journal.exists());
 
             runtime.send(Action::Set(Setting::HijackDns, true)).unwrap();
             stop_and_start(&runtime, core);
-            assert!(idle(&runtime, core).running);
+            assert!(idle(&runtime, core).running());
             assert!(journal.exists());
             let signal = core.config_dir(root).join("日常.exit");
             fs::write(&signal, []).unwrap();
@@ -3991,11 +4007,11 @@ mod tests {
             );
             assert!(!journal.exists());
             for other in Core::ALL.into_iter().filter(|other| *other != core) {
-                assert!(runtime.snapshot().core(other).running);
+                assert!(runtime.snapshot().core(other).running());
             }
             fs::remove_file(signal).unwrap();
             runtime.send(Action::Start(core)).unwrap();
-            assert!(idle(&runtime, core).running);
+            assert!(idle(&runtime, core).running());
             assert!(journal.exists());
         }
         assert!(runtime.shutdown().unwrap().is_none());
@@ -4814,13 +4830,13 @@ mod tests {
         runtime
             .send(Action::SwitchConfig(core, "日常.JSON".into()))
             .unwrap();
-        assert!(idle(&runtime, core).running);
+        assert!(idle(&runtime, core).running());
         fs::create_dir(root.join("ladder-state.json.tmp")).unwrap();
         runtime
             .send(Action::SwitchVersion(core, "0.9.0".into()))
             .unwrap();
         let unchanged = idle(&runtime, core);
-        assert!(unchanged.running);
+        assert!(unchanged.running());
         assert_eq!(unchanged.selected_version.as_deref(), Some("1.0.0"));
         assert!(unchanged.update_error.unwrap().contains("保存核心版本失败"));
         fs::remove_dir(root.join("ladder-state.json.tmp")).unwrap();
@@ -4828,7 +4844,7 @@ mod tests {
             .send(Action::SwitchVersion(core, "0.9.0".into()))
             .unwrap();
         let switched = idle(&runtime, core);
-        assert!(!switched.running);
+        assert!(!switched.running());
         assert_eq!(switched.selected_version.as_deref(), Some("0.9.0"));
         assert_eq!(switched.current.as_deref(), Some("日常.JSON"));
         runtime.shutdown().unwrap();
@@ -4924,7 +4940,7 @@ mod tests {
                 .unwrap();
             let state = failed(&runtime, core);
             assert_eq!(state.current.as_deref(), Some("选中的配置.json"));
-            assert!(!state.running);
+            assert!(!state.running());
             assert!(state.run_error.unwrap().contains("未找到核心程序"));
             assert_eq!(
                 Saved::load(folder.path()).unwrap().current(core).as_deref(),
@@ -4958,7 +4974,7 @@ mod tests {
                 .unwrap();
             let unchanged = idle(&runtime, core);
             assert_eq!(unchanged.current.as_deref(), Some("当前.json"));
-            assert!(!unchanged.running);
+            assert!(!unchanged.running());
             assert!(unchanged.run_error.unwrap().contains("保存当前配置失败"));
             assert_eq!(fs::read(root.join("ladder-state.json")).unwrap(), saved);
             fs::remove_dir(root.join("ladder-state.json.tmp")).unwrap();
@@ -5008,7 +5024,7 @@ mod tests {
                 let rejected = idle(&runtime, core);
                 assert!(rejected.run_error.is_some(), "应拒绝删除 {name}");
                 assert_eq!(rejected.current.as_deref(), Some("current.json"));
-                assert!(!rejected.running);
+                assert!(!rejected.running());
             }
             runtime
                 .send(Action::DeleteConfig(core, "other.JSON".into()))
@@ -5079,6 +5095,49 @@ mod tests {
     }
 
     #[test]
+    fn first_installed_version_is_selected_and_persisted_per_core() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        for core in Core::ALL {
+            fs::create_dir_all(core.config_dir(root)).unwrap();
+        }
+        let mut worker = Worker {
+            root: root.to_owned(),
+            state: Default::default(),
+            saved: Saved::default(),
+            children: Default::default(),
+            dns: DesktopDns::Portable(DnsLease::for_tests(root)),
+            quitting: Default::default(),
+            wireguard: Default::default(),
+            latency_jobs: Default::default(),
+            version_files: Default::default(),
+        };
+        for (core, download, selected) in [
+            (Core::Xray, "1.0.0", "1.0.0"),
+            (Core::SingBox, "2.0.0", "2.0.0"),
+            (Core::Xray, "1.1.0", "1.0.0"),
+        ] {
+            let exe = format!("{}.exe", core.label());
+            let prepared = PreparedUpdate::for_test(core, root, download, &[(&exe, b"not a PE")]);
+            worker.apply_update(core, prepared);
+            let snapshot = worker.state.lock().unwrap();
+            let state = snapshot.core(core);
+            assert!(state.installed && !state.running() && state.update_error.is_none());
+            assert!(
+                state
+                    .versions
+                    .iter()
+                    .any(|v| v.version == download && v.installed)
+            );
+            assert_eq!(state.selected_version.as_deref(), Some(selected));
+            assert_eq!(
+                Saved::load(root).unwrap().selected_version(core).as_deref(),
+                Some(selected)
+            );
+        }
+    }
+
+    #[test]
     fn downloaded_versions_coexist_without_stopping_cores_and_switch_only_stops_target() {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path();
@@ -5093,7 +5152,7 @@ mod tests {
             runtime
                 .send(Action::SwitchConfig(core, "日常.JSON".into()))
                 .unwrap();
-            assert!(idle(&runtime, core).running);
+            assert!(idle(&runtime, core).running());
         }
         for core in Core::ALL {
             let peers = Core::ALL
@@ -5117,9 +5176,9 @@ mod tests {
                     .is_err()
             );
             runtime.send(Action::Stop(core)).unwrap();
-            assert!(!idle(&runtime, core).running);
+            assert!(!idle(&runtime, core).running());
             runtime.send(Action::Start(core)).unwrap();
-            assert!(idle(&runtime, core).running);
+            assert!(idle(&runtime, core).running());
             let restarted_pid = next_pid(&pid_path, original_pid);
             let prepared = PreparedUpdate::for_test(
                 core,
@@ -5130,7 +5189,7 @@ mod tests {
             runtime.queue_prepared(core, prepared).unwrap();
             let state = idle(&runtime, core);
             assert!(
-                state.running && state.update.is_none() && state.update_error.is_none(),
+                state.running() && state.update.is_none() && state.update_error.is_none(),
                 "{state:?}"
             );
             assert_eq!(
@@ -5157,10 +5216,10 @@ mod tests {
                 .send(Action::SwitchVersion(core, "2.0.0".into()))
                 .unwrap();
             let switched = idle(&runtime, core);
-            assert!(!switched.running);
+            assert!(!switched.running());
             assert_eq!(switched.selected_version.as_deref(), Some("2.0.0"));
             for (other, pid) in peers {
-                assert!(runtime.snapshot().core(other).running);
+                assert!(runtime.snapshot().core(other).running());
                 assert_eq!(next_pid(&other.config_dir(root).join("日常.pid"), 0), pid);
             }
             runtime
@@ -5173,7 +5232,7 @@ mod tests {
                 config
             );
             runtime.send(Action::Start(core)).unwrap();
-            assert!(idle(&runtime, core).running);
+            assert!(idle(&runtime, core).running());
             next_pid(&pid_path, restarted_pid);
         }
         runtime.shutdown().unwrap();

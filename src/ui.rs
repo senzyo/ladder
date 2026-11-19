@@ -22,6 +22,10 @@ use std::{
     time::Duration,
 };
 
+#[path = "config_name.rs"]
+mod config_name;
+use config_name::ConfigName;
+
 #[path = "log_view.rs"]
 mod log_view;
 use log_view::LogView;
@@ -118,6 +122,7 @@ pub(crate) struct MainWindow {
     runtime: Runtime,
     snapshot: Snapshot,
     page: Page,
+    uptime_seconds: Option<u64>,
     config_focus: [HashMap<String, [FocusHandle; 5]>; 3],
     config_scroll: [ScrollHandle; 3],
     core_page_scroll: [ScrollHandle; 3],
@@ -175,6 +180,7 @@ impl MainWindow {
             runtime,
             snapshot: Snapshot::default(),
             page: Page::Core(settings.startup_core),
+            uptime_seconds: None,
             config_focus: Default::default(),
             config_scroll: Default::default(),
             core_page_scroll: Default::default(),
@@ -219,6 +225,17 @@ impl MainWindow {
             cx.notify();
         }
         let next = self.runtime.snapshot();
+        let uptime_seconds = match self.page {
+            Page::Core(core) if !self.show_versions[core_index(core)] => next
+                .core(core)
+                .running_since
+                .map(|started| started.elapsed().as_secs()),
+            _ => None,
+        };
+        if self.uptime_seconds != uptime_seconds {
+            self.uptime_seconds = uptime_seconds;
+            cx.notify();
+        }
         let language = next.settings.effective_language();
         if language != i18n::current() {
             i18n::set_current(language);
@@ -559,7 +576,7 @@ impl MainWindow {
     fn navigation(&self, colors: Colors, cx: &Context<Self>) -> Div {
         let item = |page, label: &'static str, index| {
             let selected = self.page == page;
-            let running = matches!(page, Page::Core(core) if self.snapshot.core(core).running);
+            let running = matches!(page, Page::Core(core) if self.snapshot.core(core).running());
             control(("navigation", index as usize), index, colors, false)
                 .w_full()
                 .h(px(38.))
@@ -659,16 +676,16 @@ impl MainWindow {
             && !state.latency_busy();
         let connection_label = match state.operation {
             Some(CoreOperation::Switching) => t::switching(),
-            _ if state.running => t::stop_core(),
+            _ if state.running() => t::stop_core(),
             _ => t::start_core(),
         };
-        let connection_action = if state.running {
+        let connection_action = if state.running() {
             idle.then_some(UiAction::Run(Action::Stop(core)))
         } else {
             can_run.then_some(UiAction::Run(Action::Start(core)))
         };
         let connection_disabled = connection_action.is_none();
-        let connection_colors = if state.running {
+        let connection_colors = if state.running() {
             Colors {
                 accent_fill: colors.stop_fill,
                 accent_hover: colors.stop_hover,
@@ -718,27 +735,14 @@ impl MainWindow {
                 )),
                 None => None,
             };
-            let full_name: SharedString = name.clone().into();
             let details = div()
                 .flex_1()
                 .min_w(px(0.))
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .gap(px(6.))
-                .child(
-                    div()
-                        .id(("config-name", index))
-                        .min_w(px(0.))
-                        .truncate()
-                        .child(full_name.clone())
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| TextTooltip {
-                                label: full_name.clone(),
-                                colors,
-                            })
-                            .into()
-                        }),
-                )
+                .child(ConfigName(name.clone().into()))
                 .children(latency_badge)
                 .children(match validation {
                     Some(ConfigValidation::Valid) => {
@@ -756,7 +760,9 @@ impl MainWindow {
                 .flex_shrink_0()
                 .items_center()
                 .gap(px(5.))
-                .when(current, |el| el.child(div().child(t::current())));
+                .when(current, |el| {
+                    el.child(badge(t::in_use(), colors.accent, colors))
+                });
             let actions = [
                 (
                     t::switch(),
@@ -907,23 +913,31 @@ impl MainWindow {
                         )
                     })
                     .when(state.installed, |el| {
+                        let power_button = action_button(
+                            "",
+                            footer_index,
+                            connection_action,
+                            true,
+                            connection_colors,
+                            cx,
+                        )
+                        .id("core-power")
+                        .gap(px(6.))
+                        .bg(connection_colors.accent_fill)
+                        .border_color(connection_colors.accent_fill)
+                        .text_color(colors.on_accent)
+                        .child(power_icon(colors.on_accent))
+                        .child(connection_label)
+                        .when(connection_disabled, |el| el.opacity(0.65));
                         el.child(
-                            action_button(
-                                "",
-                                footer_index,
-                                connection_action,
-                                true,
-                                connection_colors,
-                                cx,
-                            )
-                            .id("core-power")
-                            .gap(px(6.))
-                            .bg(connection_colors.accent_fill)
-                            .border_color(connection_colors.accent_fill)
-                            .text_color(colors.on_accent)
-                            .child(power_icon(colors.on_accent))
-                            .child(connection_label)
-                            .when(connection_disabled, |el| el.opacity(0.65)),
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(power_button)
+                                .when_some(self.uptime_seconds, |el, seconds| {
+                                    el.child(caption(format_uptime(seconds), colors))
+                                }),
                         )
                     })
                     .child(
@@ -931,7 +945,8 @@ impl MainWindow {
                             t::manage_versions(),
                             footer_index + 1,
                             Some(UiAction::ShowVersions(core, true)),
-                            true,
+                            !state.installed
+                                && !state.versions.iter().any(|version| version.installed),
                             colors,
                             cx,
                         )
@@ -1111,7 +1126,7 @@ impl MainWindow {
                 .max_w_full()
                 .gap(px(8.));
             if current {
-                buttons = buttons.child(div().child(t::current()));
+                buttons = buttons.child(badge(t::in_use(), colors.accent, colors));
             }
             for (slot, (label, action)) in actions.into_iter().enumerate() {
                 let tab_index = 14 + (index * 2 + slot) as isize;
@@ -1209,19 +1224,7 @@ impl MainWindow {
                 move |_, delta| refresh_icon(colors.on_accent, delta * std::f32::consts::TAU),
             ))
         })
-        .when(!loading, |el| el.child(refresh_icon(colors.on_accent, 0.)))
-        .tooltip(move |_, cx| {
-            cx.new(|_| TextTooltip {
-                label: if loading {
-                    t::fetching_versions()
-                } else {
-                    t::fetch_versions()
-                }
-                .into(),
-                colors,
-            })
-            .into()
-        });
+        .when(!loading, |el| el.child(refresh_icon(colors.on_accent, 0.)));
         let mut filter = div()
             .flex()
             .flex_shrink_0()
@@ -2062,6 +2065,13 @@ fn update_progress_text(progress: &UpdateProgress) -> String {
     }
 }
 
+fn format_uptime(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = seconds / 60 % 60;
+    let seconds = seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
 fn power_icon(color: Rgba) -> impl IntoElement {
     canvas(
         |_, _, _| (),
@@ -2118,22 +2128,6 @@ fn refresh_icon(color: Rgba, angle: f32) -> impl IntoElement {
         },
     )
     .size(px(16.))
-}
-
-struct TextTooltip {
-    label: SharedString,
-    colors: Colors,
-}
-
-impl Render for TextTooltip {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        panel(self.colors)
-            .px(px(8.))
-            .py(px(4.))
-            .text_size(px(TEXT_SECONDARY))
-            .text_color(self.colors.text)
-            .child(self.label.clone())
-    }
 }
 
 fn page_title(label: &'static str) -> Div {
@@ -2435,6 +2429,13 @@ impl Colors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uptime_shows_elapsed_hours_minutes_and_seconds() {
+        assert_eq!(format_uptime(0), "00:00:00");
+        assert_eq!(format_uptime(60), "00:01:00");
+        assert_eq!(format_uptime(90_061), "25:01:01");
+    }
 
     #[test]
     fn ladder_icon_preserves_color_and_antialiasing_at_display_sizes() {

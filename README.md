@@ -20,7 +20,7 @@ You maintain your core configurations; Ladder handles version management, config
 
 1. Download the portable package for your Windows architecture from [GitHub Releases](https://github.com/senzyo/ladder/releases/latest) and extract it.
 2. Run `ladder.exe` and grant administrator privileges when prompted by Windows UAC.
-3. Select a core, open “Core Versions”, then download and switch to the version you want.
+3. Select a core, open “Core Versions”, and download the version you want. Ladder automatically selects the first version you install for each core. Later downloads keep your current selection.
 4. Click “Config folder”, add your configuration files, then return to the list and click “Validate”.
 5. If the configuration is valid, click “Start Core” to run it.
 
