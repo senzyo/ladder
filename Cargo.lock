@@ -3215,6 +3215,7 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tray-icon",
+ "ttf-parser 0.20.0",
  "unicode-segmentation",
  "ureq",
  "windows-registry 0.6.1",

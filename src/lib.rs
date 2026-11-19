@@ -5,6 +5,7 @@ mod core_output;
 mod desktop;
 mod dns;
 mod emergency;
+mod flag_text;
 mod github;
 mod i18n;
 mod latency;
@@ -132,7 +133,7 @@ fn open_main(
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(window_size),
             titlebar: Some(TitlebarOptions {
-                title: Some("Ladder".into()),
+                title: Some(std::env::current_exe()?.display().to_string().into()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -180,6 +181,7 @@ fn show_main(cx: &mut App, handle: WindowHandle<MainWindow>, show: bool) -> Resu
 }
 
 fn start_desktop(cx: &mut App, runtime: Runtime, cleaned: Rc<Cell<bool>>) -> Result<()> {
+    flag_text::register(cx)?;
     let (events, incoming): (_, Receiver<TrayAction>) = async_channel::unbounded();
     let mut window = None;
     let startup = runtime.snapshot();

@@ -1,10 +1,11 @@
 use super::{Colors, MainWindow, TEXT_PRIMARY};
-use crate::runtime::Settings;
+use crate::{flag_text, runtime::Settings};
 use gpui::{
     Bounds, ClipboardItem, Context, Div, FocusHandle, MouseButton, Pixels, Point, ShapedLine,
-    Stateful, Task, TextRun, Window, canvas, div, fill, point, prelude::*, px, size,
+    Stateful, Task, Window, canvas, div, fill, point, prelude::*, px, size,
 };
 use std::{cell::RefCell, ops::Range, rc::Rc};
+use unicode_segmentation::UnicodeSegmentation;
 
 struct InputLayout {
     line: ShapedLine,
@@ -94,6 +95,12 @@ impl UrlInput {
     }
 
     fn move_to(&mut self, cursor: usize, selecting: bool) {
+        let cursor = self
+            .text
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .find(|&index| index >= cursor)
+            .unwrap_or(self.text.len());
         self.cursor = cursor;
         if !selecting {
             self.anchor = cursor;
@@ -102,16 +109,16 @@ impl UrlInput {
 
     fn previous(&self) -> usize {
         self.text[..self.cursor]
-            .char_indices()
+            .grapheme_indices(true)
             .next_back()
             .map_or(0, |(index, _)| index)
     }
 
     fn next(&self) -> usize {
         self.text[self.cursor..]
-            .chars()
+            .graphemes(true)
             .next()
-            .map_or(self.cursor, |ch| self.cursor + ch.len_utf8())
+            .map_or(self.cursor, |grapheme| self.cursor + grapheme.len())
     }
 
     fn replace(&mut self, text: &str) {
@@ -127,15 +134,21 @@ impl UrlInput {
 
     fn click(&mut self, position: Point<Pixels>, selecting: bool) {
         let cursor = self.layout.borrow().as_ref().map(|layout| {
-            layout
-                .line
-                .closest_index_for_x(position.x - layout.bounds.left() + layout.offset)
-                .min(self.text.len())
-        });
-        if let Some(mut cursor) = cursor {
-            while !self.text.is_char_boundary(cursor) {
-                cursor -= 1;
+            let x = position.x - layout.bounds.left() + layout.offset;
+            let line = &layout.line;
+            let index = line.closest_index_for_x(x);
+            // GPUI 会将末尾多字节字形内的点击直接映射到行尾。
+            if index == line.len()
+                && x < line.width
+                && let Some((start, grapheme)) = line.text.grapheme_indices(true).next_back()
+                && flag_text::has_flags(grapheme)
+                && x < (line.x_for_index(start) + line.width) / 2.
+            {
+                return start;
             }
+            index
+        });
+        if let Some(cursor) = cursor {
             self.move_to(cursor, selecting);
         }
     }
@@ -143,6 +156,7 @@ impl UrlInput {
     pub(super) fn render(&self, colors: Colors, cx: &Context<MainWindow>) -> Stateful<Div> {
         let field = self.field;
         let text = self.text.clone();
+        let has_flags = flag_text::has_flags(&text);
         let selection = self.selection();
         let cursor = self.cursor;
         let focus = self.focus.clone();
@@ -280,18 +294,13 @@ impl UrlInput {
             .child(
                 canvas(
                     move |bounds, window, _| {
-                        let run = TextRun {
-                            len: text.len(),
-                            font: window.text_style().font(),
-                            color: colors.text.into(),
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
+                        let mut style = window.text_style();
+                        style.color = colors.text.into();
+                        let runs = has_flags.then(|| flag_text::runs(&text, &style));
                         let line = window.text_system().shape_line(
                             text.clone().into(),
                             px(TEXT_PRIMARY),
-                            &[run],
+                            runs.as_deref().unwrap_or(&[style.to_run(text.len())]),
                             None,
                         );
                         let offset =
@@ -328,7 +337,19 @@ impl UrlInput {
                                 ));
                             }
                         }
-                        let _ = line.paint(origin, bounds.size.height, window, cx);
+                        if has_flags {
+                            let _ = flag_text::paint_line(
+                                &line,
+                                &[],
+                                origin,
+                                bounds.size.height,
+                                colors.text.into(),
+                                window,
+                                cx,
+                            );
+                        } else {
+                            let _ = line.paint(origin, bounds.size.height, window, cx);
+                        }
                     },
                 )
                 .size_full(),

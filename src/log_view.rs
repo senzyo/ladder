@@ -1,4 +1,6 @@
-use super::{Colors, FeedbackScope, MainWindow, TEXT_PRIMARY, control, panel, scroll_area};
+use super::{
+    Colors, FeedbackScope, MainWindow, TEXT_PRIMARY, content_text, control, panel, scroll_area,
+};
 use crate::{
     desktop,
     i18n::ui as t,
@@ -254,7 +256,7 @@ impl MainWindow {
                                             Some(LogLevel::Warning) => colors.warning,
                                             None => colors.text,
                                         })
-                                        .child(line.clone())
+                                        .child(content_text(line.clone()))
                                 },
                             )),
                         &self.logs.scroll[source.index()],

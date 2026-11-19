@@ -14,7 +14,8 @@ anyhow = "1"
 async-channel = "2"
 base64 = "0.22"
 # 桌面程序自行提供含 UAC 和 DPI 设置的清单, 避免与 GPUI 的默认清单重复。
-gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "wayland", "x11"] }
+# 升级时需重新检查 flag_text 中的 GlyphId 布局和 Windows 彩色字形支持。
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "wayland", "x11"] }
 image = { version = "0.25", default-features = false }
 raw-window-handle = "0.6"
 resvg = { version = "0.45", default-features = false }
@@ -26,6 +27,7 @@ serde_yaml_ng = "0.10"
 sha2 = "0.11"
 tempfile = "3"
 tray-icon = { version = "0.21", default-features = false }
+ttf-parser = { version = "0.20", default-features = false, features = ["opentype-layout", "std"] }
 unicode-segmentation = "1"
 ureq = { version = "3.5", features = ["socks-proxy"] }
 windows-registry = "0.6"

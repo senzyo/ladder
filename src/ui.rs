@@ -26,6 +26,10 @@ use std::{
 mod config_name;
 use config_name::ConfigName;
 
+#[path = "content_text.rs"]
+mod content_text;
+use content_text::content_text;
+
 #[path = "log_view.rs"]
 mod log_view;
 use log_view::LogView;
@@ -2142,7 +2146,7 @@ fn caption(text: impl Into<SharedString>, colors: Colors) -> Div {
     div()
         .text_size(px(TEXT_SECONDARY))
         .text_color(colors.muted)
-        .child(text.into())
+        .child(content_text(text))
 }
 
 fn panel(colors: Colors) -> Div {
@@ -2211,7 +2215,7 @@ impl RenderOnce for ErrorMessage {
                 .max_h(px(64.))
                 .px(px(10.))
                 .py(px(8.))
-                .child(self.message),
+                .child(content_text(self.message)),
             scroll.read(cx),
             self.colors,
         )

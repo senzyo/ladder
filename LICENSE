@@ -19,3 +19,23 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Ladder Flags
+
+Flag artwork by Twitter, Inc. and other Twemoji contributors, distributed under
+Creative Commons Attribution 4.0 International (CC BY 4.0).
+https://creativecommons.org/licenses/by/4.0/
+https://github.com/jdecked/twemoji/tree/v17.0.3
+
+The color font was built by poppingmoon using the Mozilla Foundation's
+twemoji-colr tooling. The project's code is licensed under Apache 2.0.
+https://github.com/poppingmoon/twemoji-colr/blob/v0.7.0%2B2026.09.09/LICENSE.md
+
+Ladder used TwemojiMozilla.ttf from the following release, with SHA-256
+1a04f7bd9bd74434797e61b48b6e00f07740dd98458d9d6f8927a039bc17688c.
+https://github.com/poppingmoon/twemoji-colr/releases/tag/v0.7.0%2B2026.09.09
+
+Ladder subset the font with fontTools 4.60.1, keeping U+1F1E6..1F1FF,
+U+1F3F4, U+E0061..E007A and U+E007F with their ligatures and color layers.
+It removed the FFTM table, renamed the font family to Ladder Flags, and
+added artwork attribution and license information to the font's name table.

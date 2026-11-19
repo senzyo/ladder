@@ -1,3 +1,4 @@
+use crate::flag_text;
 use gpui::{
     App, AvailableSpace, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, Pixels, ShapedLine, SharedString, Style, Window, px, relative, size,
@@ -59,11 +60,13 @@ impl Element for ConfigName {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let text_system = window.text_system().clone();
+        let has_flags = flag_text::has_flags(&self.0);
         let shape = move |text: &str| {
+            let runs = has_flags.then(|| flag_text::runs(text, &text_style));
             text_system.shape_line(
                 SharedString::new(text),
                 font_size,
-                &[text_style.to_run(text.len())],
+                runs.as_deref().unwrap_or(&[text_style.to_run(text.len())]),
                 None,
             )
         };
@@ -124,8 +127,13 @@ impl Element for ConfigName {
         cx: &mut App,
     ) {
         let mut origin = bounds.origin;
+        let color = window.text_style().color;
         for line in lines.borrow().iter() {
-            let _ = line.paint(origin, *line_height, window, cx);
+            if flag_text::has_flags(&line.text) {
+                let _ = flag_text::paint_line(line, &[], origin, *line_height, color, window, cx);
+            } else {
+                let _ = line.paint(origin, *line_height, window, cx);
+            }
             origin.y += *line_height;
         }
     }
