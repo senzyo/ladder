@@ -7,7 +7,7 @@ messages! {
     empty_proxy => ("GitHub 加速链接前缀不能为空", "The GitHub proxy URL prefix cannot be empty.", "Префикс URL прокси GitHub не может быть пустым.");
     invalid_latency_url => ("请在设置中输入并保存有效的 HTTP 或 HTTPS 测速地址。", "Enter and save a valid HTTP or HTTPS test URL in Settings.", "Введите и сохраните корректный тестовый URL с HTTP или HTTPS в настройках.");
     invalid_latency_timeout => ("测速超时须为 3 至 8 秒。", "Choose a test timeout between 3 and 8 seconds.", "Выберите тайм-аут от 3 до 8 секунд.");
-    latency_busy => ("该核心正在测速，请稍候。", "A latency test is already running for this core.", "Для этого ядра уже выполняется проверка задержки.");
+    latency_busy => ("该核心正在测速，请稍候。", "A latency test is already running for this core. Please wait.", "Для этого ядра уже выполняется проверка задержки. Подождите.");
     latency_thread(error: impl std::fmt::Display) => ("无法启动测速线程：{error}", "Cannot start the latency test thread: {error}", "Не удалось запустить поток проверки задержки: {error}");
     quitting_validation => ("正在退出, 无法验证配置", "Cannot validate configurations while exiting.", "Нельзя проверить конфигурацию во время выхода.");
     validation_busy => ("正在验证配置, 请稍候", "Validating configurations. Please wait.", "Выполняется проверка конфигурации. Подождите.");
@@ -18,7 +18,7 @@ messages! {
     versions_busy => ("正在获取版本列表", "Fetching versions.", "Загрузка списка версий.");
     no_more_versions => ("没有更多版本", "No more versions.", "Других версий нет.");
     quitting_download => ("正在退出, 无法开始下载", "Cannot start a download while exiting.", "Нельзя начать скачивание во время выхода.");
-    select_download => ("请先获取版本列表并选择尚未下载的版本", "Fetch the version list and select a version to download.", "Сначала загрузите список версий и выберите версию для скачивания.");
+    select_download => ("请先获取版本列表并选择尚未下载的版本", "Fetch the version list and select a version you have not downloaded yet.", "Сначала загрузите список версий и выберите версию, которую вы ещё не скачали.");
     update_cancelled => ("更新已取消, 现有核心文件保持不变", "Update cancelled. Existing core files are unchanged.", "Обновление отменено. Существующие файлы ядра сохранены.");
     update_manager_closed => ("核心管理线程已关闭, 更新未应用", "The core manager has stopped. The update was not applied.", "Поток управления ядрами остановлен. Обновление не применено.");
     not_config_file => ("所选路径不是配置文件", "The selected path is not a configuration file.", "Выбранный путь не является файлом конфигурации.");

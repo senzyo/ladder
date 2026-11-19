@@ -3,8 +3,8 @@ messages! {
     settings => ("设置", "Settings", "Настройки");
     language => ("语言", "Language", "Язык");
     switching => ("切换中", "Switching", "Переключение");
-    stop_core => ("停止核心", "Stop core", "Остановить ядро");
-    start_core => ("启动核心", "Start core", "Запустить ядро");
+    stop_core => ("停止核心", "Stop Core", "Остановить ядро");
+    start_core => ("启动核心", "Start Core", "Запустить ядро");
     config_valid => ("配置合法", "Valid", "Корректна");
     validating => ("验证中", "Validating", "Проверка");
     validation_timed_out => ("验证超时", "Validation timed out", "Время проверки истекло");
@@ -19,10 +19,10 @@ messages! {
     edit => ("编辑", "Edit", "Изменить");
     current => ("当前使用", "In use", "Используется");
     switch => ("切换", "Switch", "Выбрать");
-    confirm_delete => ("确认删除", "Confirm delete", "Подтвердить");
+    confirm_delete => ("确认删除", "Confirm delete", "Да, удалить");
     delete => ("删除", "Delete", "Удалить");
-    install_core_hint => ("点击右侧“管理核心版本”安装核心 -->", "Install a core via “Core versions” →", "Установите ядро в разделе «Версии ядра» →");
-    manage_versions => ("管理核心版本", "Core versions", "Версии ядра");
+    install_core_hint => ("点击右侧“管理核心版本”安装核心 -->", "Install a core via “Core Versions” →", "Установите ядро в разделе «Версии ядра» →");
+    manage_versions => ("管理核心版本", "Core Versions", "Версии ядра");
     config_moved => ("当前配置文件已移走, 请重新选择配置。", "The selected configuration was moved. Select another configuration.", "Выбранный файл конфигурации перемещён. Выберите конфигурацию заново.");
     config_files => ("配置文件", "Configurations", "Конфигурации");
     config_count(count: usize) => ("{count} 个", "{count}", "{count}");
@@ -72,7 +72,7 @@ messages! {
     downloading_update => ("下载中…", "Downloading…", "Загрузка…");
     restarting => ("重启中…", "Restarting…", "Перезапуск…");
     download_update => ("下载更新", "Download update", "Скачать обновление");
-    restart_to_update => ("重启以更新", "Restart to update", "Перезапустить");
+    restart_to_update => ("重启以更新", "Restart to update", "Перезапустить для обновления");
     check_update => ("检查更新", "Check for updates", "Проверить обновления");
     restoring_dns => ("正在恢复 DNS", "Restoring DNS", "Восстановление DNS");
     retry_dns => ("重试恢复 DNS", "Retry DNS restore", "Повторить восстановление DNS");
@@ -94,5 +94,5 @@ messages! {
     theme_save_thread_closed => ("主题设置未保存, 管理线程已关闭。", "The theme was not saved: the management thread has stopped.", "Тема не сохранена: управляющий поток завершён.");
     language_save_thread_closed => ("语言设置未保存, 管理线程已关闭。", "The language was not saved: the management thread has stopped.", "Язык не сохранён: управляющий поток завершён.");
     proxy_save_thread_closed => ("GitHub 加速链接前缀未保存, 管理线程已关闭。", "The GitHub proxy URL prefix was not saved: the management thread has stopped.", "Префикс URL прокси для GitHub не сохранён: управляющий поток завершён.");
-    latency_url_save_thread_closed => ("自定义测速地址未保存，管理线程已关闭。", "The custom test URL was not saved because the management thread stopped.", "Не удалось сохранить URL проверки, так как управляющий поток завершён.");
+    latency_url_save_thread_closed => ("自定义测速地址未保存，管理线程已关闭。", "The custom test URL was not saved because the management thread stopped.", "Не удалось сохранить пользовательский URL проверки, так как управляющий поток завершён.");
 }

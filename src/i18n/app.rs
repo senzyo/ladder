@@ -1,7 +1,7 @@
 messages! {
     open => ("打开 Ladder", "Open Ladder", "Открыть Ladder");
     directory => ("打开程序目录", "Open application folder", "Открыть папку приложения");
-    exit => ("退出并终止", "Exit and stop cores", "Выйти и остановить ядра");
+    exit => ("停止并退出", "Stop cores and exit", "Остановить ядра и выйти");
     window_handle(error: impl std::fmt::Display) => ("读取主窗口句柄失败: {error}", "Cannot read the main window handle: {error}", "Не удалось получить дескриптор главного окна: {error}");
     missing_handle => ("无法获取主窗口的 Windows 句柄", "Cannot get the Windows handle of the main window.", "Не удалось получить дескриптор Windows главного окна.");
     tray_update(error: impl std::fmt::Display) => ("更新托盘菜单失败: {error}", "Cannot update the tray menu: {error}", "Не удалось обновить меню в системном трее: {error}");

@@ -15,8 +15,10 @@ use gpui::{
 };
 use std::{
     collections::HashMap,
+    future::poll_fn,
     path::{Path, PathBuf},
     sync::Arc,
+    task::Poll,
     time::Duration,
 };
 
@@ -42,7 +44,7 @@ impl Asset for LadderIcon {
     type Output = Result<Arc<RenderImage>, ImageCacheError>;
 
     fn load(side: u32, _: &mut App) -> impl Future<Output = Self::Output> + Send + 'static {
-        async move { render_ladder_icon(side) }
+        poll_fn(move |_| Poll::Ready(render_ladder_icon(side)))
     }
 }
 
@@ -795,7 +797,7 @@ impl MainWindow {
                     continue;
                 }
                 let enabled = action.is_some();
-                let tab_index = 11 + (index * 5 + slot) as isize;
+                let tab_index = 9 + (index * 5 + slot) as isize;
                 let focus = self.config_focus[core_index(core)][name][slot]
                     .clone()
                     .tab_stop(action.is_some())
@@ -852,40 +854,39 @@ impl MainWindow {
                     ),
             );
         }
-        let config_list = panel(colors)
-            .flex_1()
-            .min_h(px(120.))
+        let config_list = div()
+            .id("config-scroll")
+            .relative()
+            // 按可用空间扩展列表，避免文件数量撑高卡片、挤走底部按钮。
+            .flex_grow()
+            .h(px(120.))
             .flex()
-            .flex_col()
+            .border_t_1()
+            .border_color(colors.line)
+            .rounded_b(px(8.))
             .overflow_hidden()
             .child(
-                div()
-                    .id("config-scroll")
-                    .relative()
-                    .flex()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .child(
-                        files
-                            .min_w(px(0.))
-                            .overflow_y_scroll()
-                            .track_scroll(&self.config_scroll[core_index(core)]),
-                    )
-                    .child(
-                        scrollbar("scrollbar", &self.config_scroll[core_index(core)], colors)
-                            .absolute()
-                            .right_0()
-                            .top_0()
-                            .bottom_0(),
-                    ),
+                files
+                    .min_w(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.config_scroll[core_index(core)]),
+            )
+            .child(
+                scrollbar("scrollbar", &self.config_scroll[core_index(core)], colors)
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .bottom_0(),
             );
 
-        let content = div()
-            .id(("core-content", core_index(core)))
-            .size_full()
+        let footer_index = 9 + (configs.len() * 5) as isize;
+        let core_controls = panel(colors)
+            .flex_shrink_0()
             .flex()
             .flex_col()
-            .gap(px(12.))
+            .px(px(16.))
+            .py(px(12.))
+            .gap(px(8.))
             .child(
                 div()
                     .flex_shrink_0()
@@ -907,40 +908,46 @@ impl MainWindow {
                     })
                     .when(state.installed, |el| {
                         el.child(
-                            action_button("", 6, connection_action, true, connection_colors, cx)
-                                .id("core-power")
-                                .gap(px(6.))
-                                .bg(connection_colors.accent_fill)
-                                .border_color(connection_colors.accent_fill)
-                                .text_color(colors.on_accent)
-                                .child(power_icon(colors.on_accent))
-                                .child(connection_label)
-                                .when(connection_disabled, |el| el.opacity(0.65)),
+                            action_button(
+                                "",
+                                footer_index,
+                                connection_action,
+                                true,
+                                connection_colors,
+                                cx,
+                            )
+                            .id("core-power")
+                            .gap(px(6.))
+                            .bg(connection_colors.accent_fill)
+                            .border_color(connection_colors.accent_fill)
+                            .text_color(colors.on_accent)
+                            .child(power_icon(colors.on_accent))
+                            .child(connection_label)
+                            .when(connection_disabled, |el| el.opacity(0.65)),
                         )
                     })
-                    .child(action_button(
-                        t::manage_versions(),
-                        7,
-                        Some(UiAction::ShowVersions(core, true)),
-                        true,
-                        colors,
-                        cx,
-                    )),
-            )
-            .when_some(
-                self.command_error(FeedbackScope::Config(core)).cloned(),
-                |el, message| el.child(error_message(message, colors)),
-            )
-            .when(
-                state.current.is_some() && !current_exists && state.scan_error.is_none(),
-                |el| el.child(error_message(t::config_moved().into(), colors)),
+                    .child(
+                        action_button(
+                            t::manage_versions(),
+                            footer_index + 1,
+                            Some(UiAction::ShowVersions(core, true)),
+                            true,
+                            colors,
+                            cx,
+                        )
+                        .id("core-versions"),
+                    ),
             )
             .when_some(state.run_error.clone(), |el, message| {
                 el.child(error_message(message, colors))
             })
             .when_some(state.output_error.clone(), |el, message| {
                 el.child(error_message(message, colors))
-            })
+            });
+        let config_panel = panel(colors)
+            .flex_1()
+            .flex()
+            .flex_col()
             .child(
                 div()
                     .flex_shrink_0()
@@ -949,6 +956,8 @@ impl MainWindow {
                     .items_center()
                     .justify_between()
                     .gap(px(8.))
+                    .px(px(16.))
+                    .py(px(12.))
                     .child(
                         div()
                             .flex()
@@ -972,19 +981,19 @@ impl MainWindow {
                                         || t::test_all_latencies().to_owned(),
                                         |(current, total)| t::latency_progress(current, total),
                                     ),
-                                    8,
+                                    6,
                                     can_test_all
                                         .then_some(UiAction::Run(Action::TestAllLatencies(core))),
                                     false,
                                     colors,
                                     cx,
                                 )
-                                .tab_index(8)
+                                .tab_index(6)
                                 .tab_stop(can_test_all),
                             )
                             .child(action_button(
                                 t::validate_all(),
-                                9,
+                                7,
                                 (can_validate && !state.configs.is_empty())
                                     .then_some(UiAction::Run(Action::ValidateAllConfigs(core))),
                                 false,
@@ -993,7 +1002,7 @@ impl MainWindow {
                             ))
                             .child(action_button(
                                 t::open_config_folder(),
-                                10,
+                                8,
                                 Some(UiAction::OpenFolder(core)),
                                 false,
                                 colors,
@@ -1001,10 +1010,26 @@ impl MainWindow {
                             )),
                     ),
             )
+            .when_some(
+                self.command_error(FeedbackScope::Config(core)).cloned(),
+                |el, message| el.child(error_message(message, colors)),
+            )
+            .when(
+                state.current.is_some() && !current_exists && state.scan_error.is_none(),
+                |el| el.child(error_message(t::config_moved().into(), colors)),
+            )
             .when_some(state.scan_error.clone(), |el, message| {
                 el.child(error_message(message, colors))
             })
             .child(config_list);
+        let content = div()
+            .id(("core-content", core_index(core)))
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .child(config_panel)
+            .child(core_controls);
         scroll_area(
             ("core-scroll", core_index(core)),
             content,
@@ -1829,7 +1854,7 @@ impl MainWindow {
                                     .child(
                                         div()
                                             .flex()
-                                            .items_baseline()
+                                            .items_center()
                                             .gap(px(8.))
                                             .child(repository_link(
                                                 format!("Ladder {}", env!("CARGO_PKG_VERSION")),
@@ -2416,13 +2441,17 @@ mod tests {
         for side in [24, 30, 36, 54] {
             let icon = render_ladder_icon(side).unwrap();
             assert_eq!(icon.size(0), gpui::size(side.into(), side.into()));
-            let bytes = icon.as_bytes(0).unwrap();
-            assert_eq!(bytes[3], 0);
-            assert!(bytes.chunks_exact(4).any(|p| (1..255).contains(&p[3])));
+            let (pixels, _) = icon.as_bytes(0).unwrap().as_chunks::<4>();
+            assert_eq!(pixels[0][3], 0);
             assert!(
-                bytes
-                    .chunks_exact(4)
-                    .any(|p| p[3] == 255 && p[2] > p[1] && p[1] > p[0])
+                pixels
+                    .iter()
+                    .any(|[_, _, _, alpha]| (1..255).contains(alpha))
+            );
+            assert!(
+                pixels
+                    .iter()
+                    .any(|[blue, green, red, alpha]| *alpha == 255 && red > green && green > blue)
             );
         }
     }

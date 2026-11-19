@@ -10,9 +10,9 @@
     <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.ru.md">Русский</a>
 </p>
 
-You maintain your core configurations; Ladder handles version management, configuration validation, and starting and stopping core processes. It is intended for users who run their own proxy servers and want full control over their configurations.
+You maintain your core configurations; Ladder handles version management, configuration validation, and starting and stopping core processes. It is intended only for users who run their own proxy servers and want full control over their configurations.
 
-**Importing share links is not supported. You must provide complete configuration files.**
+**Importing share links is not supported. You must write your own complete configuration files.**
 
 ![Screenshot](screenshots/main.png)
 
@@ -20,9 +20,9 @@ You maintain your core configurations; Ladder handles version management, config
 
 1. Download the portable package for your Windows architecture from [GitHub Releases](https://github.com/senzyo/ladder/releases/latest) and extract it.
 2. Run `ladder.exe` and grant administrator privileges when prompted by Windows UAC.
-3. Select a core, open “Core versions”, then download and switch to the version you want.
+3. Select a core, open “Core Versions”, then download and switch to the version you want.
 4. Click “Config folder”, add your configuration files, then return to the list and click “Validate”.
-5. If the configuration is valid, click “Start core” to run it.
+5. If the configuration is valid, click “Start Core” to run it.
 
 In Settings, use the language selector to switch between 简体中文, English, and Русский (`zh-Hans`, `en-US`, and `ru-RU`). By default, Ladder follows the system display language and falls back to English for unsupported languages. Selecting a language updates the interface and system tray immediately, and your choice is preserved after restarting.
 

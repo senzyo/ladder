@@ -1,15 +1,15 @@
 messages! {
     latency_config => (
-        "无法准备此配置的测速副本", "Cannot prepare this configuration for the latency test",
-        "Не удалось подготовить конфигурацию для проверки задержки"
+        "无法准备此配置的测速副本", "Cannot prepare a copy of this configuration for the latency test",
+        "Не удалось подготовить копию этой конфигурации для проверки задержки"
     );
     latency_cache(error: impl std::fmt::Display) => (
         "无法准备 mihomo 的测速缓存副本：{error}", "Could not prepare a copy of the mihomo cache for the latency test: {error}",
         "Не удалось подготовить копию кеша mihomo для проверки задержки: {error}"
     );
     latency_endpoint => (
-        "此配置使用的网络端点暂不支持隔离测速", "This configuration uses a network endpoint that does not support an isolated latency test",
-        "Сетевой конечный узел в этой конфигурации не поддерживает изолированную проверку задержки"
+        "此配置使用的网络端点暂不支持隔离测速", "Isolated latency tests are not yet supported for the network endpoint used by this configuration",
+        "Для сетевой конечной точки этой конфигурации пока не поддерживается изолированная проверка задержки"
     );
     latency_wireguard_conflict => (
         "另一份正在运行或测速的配置使用了同一 WireGuard 身份，无法为此配置单独测速。",
@@ -31,14 +31,14 @@ messages! {
         "Не удалось запустить ядро для проверки. Проверьте конфигурацию и выбранную версию."
     );
     latency_start_timeout => (
-        "等待测速核心就绪超时", "Timed out waiting for the test core to start",
-        "Истекло время ожидания запуска ядра"
+        "等待测速核心就绪超时", "Timed out waiting for the test core to become ready",
+        "Истекло время ожидания готовности ядра для проверки задержки"
     );
     latency_cancelled => (
         "测速已取消", "Latency test cancelled", "Проверка задержки отменена"
     );
     latency_timeout => (
-        "测速请求超时", "Latency request timed out", "Истекло время ожидания ответа"
+        "测速请求超时", "Latency request timed out", "Истекло время ожидания ответа при проверке задержки"
     );
     latency_request => (
         "无法通过此配置访问测速 URL", "Could not reach the test URL through this configuration",
@@ -220,8 +220,8 @@ messages! {
     );
     dns_boot_task_update(error: impl std::fmt::Display) => (
         "更新开机 DNS 恢复任务失败: {error:#}",
-        "Failed to update the DNS recovery task at startup: {error:#}",
-        "Не удалось обновить задачу восстановления DNS при загрузке: {error:#}"
+        "Failed to update the startup task for DNS recovery: {error:#}",
+        "Не удалось обновить задачу для восстановления DNS при загрузке системы: {error:#}"
     );
     recovery_helper_write => (
         "写入开机 DNS 恢复程序失败",
@@ -240,8 +240,8 @@ messages! {
     );
     dns_task_register => (
         "无法注册开机 DNS 恢复任务, 请检查管理员权限和 Windows 任务计划程序服务",
-        "Cannot register the DNS recovery task at startup. Check administrator permissions and the Windows Task Scheduler service",
-        "Не удалось зарегистрировать задачу восстановления DNS при загрузке. Проверьте права администратора и службу планировщика заданий Windows"
+        "Cannot register the startup task for DNS recovery. Check administrator permissions and the Windows Task Scheduler service",
+        "Не удалось зарегистрировать задачу для восстановления DNS при загрузке системы. Проверьте права администратора и службу планировщика заданий Windows"
     );
     core_config_read(error: impl std::fmt::Display) => (
         "读取核心配置失败: {error}",

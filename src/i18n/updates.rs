@@ -76,8 +76,8 @@ messages! {
     );
     app_request_limited => (
         "GitHub 请求受限, 请稍后重试或更换加速链接前缀",
-        "GitHub requests are rate-limited. Try again later or change the proxy prefix",
-        "GitHub ограничил частоту запросов. Повторите позже или измените префикс прокси"
+        "GitHub requests are restricted. Try again later or change the proxy prefix",
+        "Запросы к GitHub ограничены. Повторите позже или измените префикс прокси"
     );
     app_package_gone => (
         "软件安装包已不存在, 请重新检查更新",
@@ -156,8 +156,8 @@ messages! {
     );
     unsupported_app_contents => (
         "软件安装包含不支持的文件或内容过大",
-        "The application package contains unsupported files or is too large",
-        "Пакет приложения содержит неподдерживаемые файлы или слишком велик"
+        "The application package contains unsupported files or its unpacked size exceeds the limit",
+        "Пакет приложения содержит неподдерживаемые файлы или его размер после распаковки превышает ограничение"
     );
     invalid_app_executable => (
         "软件安装包的程序文件无效",
@@ -351,8 +351,8 @@ messages! {
     );
     core_request_limited => (
         "GitHub 暂时限制请求, 请稍后重试",
-        "GitHub is temporarily rate-limiting requests. Try again later",
-        "GitHub временно ограничивает частоту запросов. Повторите позже"
+        "GitHub is temporarily restricting requests. Try again later",
+        "GitHub временно ограничивает запросы. Повторите позже"
     );
     core_release_unavailable => (
         "官方发布文件暂不可用, 请稍后重试",
