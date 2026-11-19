@@ -7,6 +7,7 @@
 | `core.rs`                                                      | 核心类型、显示名称及配置与版本根目录                   |
 | `runtime.rs`                                                   | 设置、核心选择、工作线程、验证状态、核心升级及退出协调 |
 | `managed_child.rs`                                             | Windows Job、命令行和进程树生命周期                    |
+| `latency.rs`                                                   | 测速配置副本、回环代理和 HTTP 响应延迟                  |
 | `update.rs`                                                    | 核心 Release 列表、资产选择、下载、解包、版本检测      |
 | `github.rs`                                                    | HTTPS 加速链接前缀校验和 API/资产地址拼接              |
 | `app_update.rs` / `app_updater.rs`                             | Ladder 下载校验、可取消更新助手、异步界面状态          |

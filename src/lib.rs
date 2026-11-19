@@ -7,6 +7,8 @@ mod dns;
 mod emergency;
 mod github;
 mod i18n;
+mod latency;
+mod live_proxy;
 mod logging;
 mod managed_child;
 mod panic_helper;
@@ -16,6 +18,7 @@ mod tun_cleanup;
 mod tun_config;
 mod ui;
 mod update;
+mod wireguard;
 
 use std::{cell::Cell, process::ExitCode, ptr, rc::Rc};
 

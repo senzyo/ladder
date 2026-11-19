@@ -1,9 +1,11 @@
 use crate::app_updater::{AppUpdateState, AppUpdater};
 use crate::core::Core;
+use crate::core_output::ConfigFailure;
 use crate::desktop;
 use crate::i18n::{self, Language, ui as t};
 use crate::runtime::{
-    Action, ConfigValidation, CoreOperation, CoreState, Runtime, Setting, Snapshot, ThemePreference,
+    Action, ConfigLatency, ConfigValidation, CoreOperation, CoreState, LatencyTarget, Runtime,
+    Setting, Snapshot, ThemePreference,
 };
 use crate::update::{CoreVersion, UpdateChannel, UpdateProgress};
 use gpui::{
@@ -28,7 +30,7 @@ use scrollbar::scrollbar;
 
 #[path = "proxy_input.rs"]
 mod proxy_input;
-use proxy_input::ProxyInput;
+use proxy_input::{UrlField, UrlInput};
 
 const TEXT_PRIMARY: f32 = 14.;
 const TEXT_SECONDARY: f32 = 12.;
@@ -45,7 +47,7 @@ enum FeedbackScope {
     Config(Core),
     Versions(Core),
     Settings,
-    GithubProxy,
+    Url(UrlField),
     Logs,
 }
 
@@ -67,14 +69,14 @@ enum UiAction {
     CheckAppUpdate,
     DownloadAppUpdate,
     InstallAppUpdate,
-    SaveGithubProxy,
+    SaveUrl(UrlField),
 }
 
 pub(crate) struct MainWindow {
     runtime: Runtime,
     snapshot: Snapshot,
     page: Page,
-    config_focus: [HashMap<String, [FocusHandle; 4]>; 3],
+    config_focus: [HashMap<String, [FocusHandle; 5]>; 3],
     config_scroll: [ScrollHandle; 3],
     core_page_scroll: [ScrollHandle; 3],
     pending_theme: Option<(ThemePreference, Task<()>)>,
@@ -93,8 +95,8 @@ pub(crate) struct MainWindow {
     focus: FocusHandle,
     logs: LogView,
     icon: Arc<Image>,
-    github_proxy: ProxyInput,
-    pending_github_proxy: Option<(String, Task<()>)>,
+    url_inputs: [UrlInput; 2],
+    timeout_menu: Option<u8>,
     updater: AppUpdater,
     app_update: AppUpdateState,
     events: async_channel::Sender<crate::TrayAction>,
@@ -126,7 +128,8 @@ impl MainWindow {
         })
         .detach();
         let settings = runtime.snapshot().settings;
-        let github_proxy = ProxyInput::new(settings.github_proxy, window, cx);
+        let url_inputs = [UrlField::GithubProxy, UrlField::CustomLatency]
+            .map(|field| UrlInput::new(field, &settings, window, cx));
         let mut view = Self {
             runtime,
             snapshot: Snapshot::default(),
@@ -153,8 +156,8 @@ impl MainWindow {
                 ImageFormat::Png,
                 include_bytes!("../assets/ladder.png").to_vec(),
             )),
-            github_proxy,
-            pending_github_proxy: None,
+            url_inputs,
+            timeout_menu: None,
             updater,
             app_update: AppUpdateState::Idle,
             events,
@@ -227,6 +230,8 @@ impl MainWindow {
                 | Action::Stop(core)
                 | Action::SwitchConfig(core, _)
                 | Action::ValidateConfig(core, _)
+                | Action::TestLatency(core, _)
+                | Action::TestAllLatencies(core)
                 | Action::ValidateAllConfigs(core)
                 | Action::DeleteConfig(core, _),
             )
@@ -248,15 +253,17 @@ impl MainWindow {
             | UiAction::ConfirmDelete(DeleteTarget::Version(core, _)) => {
                 FeedbackScope::Versions(*core)
             }
-            UiAction::Run(Action::Set(..)) => FeedbackScope::Settings,
+            UiAction::Run(
+                Action::Set(..) | Action::SetLatencyTarget(_) | Action::SetLatencyTimeout(_),
+            ) => FeedbackScope::Settings,
             UiAction::Run(Action::RetryDns) => FeedbackScope::Settings,
-            UiAction::SaveGithubProxy => FeedbackScope::GithubProxy,
+            UiAction::SaveUrl(field) => FeedbackScope::Url(*field),
             UiAction::CheckAppUpdate | UiAction::DownloadAppUpdate | UiAction::InstallAppUpdate => {
                 FeedbackScope::Settings
             }
         };
         let result = match action {
-            UiAction::SaveGithubProxy => return self.save_github_proxy(cx),
+            UiAction::SaveUrl(field) => return self.save_url(field, cx),
             UiAction::CheckAppUpdate => self
                 .updater
                 .check(self.snapshot.settings.github_request_prefix().to_owned()),
@@ -463,49 +470,49 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn github_proxy_changed(&self) -> bool {
-        let saved = self.pending_github_proxy.as_ref().map_or(
-            self.snapshot.settings.github_proxy.as_str(),
-            |(prefix, _)| prefix.as_str(),
-        );
-        self.github_proxy.value() != saved
-    }
-
-    fn save_github_proxy(&mut self, cx: &mut Context<Self>) {
-        let scope = FeedbackScope::GithubProxy;
-        if !self.github_proxy_changed() {
+    fn save_url(&mut self, field: UrlField, cx: &mut Context<Self>) {
+        let scope = FeedbackScope::Url(field);
+        let input = &self.url_inputs[field as usize];
+        if !input.changed(&self.snapshot.settings) {
             if self.command_error(scope).is_some() {
                 self.set_command_result(scope, Ok(()));
                 cx.notify();
             }
             return;
         }
-        let requested = self.github_proxy.value().to_owned();
-        match self.runtime.set_github_proxy(requested.clone()) {
+        let requested = input.value().to_owned();
+        let save = match field {
+            UrlField::GithubProxy => self.runtime.set_github_proxy(requested.clone()),
+            UrlField::CustomLatency => self.runtime.set_custom_latency_url(requested.clone()),
+        };
+        match save {
             Ok(saved) => {
                 self.set_command_result(scope, Ok(()));
                 let pending = requested.clone();
                 let task = cx.spawn(async move |view, cx| {
                     let result = saved.recv().await;
                     let _ = view.update(cx, |view, cx| {
-                        view.pending_github_proxy = None;
+                        view.url_inputs[field as usize].pending = None;
                         if result.is_err() {
-                            view.set_command_result(
-                                scope,
-                                Err(t::proxy_save_thread_closed().into()),
-                            );
+                            let message = match field {
+                                UrlField::GithubProxy => t::proxy_save_thread_closed(),
+                                UrlField::CustomLatency => t::latency_url_save_thread_closed(),
+                            };
+                            view.set_command_result(scope, Err(message.into()));
                         }
                         view.refresh(cx);
                         if let Some(message) = view.snapshot.settings_error.clone() {
                             view.set_command_result(scope, Err(message));
-                        } else if result.is_ok() && view.github_proxy.value() == requested {
-                            view.github_proxy
-                                .set_value(view.snapshot.settings.github_proxy.clone());
+                        } else if result.is_ok()
+                            && view.url_inputs[field as usize].value() == requested
+                        {
+                            view.url_inputs[field as usize]
+                                .set_value(field.saved(&view.snapshot.settings).to_owned());
                         }
                         cx.notify();
                     });
                 });
-                self.pending_github_proxy = Some((pending, task));
+                self.url_inputs[field as usize].pending = Some((pending, task));
             }
             Err(message) => self.set_command_result(scope, Err(message)),
         }
@@ -600,7 +607,19 @@ impl MainWindow {
             .as_ref()
             .is_some_and(|name| state.configs.contains(name));
         let can_use_config = idle && state.scan_error.is_none();
-        let can_run = can_use_config && state.installed && current_exists;
+        let can_start_config = can_use_config && !state.validation_busy;
+        let can_validate = state.installed
+            && state.scan_error.is_none()
+            && !state.validation_busy
+            && !matches!(
+                state.operation,
+                Some(CoreOperation::Starting | CoreOperation::Switching)
+            );
+        let can_run = can_start_config && state.installed && current_exists;
+        let can_test_all = state.installed
+            && !state.configs.is_empty()
+            && state.scan_error.is_none()
+            && !state.latency_busy();
         let connection_label = match state.operation {
             Some(CoreOperation::Switching) => t::switching(),
             _ if state.running => t::stop_core(),
@@ -611,6 +630,7 @@ impl MainWindow {
         } else {
             can_run.then_some(UiAction::Run(Action::Start(core)))
         };
+        let connection_disabled = connection_action.is_none();
         let connection_colors = if state.running {
             Colors {
                 accent_fill: colors.stop_fill,
@@ -632,65 +652,115 @@ impl MainWindow {
             let current = state.current.as_ref() == Some(name);
             let target = DeleteTarget::Config(core, name.clone());
             let confirming = self.confirm_delete.as_ref() == Some(&target);
+            let validation = state.validation(name);
+            let latency = state.latency(name);
+            let probe_validation_timed_out = matches!(
+                latency,
+                Some(ConfigLatency::Failed(ConfigFailure::ValidationTimeout(_)))
+            );
+            let latency_badge = match latency {
+                Some(ConfigLatency::Queued) => {
+                    Some(badge(t::latency_queued(), colors.muted, colors))
+                }
+                Some(ConfigLatency::Testing) => {
+                    Some(badge(t::testing_latency(), colors.accent, colors))
+                }
+                Some(ConfigLatency::Measured(time)) => Some(badge(
+                    t::latency_ms(time.as_millis()),
+                    colors.accent,
+                    colors,
+                )),
+                Some(ConfigLatency::Failed(_)) => Some(badge(
+                    if probe_validation_timed_out {
+                        t::validation_timed_out()
+                    } else {
+                        t::latency_failed()
+                    },
+                    colors.error,
+                    colors,
+                )),
+                None => None,
+            };
+            let full_name: SharedString = name.clone().into();
+            let details = div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .id(("config-name", index))
+                        .min_w(px(0.))
+                        .truncate()
+                        .child(full_name.clone())
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| TextTooltip {
+                                label: full_name.clone(),
+                                colors,
+                            })
+                            .into()
+                        }),
+                )
+                .children(latency_badge)
+                .children(match validation {
+                    Some(ConfigValidation::Valid) => {
+                        Some(badge(t::config_valid(), colors.version_stable, colors))
+                    }
+                    Some(ConfigValidation::Invalid(ConfigFailure::ValidationTimeout(_)))
+                        if !probe_validation_timed_out =>
+                    {
+                        Some(badge(t::validation_timed_out(), colors.error, colors))
+                    }
+                    _ => None,
+                });
             let mut buttons = div()
                 .flex()
-                .flex_wrap()
+                .flex_shrink_0()
                 .items_center()
-                .max_w_full()
-                .gap(px(8.));
-            let validation = state.validation(name);
-            let checking = matches!(validation, Some(ConfigValidation::Checking));
-            if matches!(validation, Some(ConfigValidation::Valid)) {
-                buttons = buttons.child(badge(t::config_valid(), colors.version_stable, colors));
-            }
-            let validate = (
-                if checking {
-                    t::validating()
-                } else {
-                    t::validate()
-                },
-                (!state.validation_busy && state.installed && state.scan_error.is_none())
-                    .then(|| UiAction::Run(Action::ValidateConfig(core, name.clone()))),
-            );
-            let edit = (2, (t::edit(), Some(UiAction::Edit(core, name.clone()))));
-            let actions;
-            if current {
-                buttons = buttons.child(div().child(t::current()));
-                actions = vec![(1, validate), edit];
-            } else {
-                actions = vec![
-                    (
-                        0,
-                        (
-                            t::switch(),
-                            can_use_config
-                                .then(|| UiAction::Run(Action::SwitchConfig(core, name.clone()))),
-                        ),
-                    ),
-                    (1, validate),
-                    edit,
-                    (
-                        3,
-                        (
-                            if confirming {
-                                t::confirm_delete()
-                            } else {
-                                t::delete()
-                            },
-                            can_use_config.then(|| {
-                                if confirming {
-                                    UiAction::Run(Action::DeleteConfig(core, name.clone()))
-                                } else {
-                                    UiAction::ConfirmDelete(target.clone())
-                                }
-                            }),
-                        ),
-                    ),
-                ];
-            }
-            for (slot, (label, action)) in actions {
+                .gap(px(5.))
+                .when(current, |el| el.child(div().child(t::current())));
+            let actions = [
+                (
+                    t::switch(),
+                    can_start_config
+                        .then(|| UiAction::Run(Action::SwitchConfig(core, name.clone()))),
+                ),
+                (
+                    t::test_latency(),
+                    (state.installed && !state.latency_busy() && state.scan_error.is_none())
+                        .then(|| UiAction::Run(Action::TestLatency(core, name.clone()))),
+                ),
+                (t::edit(), Some(UiAction::Edit(core, name.clone()))),
+                (
+                    if matches!(validation, Some(ConfigValidation::Checking)) {
+                        t::validating()
+                    } else {
+                        t::validate()
+                    },
+                    can_validate.then(|| UiAction::Run(Action::ValidateConfig(core, name.clone()))),
+                ),
+                (
+                    if confirming {
+                        t::confirm_delete()
+                    } else {
+                        t::delete()
+                    },
+                    can_use_config.then(|| {
+                        if confirming {
+                            UiAction::Run(Action::DeleteConfig(core, name.clone()))
+                        } else {
+                            UiAction::ConfirmDelete(target)
+                        }
+                    }),
+                ),
+            ];
+            for (slot, (label, action)) in actions.into_iter().enumerate() {
+                if current && matches!(slot, 0 | 4) {
+                    continue;
+                }
                 let enabled = action.is_some();
-                let tab_index = 10 + (index * 4 + slot) as isize;
+                let tab_index = 11 + (index * 5 + slot) as isize;
                 let focus = self.config_focus[core_index(core)][name][slot]
                     .clone()
                     .tab_stop(action.is_some())
@@ -702,15 +772,17 @@ impl MainWindow {
                             core.label()
                         )))
                         .track_focus(&focus)
+                        .min_w(px(50.))
+                        .px(px(8.))
                         .when(enabled, |el| {
                             el.text_color(match slot {
-                                1 => colors.text,
+                                1 | 3 => colors.text,
                                 2 => colors.version_preview,
-                                3 => colors.error,
+                                4 => colors.error,
                                 _ => colors.accent,
                             })
                         })
-                        .when(confirming && slot == 3, |el| {
+                        .when(confirming && slot == 4, |el| {
                             el.on_mouse_down_out(cx.listener(|view, _, _, cx| {
                                 view.confirm_delete = None;
                                 cx.notify();
@@ -732,19 +804,17 @@ impl MainWindow {
                     .child(
                         div()
                             .flex()
-                            .flex_wrap()
                             .items_center()
-                            .justify_between()
                             .gap(px(12.))
-                            .child(div().flex_1().min_w(px(100.)).child(name.clone()))
+                            .child(details)
                             .child(buttons),
                     )
-                    .when_some(validation, |el, result| match result {
-                        ConfigValidation::Invalid(message) => {
-                            el.child(error_message(message.clone(), colors))
-                        }
-                        _ => el,
-                    }),
+                    .children(
+                        config_failure_messages(validation, latency)
+                            .into_iter()
+                            .flatten()
+                            .map(|message| error_message(message.to_owned(), colors)),
+                    ),
             );
         }
         let config_list = panel(colors)
@@ -810,7 +880,7 @@ impl MainWindow {
                                 .text_color(colors.on_accent)
                                 .child(power_icon(colors.on_accent))
                                 .child(connection_label)
-                                .when(!idle, |el| el.opacity(0.65)),
+                                .when(connection_disabled, |el| el.opacity(0.65)),
                         )
                     })
                     .child(action_button(
@@ -861,13 +931,26 @@ impl MainWindow {
                             .flex()
                             .items_center()
                             .gap(px(8.))
+                            .child(
+                                action_button(
+                                    state.latency_progress().map_or_else(
+                                        || t::test_all_latencies().to_owned(),
+                                        |(current, total)| t::latency_progress(current, total),
+                                    ),
+                                    8,
+                                    can_test_all
+                                        .then_some(UiAction::Run(Action::TestAllLatencies(core))),
+                                    false,
+                                    colors,
+                                    cx,
+                                )
+                                .tab_index(8)
+                                .tab_stop(can_test_all),
+                            )
                             .child(action_button(
                                 t::validate_all(),
-                                8,
-                                (state.installed
-                                    && !state.configs.is_empty()
-                                    && state.scan_error.is_none()
-                                    && !state.validation_busy)
+                                9,
+                                (can_validate && !state.configs.is_empty())
                                     .then_some(UiAction::Run(Action::ValidateAllConfigs(core))),
                                 false,
                                 colors,
@@ -875,7 +958,7 @@ impl MainWindow {
                             ))
                             .child(action_button(
                                 t::open_config_folder(),
-                                9,
+                                10,
                                 Some(UiAction::OpenFolder(core)),
                                 false,
                                 colors,
@@ -937,7 +1020,7 @@ impl MainWindow {
                         } else {
                             t::delete()
                         },
-                        can_manage.then(|| {
+                        (can_manage && !state.testing_version(&version.version)).then(|| {
                             if confirming {
                                 UiAction::Run(Action::DeleteVersion(core, version.version.clone()))
                             } else {
@@ -1067,7 +1150,18 @@ impl MainWindow {
             ))
         })
         .when(!loading, |el| el.child(refresh_icon(colors.on_accent, 0.)))
-        .tooltip(move |_, cx| cx.new(|_| RefreshTooltip { loading, colors }).into());
+        .tooltip(move |_, cx| {
+            cx.new(|_| TextTooltip {
+                label: if loading {
+                    t::fetching_versions()
+                } else {
+                    t::fetch_versions()
+                }
+                .into(),
+                colors,
+            })
+            .into()
+        });
         let mut filter = div()
             .flex()
             .flex_shrink_0()
@@ -1226,17 +1320,184 @@ impl MainWindow {
         .size_full()
     }
 
+    fn url_setting(&self, field: UrlField, colors: Colors, cx: &Context<Self>) -> Div {
+        let input = &self.url_inputs[field as usize];
+        let changed = input.changed(&self.snapshot.settings);
+        let save_index = field.tab_index() + 1;
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .px(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .min_h(px(44.))
+                    .gap(px(8.))
+                    .items_center()
+                    .when(field == UrlField::GithubProxy, |el| {
+                        el.child(div().flex_shrink_0().child(t::proxy_prefix()))
+                    })
+                    .child(input.render(colors, cx))
+                    .child(
+                        action_button(
+                            t::save(),
+                            save_index,
+                            changed.then_some(UiAction::SaveUrl(field)),
+                            true,
+                            colors,
+                            cx,
+                        )
+                        .tab_index(save_index)
+                        .tab_stop(changed),
+                    ),
+            )
+            .when_some(
+                self.command_error(FeedbackScope::Url(field)).cloned(),
+                |el, message| el.child(div().mb(px(8.)).child(error_message(message, colors))),
+            )
+    }
+
+    fn timeout_dropdown(&self, colors: Colors, cx: &Context<Self>) -> Div {
+        let seconds = self.snapshot.settings.latency_timeout_secs;
+        let open = self.timeout_menu.is_some();
+        let button = control("latency-timeout", 25, colors, false)
+            .w(px(72.))
+            .h(px(30.))
+            .px(px(8.))
+            .justify_between()
+            .border_color(colors.line)
+            .bg(colors.canvas)
+            .child(t::seconds(seconds))
+            .child(caption("▾", colors))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |view, _, _, cx| {
+                    view.timeout_menu = (!open).then_some(seconds);
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(move |view, event: &gpui::KeyDownEvent, _, cx| {
+                let current = view.timeout_menu.unwrap_or(seconds);
+                match event.keystroke.key.as_str() {
+                    "up" => view.timeout_menu = Some(current.saturating_sub(1).max(3)),
+                    "down" => view.timeout_menu = Some((current + 1).min(8)),
+                    "enter" | "space" => {
+                        if let Some(choice) = view.timeout_menu.take() {
+                            view.activate(UiAction::Run(Action::SetLatencyTimeout(choice)), cx);
+                        } else {
+                            view.timeout_menu = Some(seconds);
+                        }
+                    }
+                    "tab" => {
+                        view.timeout_menu = None;
+                        cx.notify();
+                        return;
+                    }
+                    "escape" => view.timeout_menu = None,
+                    _ => return,
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }));
+        div().relative().flex_shrink_0().child(button).when_some(
+            self.timeout_menu,
+            |el, highlighted| {
+                let menu = panel(colors)
+                    .id("latency-timeout-menu")
+                    .w(px(72.))
+                    .p(px(2.))
+                    .flex()
+                    .flex_col()
+                    .shadow_md()
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                        view.timeout_menu = None;
+                        cx.notify();
+                    }))
+                    .children((3..=8u8).map(|choice| {
+                        control(("timeout-seconds", choice as usize), 25, colors, false)
+                            .tab_stop(false)
+                            .h(px(26.))
+                            .px(px(6.))
+                            .when(highlighted == choice, |el| {
+                                el.bg(colors.selection).text_color(colors.accent)
+                            })
+                            .child(t::seconds(choice))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.timeout_menu = None;
+                                view.activate(UiAction::Run(Action::SetLatencyTimeout(choice)), cx);
+                            }))
+                    }));
+                el.child(gpui::deferred(
+                    gpui::anchored().offset(point(px(0.), px(2.))).child(menu),
+                ))
+            },
+        )
+    }
+
+    fn latency_settings(&self, colors: Colors, cx: &Context<Self>) -> Div {
+        let target = self.snapshot.settings.latency_target;
+        let choices = segmented_choices(colors).children(
+            [
+                (LatencyTarget::Google, "Google"),
+                (LatencyTarget::Cloudflare, "Cloudflare"),
+                (LatencyTarget::Custom, t::custom_url()),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (option, label))| {
+                control(
+                    ("latency-target", index),
+                    22 + index as isize,
+                    colors,
+                    false,
+                )
+                .h(px(28.))
+                .px(px(8.))
+                .whitespace_nowrap()
+                .when(target == option, |el| {
+                    el.bg(colors.selection).text_color(colors.accent)
+                })
+                .child(label)
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.activate(UiAction::Run(Action::SetLatencyTarget(option)), cx);
+                }))
+            }),
+        );
+        let controls = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(12.))
+            .px(px(12.))
+            .min_h(px(44.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(t::latency_url())
+                    .child(choices),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(t::latency_timeout())
+                    .child(self.timeout_dropdown(colors, cx)),
+            );
+        let group = div().flex().flex_col().py(px(4.)).child(controls);
+        match target.preset_url() {
+            Some(url) => group.child(caption(url, colors).mx(px(12.)).mb(px(4.))),
+            None => group.child(self.url_setting(UrlField::CustomLatency, colors, cx)),
+        }
+    }
+
     fn settings_page(&self, colors: Colors, cx: &Context<Self>) -> Stateful<Div> {
         let settings = &self.snapshot.settings;
-        let mut choices = div()
-            .flex()
-            .flex_shrink_0()
-            .gap(px(2.))
-            .p(px(2.))
-            .bg(colors.canvas)
-            .border_1()
-            .border_color(colors.line)
-            .rounded(px(6.));
+        let mut choices = segmented_choices(colors);
         for (index, (theme, label)) in [
             (ThemePreference::System, t::system_theme()),
             (ThemePreference::Light, t::light_theme()),
@@ -1257,15 +1518,7 @@ impl MainWindow {
                     .on_click(cx.listener(move |view, _, _, cx| view.set_theme(theme, cx))),
             );
         }
-        let mut languages = div()
-            .flex()
-            .flex_shrink_0()
-            .gap(px(2.))
-            .p(px(2.))
-            .bg(colors.canvas)
-            .border_1()
-            .border_color(colors.line)
-            .rounded(px(6.));
+        let mut languages = segmented_choices(colors);
         for (index, language) in Language::ALL.into_iter().enumerate() {
             languages = languages.child(
                 control(("language", index), 9 + index as isize, colors, false)
@@ -1280,15 +1533,7 @@ impl MainWindow {
                     .on_click(cx.listener(move |view, _, _, cx| view.set_language(language, cx))),
             );
         }
-        let mut startup_choices = div()
-            .flex()
-            .flex_shrink_0()
-            .gap(px(2.))
-            .p(px(2.))
-            .bg(colors.canvas)
-            .border_1()
-            .border_color(colors.line)
-            .rounded(px(6.));
+        let mut startup_choices = segmented_choices(colors);
         for (index, (core, label)) in [
             (Core::Mihomo, "mihomo"),
             (Core::SingBox, "sing-box"),
@@ -1348,6 +1593,65 @@ impl MainWindow {
                     .child(t::startup_page())
                     .child(startup_choices),
             );
+        let toggle = |index: isize,
+                      label: &'static str,
+                      description: &'static str,
+                      key: Setting,
+                      value: bool| {
+            let track = div()
+                .w(px(32.))
+                .h(px(18.))
+                .px(px(3.))
+                .rounded_full()
+                .bg(if value {
+                    colors.accent_fill
+                } else {
+                    colors.switch_off
+                })
+                .flex()
+                .items_center()
+                .when(value, |el| el.justify_end())
+                .child(
+                    div()
+                        .w(px(12.))
+                        .h(px(12.))
+                        .rounded_full()
+                        .bg(colors.on_accent),
+                );
+            control(("setting", index as usize), index, colors, false)
+                .flex_shrink_0()
+                .min_h(px(68.))
+                .px(px(12.))
+                .py(px(10.))
+                .gap(px(12.))
+                .justify_between()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        .flex_col()
+                        .whitespace_normal()
+                        .gap(px(4.))
+                        .child(label)
+                        .child(caption(description, colors).w_full().whitespace_normal()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(caption(
+                            if value { t::enabled() } else { t::disabled() },
+                            colors,
+                        ))
+                        .child(track),
+                )
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.activate(UiAction::Run(Action::Set(key, !value)), cx);
+                }))
+        };
         for (index, (label, description, key, value)) in [
             (
                 t::hide_on_startup(),
@@ -1374,12 +1678,6 @@ impl MainWindow {
                 settings.auto_xray,
             ),
             (
-                t::hijack_dns(),
-                t::hijack_dns_description(),
-                Setting::HijackDns,
-                settings.hijack_dns,
-            ),
-            (
                 t::github_proxy(),
                 t::github_proxy_description(),
                 Setting::GithubProxyEnabled,
@@ -1389,98 +1687,22 @@ impl MainWindow {
         .into_iter()
         .enumerate()
         {
-            let track = div()
-                .w(px(32.))
-                .h(px(18.))
-                .px(px(3.))
-                .rounded_full()
-                .bg(if value {
-                    colors.accent_fill
-                } else {
-                    colors.switch_off
-                })
-                .flex()
-                .items_center()
-                .when(value, |el| el.justify_end())
-                .child(
-                    div()
-                        .w(px(12.))
-                        .h(px(12.))
-                        .rounded_full()
-                        .bg(colors.on_accent),
-                );
-            rows = rows.child(
-                control(("setting", index), 15 + index as isize, colors, false)
-                    .flex_shrink_0()
-                    .min_h(px(68.))
-                    .px(px(12.))
-                    .py(px(10.))
-                    .gap(px(12.))
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .whitespace_normal()
-                            .gap(px(4.))
-                            .child(label)
-                            .child(caption(description, colors).w_full().whitespace_normal()),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .child(caption(
-                                if value { t::enabled() } else { t::disabled() },
-                                colors,
-                            ))
-                            .child(track),
-                    )
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.activate(UiAction::Run(Action::Set(key, !value)), cx);
-                    })),
-            );
+            rows = rows.child(toggle(15 + index as isize, label, description, key, value));
         }
-        rows = rows
-            .child(
-                div()
-                    .flex()
-                    .flex_shrink_0()
-                    .min_h(px(52.))
-                    .px(px(12.))
-                    .gap(px(8.))
-                    .items_center()
-                    .child(div().flex_shrink_0().child(t::proxy_prefix()))
-                    .child(self.github_proxy.render(colors, cx))
-                    .child(
-                        action_button(
-                            t::save(),
-                            22,
-                            self.github_proxy_changed()
-                                .then_some(UiAction::SaveGithubProxy),
-                            true,
-                            colors,
-                            cx,
-                        )
-                        .tab_index(22)
-                        .tab_stop(self.github_proxy_changed()),
-                    ),
-            )
-            .when_some(
-                self.command_error(FeedbackScope::GithubProxy).cloned(),
-                |el, message| {
-                    el.child(
-                        div()
-                            .mx(px(12.))
-                            .mb(px(8.))
-                            .child(error_message(message, colors)),
-                    )
-                },
-            );
+        rows = rows.child(self.url_setting(UrlField::GithubProxy, colors, cx));
+        let network_settings = panel(colors)
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .p(px(4.))
+            .child(self.latency_settings(colors, cx))
+            .child(toggle(
+                28,
+                t::hijack_dns(),
+                t::hijack_dns_description(),
+                Setting::HijackDns,
+                settings.hijack_dns,
+            ));
         let update_status = match &self.app_update {
             AppUpdateState::Idle
             | AppUpdateState::Checking
@@ -1533,7 +1755,7 @@ impl MainWindow {
                             } else {
                                 t::retry_dns()
                             },
-                            23,
+                            29,
                             (!busy).then_some(UiAction::Run(Action::RetryDns)),
                             false,
                             colors,
@@ -1545,6 +1767,7 @@ impl MainWindow {
                 el.child(error_message(message, colors))
             })
             .child(rows)
+            .child(network_settings)
             .child(
                 panel(colors)
                     .flex_shrink_0()
@@ -1552,7 +1775,6 @@ impl MainWindow {
                     .flex()
                     .flex_col()
                     .gap(px(12.))
-                    .child(page_title(t::about()))
                     .child(
                         div()
                             .flex()
@@ -1577,7 +1799,7 @@ impl MainWindow {
                                             .child(repository_link(
                                                 format!("Ladder {}", env!("CARGO_PKG_VERSION")),
                                                 "https://github.com/senzyo/ladder",
-                                                24,
+                                                30,
                                                 colors,
                                             ))
                                             .child(caption(t::mit_license(), colors)),
@@ -1599,7 +1821,7 @@ impl MainWindow {
                                                     repository_link(
                                                         label,
                                                         url,
-                                                        25 + index as isize,
+                                                        31 + index as isize,
                                                         colors,
                                                     )
                                                 },
@@ -1618,7 +1840,7 @@ impl MainWindow {
                             .child(
                                 action_button(
                                     update_label,
-                                    28,
+                                    34,
                                     update_action,
                                     matches!(
                                         self.app_update,
@@ -1838,23 +2060,19 @@ fn refresh_icon(color: Rgba, angle: f32) -> impl IntoElement {
     .size(px(16.))
 }
 
-struct RefreshTooltip {
-    loading: bool,
+struct TextTooltip {
+    label: SharedString,
     colors: Colors,
 }
 
-impl Render for RefreshTooltip {
+impl Render for TextTooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         panel(self.colors)
             .px(px(8.))
             .py(px(4.))
             .text_size(px(TEXT_SECONDARY))
             .text_color(self.colors.text)
-            .child(if self.loading {
-                t::fetching_versions()
-            } else {
-                t::fetch_versions()
-            })
+            .child(self.label.clone())
     }
 }
 
@@ -1881,7 +2099,7 @@ fn panel(colors: Colors) -> Div {
         .rounded(px(8.))
 }
 
-fn badge(label: &'static str, color: Rgba, colors: Colors) -> Div {
+fn badge(label: impl Into<SharedString>, color: Rgba, colors: Colors) -> Div {
     div()
         .flex_shrink_0()
         .px(px(7.))
@@ -1890,7 +2108,7 @@ fn badge(label: &'static str, color: Rgba, colors: Colors) -> Div {
         .bg(colors.canvas)
         .text_color(color)
         .text_size(px(TEXT_SECONDARY))
-        .child(label)
+        .child(label.into())
 }
 
 fn scroll_area(
@@ -1953,8 +2171,45 @@ impl RenderOnce for ErrorMessage {
     }
 }
 
+fn config_failure_messages<'a>(
+    validation: Option<&'a ConfigValidation>,
+    latency: Option<&'a ConfigLatency>,
+) -> [Option<&'a str>; 2] {
+    let validation = match validation {
+        Some(ConfigValidation::Invalid(failure)) => Some(failure),
+        _ => None,
+    };
+    let latency = match latency {
+        Some(ConfigLatency::Failed(failure)) => Some(failure),
+        _ => None,
+    };
+    for failure in [validation, latency].into_iter().flatten() {
+        if let Some(message) = failure.core_output() {
+            return [Some(message), None];
+        }
+    }
+    let validation = validation.map(ConfigFailure::as_str);
+    let latency = latency.map(ConfigFailure::as_str);
+    [
+        validation,
+        latency.filter(|message| Some(*message) != validation),
+    ]
+}
+
 fn error_message(message: String, colors: Colors) -> ErrorMessage {
     ErrorMessage { message, colors }
+}
+
+fn segmented_choices(colors: Colors) -> Div {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .gap(px(2.))
+        .p(px(2.))
+        .bg(colors.canvas)
+        .border_1()
+        .border_color(colors.line)
+        .rounded(px(6.))
 }
 
 fn control(id: impl Into<ElementId>, index: isize, colors: Colors, primary: bool) -> Stateful<Div> {
@@ -1990,13 +2245,14 @@ fn repository_link(
 }
 
 fn action_button(
-    label: &'static str,
+    label: impl Into<SharedString>,
     index: isize,
     action: Option<UiAction>,
     primary: bool,
     colors: Colors,
     cx: &Context<MainWindow>,
 ) -> Stateful<Div> {
+    let label = label.into();
     let enabled = action.is_some();
     let base = if enabled {
         control(("action", index as usize), index, colors, primary)
@@ -2119,6 +2375,40 @@ impl Colors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_row_prefers_core_output_over_generic_failures() {
+        let validation = ConfigValidation::Invalid(ConfigFailure::Core("invalid outbound".into()));
+        let probe = ConfigLatency::Failed(ConfigFailure::Core("dial failed".into()));
+        let timeout = ConfigFailure::ValidationTimeout("INFO core started".into());
+        let silent_validation = ConfigValidation::Invalid("check failed".into());
+        let silent_probe = ConfigLatency::Failed("timed out".into());
+        for (validation, probe, expected) in [
+            (
+                &ConfigValidation::Invalid(timeout.clone()),
+                &ConfigLatency::Failed(timeout),
+                [Some("INFO core started"), None],
+            ),
+            (&validation, &silent_probe, [Some("invalid outbound"), None]),
+            (&silent_validation, &probe, [Some("dial failed"), None]),
+            (&validation, &probe, [Some("invalid outbound"), None]),
+            (
+                &silent_validation,
+                &silent_probe,
+                [Some("check failed"), Some("timed out")],
+            ),
+            (
+                &silent_validation,
+                &ConfigLatency::Failed("check failed".into()),
+                [Some("check failed"), None],
+            ),
+        ] {
+            assert_eq!(
+                config_failure_messages(Some(validation), Some(probe)),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn only_system_theme_tracks_changes_in_window_appearance() {

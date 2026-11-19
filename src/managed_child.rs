@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
@@ -28,10 +28,10 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetProcessId,
+    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use crate::core::Core;
@@ -77,10 +77,41 @@ fn create_job() -> io::Result<OwnedHandle> {
     Ok(job)
 }
 
+// 验证与测速使用指定的文件, 排除可能额外加载配置、监听器或启动脚本的环境变量。
+fn overrides_test_config(core: Core, key: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    let key = key.to_ascii_uppercase();
+    match core {
+        Core::Mihomo => {
+            key == "CLASH_CONFIG_STRING"
+                || key.starts_with("CLASH_OVERRIDE_EXTERNAL_")
+                || matches!(key.as_str(), "CLASH_POST_UP" | "CLASH_POST_DOWN")
+        }
+        Core::Xray => matches!(
+            key.as_str(),
+            "XRAY.LOCATION.CONFDIR"
+                | "XRAY_LOCATION_CONFDIR"
+                | "XRAY.BROWSER.DIALER"
+                | "XRAY_BROWSER_DIALER"
+        ),
+        Core::SingBox => false,
+    }
+}
+
 // Windows 的环境块按变量名 (忽略大小写) 排序, 以两个 NUL 结束。
-fn xray_environment(assets: &Path) -> Vec<u16> {
-    let name: Vec<_> = "XRAY_LOCATION_ASSET".encode_utf16().collect();
+fn core_environment(
+    core: Core,
+    assets: &Path,
+    isolate_config: bool,
+    mihomo_source_dir: Option<&Path>,
+) -> Option<Vec<u16>> {
+    if core != Core::Xray && !(isolate_config && core == Core::Mihomo) {
+        return None;
+    }
     let mut entries: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| !isolate_config || !overrides_test_config(core, key))
         .map(|(key, value)| (key.encode_wide().collect::<Vec<_>>(), value))
         .collect();
     let compare = |left: &[u16], right: &[u16]| match unsafe {
@@ -96,8 +127,21 @@ fn xray_environment(assets: &Path) -> Vec<u16> {
         CSTR_EQUAL => Ordering::Equal,
         _ => Ordering::Greater,
     };
-    entries.retain(|(key, _)| compare(key, &name) != Ordering::Equal);
-    entries.push((name, assets.as_os_str().to_owned()));
+    if core == Core::Xray {
+        let name: Vec<_> = "XRAY_LOCATION_ASSET".encode_utf16().collect();
+        entries.retain(|(key, _)| compare(key, &name) != Ordering::Equal);
+        entries.push((name, assets.as_os_str().to_owned()));
+    }
+    if let Some(dir) = mihomo_source_dir {
+        // Absolute provider paths under the original -d directory remain valid in a private home.
+        let name: Vec<_> = "SAFE_PATHS".encode_utf16().collect();
+        entries.retain(|(key, _)| compare(key, &name) != Ordering::Equal);
+        let mut paths = OsString::from("\"");
+        paths.push(dir);
+        paths.push("\";");
+        paths.push(std::env::var_os("SAFE_PATHS").unwrap_or_default());
+        entries.push((name, paths));
+    }
     entries.sort_unstable_by(|(left, _), (right, _)| compare(left, right));
     let mut block = Vec::new();
     for (key, value) in entries {
@@ -106,8 +150,11 @@ fn xray_environment(assets: &Path) -> Vec<u16> {
         block.extend(value.encode_wide());
         block.push(0);
     }
+    if block.is_empty() {
+        block.push(0);
+    }
     block.push(0);
-    block
+    Some(block)
 }
 
 struct AttributeList(Vec<usize>);
@@ -170,8 +217,11 @@ impl ManagedChild {
             stderr_write.as_raw_handle(),
         ];
         let command = config_command(core, exe, assets, config.path(), false);
-        let env = (core == Core::Xray).then(|| xray_environment(assets));
+        let env = core_environment(core, assets, false, None);
         let process = JobProcess::spawn(exe, root, command, env.as_deref(), stdio)?;
+        if let Some(session) = &config.session {
+            session.set_pid(Some(process.id()));
+        }
         drop((stdin, stdout_write, stderr_write));
         Ok(Self {
             process,
@@ -189,18 +239,21 @@ impl ManagedChild {
     }
 
     pub(crate) fn terminate(&self) -> io::Result<()> {
+        if let Some(session) = &self.config.session {
+            session.set_pid(None);
+        }
         self.process.terminate()
     }
 }
 
 impl JobProcess {
-    pub(crate) fn spawn_version(core: Core, exe: &Path, stdout: &File) -> io::Result<Self> {
+    pub(crate) fn spawn_version(core: Core, exe: &Path, output: &File) -> io::Result<Self> {
         let root = exe.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, t::core_directory_missing())
         })?;
         let stdin = File::open("NUL")?;
-        let stdout = stdout.try_clone()?;
-        let stderr = File::options().write(true).open("NUL")?;
+        let stdout = output.try_clone()?;
+        let stderr = output.try_clone()?;
         let stdio = [
             stdin.as_raw_handle(),
             stdout.as_raw_handle(),
@@ -223,25 +276,58 @@ impl JobProcess {
         config: &Path,
         output: &File,
     ) -> io::Result<Self> {
+        Self::spawn_config(core, exe, root, config, output, true)
+    }
+
+    pub(crate) fn spawn_latency(
+        core: Core,
+        exe: &Path,
+        root: &Path,
+        config: &Path,
+        output: &std::io::PipeWriter,
+    ) -> io::Result<Self> {
+        Self::spawn_config(core, exe, root, config, output, false)
+    }
+
+    fn spawn_config(
+        core: Core,
+        exe: &Path,
+        root: &Path,
+        config: &Path,
+        output: &impl AsHandle,
+        validate: bool,
+    ) -> io::Result<Self> {
         let assets = exe.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, t::core_directory_missing())
         })?;
         let stdin = File::open("NUL")?;
-        let output = output.try_clone()?;
+        let output = output.as_handle().try_clone_to_owned()?;
         let stderr = output.try_clone()?;
         let stdio = [
             stdin.as_raw_handle(),
             output.as_raw_handle(),
             stderr.as_raw_handle(),
         ];
-        let env = (core == Core::Xray).then(|| xray_environment(assets));
+        let source_dir = (core == Core::Mihomo && !validate).then(|| core.config_dir(root));
+        let env = core_environment(
+            core,
+            assets,
+            true,
+            source_dir
+                .as_deref()
+                .filter(|dir| Some(*dir) != config.parent()),
+        );
         Self::spawn(
             exe,
             root,
-            config_command(core, exe, assets, config, true),
+            config_command(core, exe, assets, config, validate),
             env.as_deref(),
             stdio,
         )
+    }
+
+    pub(crate) fn id(&self) -> u32 {
+        unsafe { GetProcessId(self.process.as_raw_handle()) }
     }
 
     fn spawn(
@@ -377,6 +463,37 @@ impl JobProcess {
 #[cfg(test)]
 mod command_tests {
     use super::*;
+
+    #[test]
+    fn test_environment_filters_overrides_and_preserves_resource_locations() {
+        for key in [
+            "clash_config_string",
+            "CLASH_OVERRIDE_EXTERNAL_CONTROLLER_TLS",
+            "CLASH_POST_UP",
+            "CLASH_POST_DOWN",
+        ] {
+            assert!(overrides_test_config(Core::Mihomo, key.as_ref()));
+        }
+        for key in [
+            "XRAY_LOCATION_CONFDIR",
+            "xray.location.confdir",
+            "XRAY_BROWSER_DIALER",
+            "xray.browser.dialer",
+        ] {
+            assert!(overrides_test_config(Core::Xray, key.as_ref()));
+        }
+        for key in ["XRAY_LOCATION_ASSET", "xray.location.cert", "SystemRoot"] {
+            assert!(!overrides_test_config(Core::Xray, key.as_ref()));
+        }
+        assert!(!overrides_test_config(
+            Core::Mihomo,
+            "CLASH_AGE_SECRET_KEY".as_ref()
+        ));
+        assert!(!overrides_test_config(
+            Core::SingBox,
+            "XRAY_LOCATION_CONFDIR".as_ref()
+        ));
+    }
 
     #[test]
     fn validation_commands_use_official_flags_and_quote_paths() {

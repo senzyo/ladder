@@ -1,7 +1,8 @@
 use super::{Colors, MainWindow, TEXT_PRIMARY};
+use crate::runtime::Settings;
 use gpui::{
     Bounds, ClipboardItem, Context, Div, FocusHandle, MouseButton, Pixels, Point, ShapedLine,
-    Stateful, TextRun, Window, canvas, div, fill, point, prelude::*, px, size,
+    Stateful, Task, TextRun, Window, canvas, div, fill, point, prelude::*, px, size,
 };
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
@@ -11,31 +12,74 @@ struct InputLayout {
     offset: Pixels,
 }
 
-pub(super) struct ProxyInput {
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum UrlField {
+    GithubProxy,
+    CustomLatency,
+}
+
+impl UrlField {
+    pub(super) fn saved(self, settings: &Settings) -> &str {
+        match self {
+            Self::GithubProxy => &settings.github_proxy,
+            Self::CustomLatency => &settings.custom_latency_url,
+        }
+    }
+
+    pub(super) fn tab_index(self) -> isize {
+        match self {
+            Self::GithubProxy => 20,
+            Self::CustomLatency => 26,
+        }
+    }
+}
+
+pub(super) struct UrlInput {
+    field: UrlField,
     text: String,
     cursor: usize,
     anchor: usize,
     focus: FocusHandle,
     layout: Rc<RefCell<Option<InputLayout>>>,
+    pub(super) pending: Option<(String, Task<()>)>,
 }
 
-impl ProxyInput {
-    pub(super) fn new(text: String, window: &mut Window, cx: &mut Context<MainWindow>) -> Self {
+impl UrlInput {
+    pub(super) fn new(
+        field: UrlField,
+        settings: &Settings,
+        window: &mut Window,
+        cx: &mut Context<MainWindow>,
+    ) -> Self {
+        let text = field.saved(settings).to_owned();
         let cursor = text.len();
-        let focus = cx.focus_handle().tab_index(21).tab_stop(true);
-        cx.on_blur(&focus, window, |view, _, cx| view.save_github_proxy(cx))
+        let focus = cx
+            .focus_handle()
+            .tab_index(field.tab_index())
+            .tab_stop(true);
+        cx.on_blur(&focus, window, move |view, _, cx| view.save_url(field, cx))
             .detach();
         Self {
+            field,
             text,
             cursor,
             anchor: cursor,
             focus,
             layout: Rc::default(),
+            pending: None,
         }
     }
 
     pub(super) fn value(&self) -> &str {
         &self.text
+    }
+
+    pub(super) fn changed(&self, settings: &Settings) -> bool {
+        let saved = self
+            .pending
+            .as_ref()
+            .map_or(self.field.saved(settings), |(value, _)| value);
+        self.text != saved
     }
 
     pub(super) fn set_value(&mut self, text: String) {
@@ -97,15 +141,16 @@ impl ProxyInput {
     }
 
     pub(super) fn render(&self, colors: Colors, cx: &Context<MainWindow>) -> Stateful<Div> {
+        let field = self.field;
         let text = self.text.clone();
         let selection = self.selection();
         let cursor = self.cursor;
         let focus = self.focus.clone();
         let layout = self.layout.clone();
         div()
-            .id("github-proxy-input")
+            .id(("url-input", field as usize))
             .track_focus(&self.focus)
-            .tab_index(21)
+            .tab_index(field.tab_index())
             .flex_1()
             .min_w(px(100.))
             .h(px(30.))
@@ -118,24 +163,24 @@ impl ProxyInput {
             .focus(|el| el.border_color(colors.accent))
             .cursor_text()
             .overflow_hidden()
-            .on_mouse_down_out(cx.listener(|view, _, window, _| {
-                if view.github_proxy.focus.is_focused(window) {
+            .on_mouse_down_out(cx.listener(move |view, _, window, _| {
+                if view.url_inputs[field as usize].focus.is_focused(window) {
                     window.focus(&view.focus);
                 }
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|view, event: &gpui::MouseDownEvent, window, cx| {
-                    window.focus(&view.github_proxy.focus);
-                    view.github_proxy
-                        .click(event.position, event.modifiers.shift);
+                cx.listener(move |view, event: &gpui::MouseDownEvent, window, cx| {
+                    let input = &mut view.url_inputs[field as usize];
+                    window.focus(&input.focus);
+                    input.click(event.position, event.modifiers.shift);
                     cx.notify();
                     cx.stop_propagation();
                 }),
             )
             .on_key_down(
                 cx.listener(move |view, event: &gpui::KeyDownEvent, window, cx| {
-                    let input = &mut view.github_proxy;
+                    let input = &mut view.url_inputs[field as usize];
                     if !input.focus.is_focused(window) {
                         return;
                     }
@@ -145,7 +190,7 @@ impl ProxyInput {
                         return;
                     }
                     if key == "enter" {
-                        view.save_github_proxy(cx);
+                        view.save_url(field, cx);
                     } else if modifiers.control {
                         match key.as_str() {
                             "a" => {
@@ -207,7 +252,7 @@ impl ProxyInput {
                                 input.replace("");
                             }
                             "escape" => {
-                                input.set_value(view.snapshot.settings.github_proxy.clone());
+                                input.set_value(field.saved(&view.snapshot.settings).to_owned());
                                 window.focus(&view.focus);
                             }
                             _ => {
@@ -224,9 +269,10 @@ impl ProxyInput {
                 }),
             )
             .on_mouse_move(
-                cx.listener(|view, event: &gpui::MouseMoveEvent, window, cx| {
-                    if event.dragging() && view.github_proxy.focus.is_focused(window) {
-                        view.github_proxy.click(event.position, true);
+                cx.listener(move |view, event: &gpui::MouseMoveEvent, window, cx| {
+                    let input = &mut view.url_inputs[field as usize];
+                    if event.dragging() && input.focus.is_focused(window) {
+                        input.click(event.position, true);
                         cx.notify();
                     }
                 }),

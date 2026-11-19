@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::core::Core;
-use crate::core_output::CoreDiagnostics;
+use crate::core_output::{ConfigFailure, CoreDiagnostics};
 use crate::dns::DnsLease;
 use crate::i18n::{Language, runtime as t};
 use crate::logging;
@@ -27,6 +28,57 @@ pub enum ThemePreference {
     System,
     Light,
     Dark,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LatencyTarget {
+    #[default]
+    Google,
+    Cloudflare,
+    Custom,
+}
+
+impl LatencyTarget {
+    pub fn preset_url(self) -> Option<&'static str> {
+        match self {
+            Self::Google => Some("https://www.google.com/generate_204"),
+            Self::Cloudflare => Some("https://cp.cloudflare.com/"),
+            Self::Custom => None,
+        }
+    }
+}
+
+fn default_latency_timeout() -> u8 {
+    5
+}
+
+fn deserialize_latency_timeout<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u8, D::Error> {
+    let seconds = u8::deserialize(deserializer)?;
+    Ok(if (3..=8).contains(&seconds) {
+        seconds
+    } else {
+        default_latency_timeout()
+    })
+}
+
+fn checked_latency_url(value: &str) -> Result<&str, String> {
+    let value = value.trim();
+    let invalid = || t::invalid_latency_url().to_owned();
+    let url: ureq::http::Uri = value.parse().map_err(|_| invalid())?;
+    let authority = url.authority().ok_or_else(invalid)?;
+    if !matches!(url.scheme_str(), Some("http" | "https"))
+        || authority.host().is_empty()
+        || authority.as_str().contains('@')
+        || (authority.as_str() != authority.host() && authority.port_u16().is_none())
+        || value.contains(['#', '\\'])
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err(invalid());
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -49,6 +101,15 @@ pub struct Settings {
         deserialize_with = "deserialize_github_proxy"
     )]
     pub github_proxy: String,
+    #[serde(default)]
+    pub latency_target: LatencyTarget,
+    #[serde(
+        default = "default_latency_timeout",
+        deserialize_with = "deserialize_latency_timeout"
+    )]
+    pub latency_timeout_secs: u8,
+    #[serde(default)]
+    pub custom_latency_url: String,
 }
 
 impl Default for Settings {
@@ -64,11 +125,20 @@ impl Default for Settings {
             hijack_dns: false,
             github_proxy_enabled: false,
             github_proxy: default_github_proxy(),
+            latency_target: LatencyTarget::default(),
+            latency_timeout_secs: default_latency_timeout(),
+            custom_latency_url: String::new(),
         }
     }
 }
 
 impl Settings {
+    pub fn latency_url(&self) -> &str {
+        self.latency_target
+            .preset_url()
+            .unwrap_or(&self.custom_latency_url)
+    }
+
     pub fn effective_language(&self) -> Language {
         Language::resolve(self.language)
     }
@@ -101,13 +171,43 @@ fn deserialize_github_proxy<'de, D: serde::Deserializer<'de>>(
 pub enum ConfigValidation {
     Checking,
     Valid,
-    Invalid(String),
+    Invalid(ConfigFailure),
+}
+
+impl ConfigValidation {
+    fn completed(core: Core, result: Result<(), ConfigFailure>) -> Self {
+        match result {
+            Ok(()) => Self::Valid,
+            Err(error) => {
+                for line in error.to_string().lines() {
+                    logging::record_core(core, format!("[ERROR] 配置验证: {line}"));
+                }
+                Self::Invalid(error)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ValidationRecord {
-    result: ConfigValidation,
+struct ConfigRecord<T> {
+    result: T,
     stamp: Option<(u64, Option<SystemTime>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigLatency {
+    Queued,
+    Testing,
+    Measured(Duration),
+    Failed(ConfigFailure),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveLatencyTest {
+    config: String,
+    version: Option<String>,
+    progress: Option<(usize, usize)>,
+    checking: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,13 +240,49 @@ pub struct CoreState {
     pub versions_error: Option<String>,
     pub local_versions_error: Option<String>,
     pub downloading_version: Option<String>,
-    validation: BTreeMap<String, ValidationRecord>,
+    validation: BTreeMap<String, ConfigRecord<ConfigValidation>>,
     pub validation_busy: bool,
+    latency: BTreeMap<String, ConfigRecord<ConfigLatency>>,
+    active_latency: Option<ActiveLatencyTest>,
     versions_page: u32,
 }
 
 impl CoreState {
+    pub fn latency(&self, name: &str) -> Option<&ConfigLatency> {
+        if self
+            .active_latency
+            .as_ref()
+            .is_some_and(|test| test.config == name)
+        {
+            return Some(&ConfigLatency::Testing);
+        }
+        self.latency.get(name).map(|record| &record.result)
+    }
+
+    pub fn latency_busy(&self) -> bool {
+        self.active_latency.is_some()
+    }
+
+    pub fn latency_progress(&self) -> Option<(usize, usize)> {
+        self.active_latency.as_ref()?.progress
+    }
+
+    pub fn testing_version(&self, version: &str) -> bool {
+        self.active_latency
+            .as_ref()
+            .and_then(|test| test.version.as_deref())
+            == Some(version)
+    }
+
     pub fn validation(&self, name: &str) -> Option<&ConfigValidation> {
+        if self
+            .active_latency
+            .as_ref()
+            .is_some_and(|test| test.config == name && test.checking)
+            && self.latency.contains_key(name)
+        {
+            return Some(&ConfigValidation::Checking);
+        }
         self.validation.get(name).map(|record| &record.result)
     }
 }
@@ -197,9 +333,13 @@ pub enum Action {
     Stop(Core),
     ValidateConfig(Core, String),
     ValidateAllConfigs(Core),
+    TestLatency(Core, String),
+    TestAllLatencies(Core),
     SwitchConfig(Core, String),
     DeleteConfig(Core, String),
     Set(Setting, bool),
+    SetLatencyTarget(LatencyTarget),
+    SetLatencyTimeout(u8),
     RetryDns,
     RefreshVersions(Core),
     LoadMoreVersions(Core),
@@ -209,16 +349,47 @@ pub enum Action {
 }
 
 enum Request {
-    Action(Action),
+    Action(Action, Runtime),
+    ValidatedLaunch(Action, ValidatedConfig),
+    TestLatencies(Core, Vec<String>),
     SetTheme(ThemePreference, async_channel::Sender<()>),
     SetLanguage(Language, async_channel::Sender<()>),
     SetStartupCore(Core, async_channel::Sender<()>),
     SetGithubProxy(String, async_channel::Sender<()>),
+    SetCustomLatencyUrl(String, async_channel::Sender<()>),
     Shutdown(mpsc::Sender<Result<Option<String>, String>>),
     PrepareAppUpdate(mpsc::Sender<Result<(), String>>),
     Prepared(Core, PreparedUpdate),
     #[cfg(test)]
     Panic,
+}
+
+pub(crate) struct ValidatedConfig {
+    pub(crate) config: PathBuf,
+    pub(crate) exe: PathBuf,
+    _files: [fs::File; 2],
+}
+
+impl ValidatedConfig {
+    pub(crate) fn hold(
+        config: PathBuf,
+        config_stamp: (u64, Option<SystemTime>),
+        exe: &Path,
+        exe_stamp: (u64, Option<SystemTime>),
+    ) -> Option<Self> {
+        // Deny writes and replacement until CreateProcess returns, including while the
+        // old instance stops. Release the handles so the running configuration can be edited.
+        let mut read = fs::OpenOptions::new();
+        read.read(true).share_mode(1 /* FILE_SHARE_READ */);
+        let files = [read.open(&config).ok()?, read.open(exe).ok()?];
+        (executable_stamp(&config) == Some(config_stamp)
+            && executable_stamp(exe) == Some(exe_stamp))
+        .then(|| Self {
+            config,
+            exe: exe.to_owned(),
+            _files: files,
+        })
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -297,11 +468,12 @@ pub struct Runtime {
     state: Arc<Mutex<Snapshot>>,
     tx: mpsc::Sender<Request>,
     quitting: Arc<AtomicBool>,
+    validation_jobs: Arc<Mutex<[Option<thread::JoinHandle<()>>; 3]>>,
 }
 
 impl Runtime {
     #[cfg(test)]
-    fn open(root: PathBuf) -> Result<Self, String> {
+    pub(crate) fn open(root: PathBuf) -> Result<Self, String> {
         let dns = DnsLease::for_tests(&root);
         Self::open_with_dns(root, DesktopDns::Portable(dns), None)
     }
@@ -377,26 +549,32 @@ impl Runtime {
         let state = Arc::new(Mutex::new(snapshot));
         let (tx, rx) = mpsc::channel();
         let quitting = Arc::new(AtomicBool::new(false));
-        let worker = Worker {
+        let mut worker = Worker {
             root: root.clone(),
             state: state.clone(),
             saved,
             children: Default::default(),
             dns,
             quitting: quitting.clone(),
+            wireguard: Default::default(),
+            latency_jobs: Default::default(),
             version_files: Default::default(),
         };
-        thread::Builder::new()
-            .name("ladder-cores".into())
-            .spawn(move || worker.run(rx))
-            .map_err(t::create_manager)?;
-        logging::info("runtime", "核心管理线程已启动");
-        Ok(Self {
+        worker.refresh();
+        let runtime = Self {
             root,
             state,
             tx,
             quitting,
-        })
+            validation_jobs: Default::default(),
+        };
+        let startup = runtime.clone();
+        thread::Builder::new()
+            .name("ladder-cores".into())
+            .spawn(move || worker.run(rx, startup))
+            .map_err(t::create_manager)?;
+        logging::info("runtime", "核心管理线程已启动");
+        Ok(runtime)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -420,6 +598,8 @@ impl Runtime {
                 return self.validate_configs(core, Some(name));
             }
             Action::ValidateAllConfigs(core) => return self.validate_configs(core, None),
+            Action::TestLatency(core, name) => return self.queue_latency(core, Some(name)),
+            Action::TestAllLatencies(core) => return self.queue_latency(core, None),
             Action::RefreshVersions(core) => return self.load_versions(core, false),
             Action::LoadMoreVersions(core) => return self.load_versions(core, true),
             Action::DownloadVersion(core, ref version) => {
@@ -441,7 +621,10 @@ impl Runtime {
                 }
                 Some((*core, CoreOperation::Updating))
             }
-            Action::Set(_, _) => None,
+            Action::SetLatencyTimeout(seconds) if !(3..=8).contains(seconds) => {
+                return Err(t::invalid_latency_timeout().into());
+            }
+            Action::Set(_, _) | Action::SetLatencyTarget(_) | Action::SetLatencyTimeout(_) => None,
             Action::RetryDns => {
                 if snapshot.dns_recovery_error.is_none() || snapshot.dns_recovery_busy {
                     return Err(t::no_dns_retry().into());
@@ -452,6 +635,8 @@ impl Runtime {
             Action::RefreshVersions(_)
             | Action::ValidateConfig(..)
             | Action::ValidateAllConfigs(_)
+            | Action::TestLatency(..)
+            | Action::TestAllLatencies(_)
             | Action::LoadMoreVersions(_)
             | Action::DownloadVersion(_, _) => unreachable!(),
         };
@@ -460,22 +645,66 @@ impl Runtime {
             if active.operation.is_some() {
                 return Err(t::core_busy(core.label()));
             }
+            if matches!(action, Action::Start(_) | Action::SwitchConfig(..))
+                && active.validation_busy
+            {
+                return Err(t::validation_busy().into());
+            }
             active.operation = Some(operation);
             if operation == CoreOperation::Updating {
                 active.update_error = None;
             } else {
                 active.run_error = None;
             }
+            if !active.running && matches!(action, Action::Start(_) | Action::SwitchConfig(..)) {
+                active.output_error = None;
+            }
         }
-        self.tx.send(Request::Action(action)).map_err(|_| {
-            if let Some((core, _)) = target {
-                snapshot.core_mut(core).operation = None;
+        self.tx
+            .send(Request::Action(action, self.clone()))
+            .map_err(|_| {
+                if let Some((core, _)) = target {
+                    snapshot.core_mut(core).operation = None;
+                }
+                if retry_dns {
+                    snapshot.dns_recovery_busy = false;
+                }
+                t::manager_closed().to_owned()
+            })
+    }
+
+    fn queue_latency(&self, core: Core, file: Option<String>) -> Result<(), String> {
+        let mut snapshot = self.state.lock().unwrap();
+        let state = snapshot.core_mut(core);
+        if state.latency_busy() {
+            return Err(t::latency_busy().into());
+        }
+        let batch = file.is_none();
+        let names = match file {
+            Some(name) => {
+                config_path(core, &self.root, &name)?;
+                vec![name]
             }
-            if retry_dns {
-                snapshot.dns_recovery_busy = false;
+            None => {
+                let mut names = list_configs(core, &self.config_dir(core))?;
+                names.sort_by_key(|name| state.current.as_ref() != Some(name));
+                names
             }
-            t::manager_closed().to_string()
-        })
+        };
+        let Some(first) = names.first() else {
+            return Ok(());
+        };
+        let active = ActiveLatencyTest {
+            config: first.clone(),
+            version: state.selected_version.clone(),
+            progress: batch.then_some((1, names.len())),
+            checking: false,
+        };
+        self.tx
+            .send(Request::TestLatencies(core, names))
+            .map_err(|_| t::manager_closed().to_owned())?;
+        state.active_latency = Some(active);
+        Ok(())
     }
 
     pub fn set_theme(&self, theme: ThemePreference) -> Result<async_channel::Receiver<()>, String> {
@@ -514,12 +743,44 @@ impl Runtime {
         Ok(rx)
     }
 
+    pub fn set_custom_latency_url(
+        &self,
+        url: String,
+    ) -> Result<async_channel::Receiver<()>, String> {
+        let value = checked_latency_url(&url)?.to_owned();
+        let (tx, rx) = async_channel::bounded(1);
+        self.tx
+            .send(Request::SetCustomLatencyUrl(value, tx))
+            .map_err(|_| t::manager_closed().to_owned())?;
+        Ok(rx)
+    }
+
     fn validate_configs(&self, core: Core, name: Option<&str>) -> Result<(), String> {
         if self.quitting.load(Ordering::Acquire) {
             return Err(t::quitting_validation().into());
         }
         let mut snapshot = self.state.lock().unwrap();
         let state = snapshot.core_mut(core);
+        if matches!(
+            state.operation,
+            Some(CoreOperation::Starting | CoreOperation::Switching)
+        ) {
+            return Err(t::core_busy(core.label()));
+        }
+        self.begin_validation(core, state, name, None)
+    }
+
+    fn begin_validation(
+        &self,
+        core: Core,
+        state: &mut CoreState,
+        name: Option<&str>,
+        launch: Option<Action>,
+    ) -> Result<(), String> {
+        let mut threads = self.validation_jobs.lock().unwrap();
+        if self.quitting.load(Ordering::Acquire) {
+            return Err(t::quitting_validation().into());
+        }
         if state.validation_busy {
             return Err(t::validation_busy().into());
         }
@@ -543,12 +804,18 @@ impl Runtime {
             })
             .collect::<Vec<_>>();
         for (name, _, stamp) in &jobs {
+            // A manual or launch check owns its row even if a latency check finishes later.
+            if let Some(test) = &mut state.active_latency
+                && test.config == *name
+            {
+                test.checking = false;
+            }
             // 读取失败时保留已有指纹, 延续刷新时的失效判断。
             let stamp =
                 stamp.or_else(|| state.validation.get(name).and_then(|record| record.stamp));
             state.validation.insert(
                 name.clone(),
-                ValidationRecord {
+                ConfigRecord {
                     result: ConfigValidation::Checking,
                     stamp,
                 },
@@ -556,16 +823,23 @@ impl Runtime {
         }
         state.validation_busy = true;
         let runtime = self.clone();
-        thread::Builder::new()
+        let thread = thread::Builder::new()
             .name(format!("{}-validate", core.label()))
             .spawn(move || {
+                let mut checked = None;
                 for (name, path, stamp) in jobs {
                     if runtime.quitting.load(Ordering::Acquire) {
                         break;
                     }
-                    let result = path.as_ref().map_err(Clone::clone).and_then(|path| {
-                        validate_config(core, &exe, &runtime.root, path, &runtime.quitting)
-                    });
+                    let result = path
+                        .as_ref()
+                        .map_err(|error| ConfigFailure::Ladder(error.clone()))
+                        .and_then(|path| {
+                            validate_config(core, &exe, &runtime.root, path, &runtime.quitting)
+                        });
+                    if runtime.quitting.load(Ordering::Acquire) {
+                        break;
+                    }
                     let mut snapshot = runtime.state.lock().unwrap();
                     let state = snapshot.core_mut(core);
                     if state.selected_version.as_deref() != Some(&version)
@@ -576,18 +850,24 @@ impl Runtime {
                         || state.validation(&name) != Some(&ConfigValidation::Checking)
                     {
                         state.validation.remove(&name);
+                        if launch.is_some() && !runtime.quitting.load(Ordering::Acquire) {
+                            state.run_error = Some(t::validation_inputs_changed().into());
+                        }
                         continue;
                     }
-                    let value = match result {
-                        Ok(()) => ConfigValidation::Valid,
-                        Err(error) => {
-                            for line in error.lines() {
-                                logging::record_core(core, format!("[ERROR] 配置验证: {line}"));
-                            }
-                            ConfigValidation::Invalid(error)
+                    if result.is_ok()
+                        && launch.is_some()
+                        && let (Ok(config), Some(config_stamp)) = (path, stamp)
+                    {
+                        checked = ValidatedConfig::hold(config, config_stamp, &exe, exe_stamp);
+                        if checked.is_none() {
+                            state.validation.remove(&name);
+                            state.run_error = Some(t::validation_inputs_changed().into());
+                            continue;
                         }
-                    };
-                    state.validation.get_mut(&name).unwrap().result = value;
+                    }
+                    state.validation.get_mut(&name).unwrap().result =
+                        ConfigValidation::completed(core, result);
                 }
                 let mut snapshot = runtime.state.lock().unwrap();
                 let state = snapshot.core_mut(core);
@@ -595,6 +875,18 @@ impl Runtime {
                     .validation
                     .retain(|_, record| record.result != ConfigValidation::Checking);
                 state.validation_busy = false;
+                if let Some(action) = launch {
+                    if let Some(checked) = checked
+                        && !runtime.quitting.load(Ordering::Acquire)
+                        && runtime
+                            .tx
+                            .send(Request::ValidatedLaunch(action, checked))
+                            .is_ok()
+                    {
+                        return;
+                    }
+                    state.operation = None;
+                }
             })
             .map_err(|error| {
                 for name in names {
@@ -603,13 +895,22 @@ impl Runtime {
                 state.validation_busy = false;
                 t::validation_thread(error)
             })?;
+        threads[core as usize] = Some(thread);
         Ok(())
+    }
+
+    fn cancel_validations(&self) {
+        self.quitting.store(true, Ordering::Release);
+        let jobs = std::mem::take(&mut *self.validation_jobs.lock().unwrap());
+        for job in jobs.into_iter().flatten() {
+            let _ = job.join();
+        }
     }
 
     /// 核心均已停止时返回可选的 DNS 恢复提示, 失败的记录保留到下次启动。
     pub fn shutdown(&self) -> Result<Option<String>, String> {
         logging::info("runtime", "请求停止核心并退出");
-        self.quitting.store(true, Ordering::Release);
+        self.cancel_validations();
         let (tx, rx) = mpsc::channel();
         self.tx
             .send(Request::Shutdown(tx))
@@ -622,7 +923,7 @@ impl Runtime {
     }
 
     pub fn prepare_app_update(&self) -> Result<(), String> {
-        self.quitting.store(true, Ordering::Release);
+        self.cancel_validations();
         let (tx, rx) = mpsc::channel();
         let result = self
             .tx
@@ -860,7 +1161,10 @@ fn is_runtime_config(path: &Path) -> bool {
         && path
             .file_name()
             .and_then(OsStr::to_str)
-            .is_some_and(|name| name.starts_with(tun_config::RUNTIME_PREFIX))
+            .is_some_and(|name| {
+                name.starts_with(tun_config::RUNTIME_PREFIX)
+                    || name.starts_with(crate::latency::CONFIG_PREFIX)
+            })
 }
 
 fn cleanup_runtime_configs(dir: &Path) {
@@ -877,7 +1181,7 @@ fn cleanup_runtime_configs(dir: &Path) {
     }
 }
 
-fn executable_stamp(path: &Path) -> Option<(u64, Option<SystemTime>)> {
+pub(crate) fn executable_stamp(path: &Path) -> Option<(u64, Option<SystemTime>)> {
     fs::metadata(path)
         .ok()
         .filter(|file| file.is_file())
@@ -914,7 +1218,18 @@ fn validate_config(
     root: &Path,
     config: &Path,
     cancelled: &AtomicBool,
-) -> Result<(), String> {
+) -> Result<(), ConfigFailure> {
+    validate_config_with_timeout(core, exe, root, config, cancelled, Duration::from_secs(30))
+}
+
+fn validate_config_with_timeout(
+    core: Core,
+    exe: &Path,
+    root: &Path,
+    config: &Path,
+    cancelled: &AtomicBool,
+    timeout: Duration,
+) -> Result<(), ConfigFailure> {
     const OUTPUT_LIMIT: u64 = 64 * 1024;
     if cancelled.load(Ordering::Acquire) {
         return Err(t::validation_cancelled().into());
@@ -922,18 +1237,18 @@ fn validate_config(
     let mut output = tempfile::tempfile().map_err(t::create_validation_output)?;
     let child = JobProcess::spawn_validation(core, exe, root, config, &output)
         .map_err(t::run_validation)?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + timeout;
     let result = loop {
         if cancelled.load(Ordering::Acquire) {
             break Err(t::validation_cancelled().to_string());
         }
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status.success()),
+            Ok(Some(status)) => break Ok(Some(status)),
             Err(_) => break Err(t::validation_status_failed().into()),
             Ok(None) => {}
         }
         if Instant::now() >= deadline {
-            break Err(t::validation_timeout().into());
+            break Ok(None);
         }
         if output
             .metadata()
@@ -943,7 +1258,10 @@ fn validate_config(
         }
         thread::sleep(Duration::from_millis(20));
     };
-    child.terminate().map_err(|_| t::validation_not_exited())?;
+    let result = child
+        .terminate()
+        .map_err(|_| t::validation_not_exited().to_owned())
+        .and(result);
     drop(child);
     output
         .seek(SeekFrom::Start(0))
@@ -955,11 +1273,11 @@ fn validate_config(
         .map_err(|_| t::validation_output_failed())?;
     let message = crate::core_output::sanitized_output(&bytes);
     match result {
-        Ok(true) => Ok(()),
-        Ok(false) if message.trim().is_empty() => Err(t::validation_failed().into()),
-        Ok(false) => Err(message),
-        Err(error) if message.trim().is_empty() => Err(error),
-        Err(error) => Err(format!("{error}\n{message}")),
+        Ok(Some(status)) if status.success() => Ok(()),
+        Ok(None) => Err(ConfigFailure::ValidationTimeout(message)),
+        _ if !message.trim().is_empty() => Err(ConfigFailure::Core(message)),
+        Ok(Some(_)) => Err(t::validation_failed().into()),
+        Err(error) => Err(ConfigFailure::Ladder(error)),
     }
 }
 
@@ -968,12 +1286,161 @@ struct Worker {
     state: Arc<Mutex<Snapshot>>,
     saved: Saved,
     children: [Option<ManagedChild>; 3],
+    wireguard: crate::wireguard::Sessions,
+    latency_jobs: [Option<thread::JoinHandle<()>>; 3],
     dns: DesktopDns,
     quitting: Arc<AtomicBool>,
     version_files: [Option<(u64, Option<SystemTime>)>; 3],
 }
 
 impl Worker {
+    fn test_latencies(&mut self, core: Core, names: Vec<String>) {
+        let mut snapshot = self.state.lock().unwrap();
+        let state = snapshot.core_mut(core);
+        let version = self.saved.selected_version(core).clone();
+        if let Some(active) = &mut state.active_latency {
+            active.version.clone_from(&version);
+        }
+        let jobs: Vec<_> = names
+            .into_iter()
+            .map(|name| {
+                let path = core.config_dir(&self.root).join(&name);
+                let stamp = executable_stamp(&path);
+                state.latency.insert(
+                    name.clone(),
+                    ConfigRecord {
+                        result: ConfigLatency::Queued,
+                        stamp,
+                    },
+                );
+                (name, path, stamp)
+            })
+            .collect();
+        let job = (|| {
+            let url = checked_latency_url(self.saved.settings.latency_url())?.to_owned();
+            let timeout = Duration::from_secs(self.saved.settings.latency_timeout_secs.into());
+            let exe = self.saved.executable(core, &self.root)?;
+            let exe_stamp = executable_stamp(&exe).ok_or_else(|| t::select_core().to_owned())?;
+            let root = self.root.clone();
+            let quitting = self.quitting.clone();
+            let shared = self.state.clone();
+            let wireguard = self.wireguard.clone();
+            thread::Builder::new()
+                .name(format!("{}-latency", core.label()))
+                .spawn(move || {
+                    let batch_current = |state: &CoreState| {
+                        !quitting.load(Ordering::Acquire)
+                            && state.selected_version == version
+                            && executable_stamp(&exe) == Some(exe_stamp)
+                    };
+                    for (index, (name, path, stamp)) in jobs.into_iter().enumerate() {
+                        // Settings changes clear the queue. File edits invalidate only their own row.
+                        let row_current = |state: &CoreState| {
+                            state.latency.contains_key(&name) && executable_stamp(&path) == stamp
+                        };
+                        {
+                            let mut snapshot = shared.lock().unwrap();
+                            let state = snapshot.core_mut(core);
+                            if !batch_current(state) {
+                                break;
+                            }
+                            if !row_current(state) {
+                                state.latency.remove(&name);
+                                continue;
+                            }
+                            let manual_check =
+                                state.validation(&name) == Some(&ConfigValidation::Checking);
+                            let active = state.active_latency.as_mut().unwrap();
+                            active.config.clone_from(&name);
+                            active.checking = !manual_check;
+                            if let Some((position, _)) = &mut active.progress {
+                                *position = index + 1;
+                            }
+                        }
+                        let validation = readable_config(core, &root, &name)
+                            .map_err(ConfigFailure::Ladder)
+                            .and_then(|config| {
+                                validate_config(core, &exe, &root, &config, &quitting)
+                            });
+                        {
+                            let mut snapshot = shared.lock().unwrap();
+                            let state = snapshot.core_mut(core);
+                            if !batch_current(state) {
+                                break;
+                            }
+                            let publish = std::mem::take(
+                                &mut state.active_latency.as_mut().unwrap().checking,
+                            );
+                            if !row_current(state) {
+                                state.latency.remove(&name);
+                                continue;
+                            }
+                            if publish {
+                                state.validation.insert(
+                                    name.clone(),
+                                    ConfigRecord {
+                                        result: ConfigValidation::completed(
+                                            core,
+                                            validation.clone(),
+                                        ),
+                                        stamp,
+                                    },
+                                );
+                            }
+                            if let Err(error) = validation {
+                                state.latency.get_mut(&name).unwrap().result =
+                                    ConfigLatency::Failed(error);
+                                continue;
+                            }
+                        }
+                        let result = stamp
+                            .and_then(|stamp| {
+                                ValidatedConfig::hold(path.clone(), stamp, &exe, exe_stamp)
+                            })
+                            .ok_or_else(|| {
+                                ConfigFailure::Ladder(crate::i18n::system::latency_config().into())
+                            })
+                            .and_then(|checked| {
+                                crate::latency::measure(
+                                    core, &root, checked, &url, timeout, &quitting, &wireguard,
+                                )
+                            });
+                        let mut snapshot = shared.lock().unwrap();
+                        let state = snapshot.core_mut(core);
+                        if !batch_current(state) {
+                            break;
+                        }
+                        if !row_current(state) {
+                            state.latency.remove(&name);
+                        } else {
+                            state.latency.get_mut(&name).unwrap().result = match result {
+                                Ok(time) => ConfigLatency::Measured(time),
+                                Err(error) => ConfigLatency::Failed(error),
+                            };
+                        }
+                    }
+                    let mut snapshot = shared.lock().unwrap();
+                    let state = snapshot.core_mut(core);
+                    state
+                        .latency
+                        .retain(|_, record| record.result != ConfigLatency::Queued);
+                    state.active_latency = None;
+                })
+                .map_err(t::latency_thread)
+        })();
+        match job {
+            Ok(handle) => self.latency_jobs[core as usize] = Some(handle),
+            Err(error) => {
+                for record in state.latency.values_mut() {
+                    if record.result == ConfigLatency::Queued {
+                        record.result = ConfigLatency::Failed(ConfigFailure::Ladder(error.clone()));
+                    }
+                }
+                state.active_latency = None;
+            }
+        }
+    }
+
     fn apply_update(&mut self, core: Core, mut prepared: PreparedUpdate) {
         let result = if self.quitting.load(Ordering::Acquire) {
             Err(t::download_cancelled().into())
@@ -1003,7 +1470,7 @@ impl Worker {
         }
     }
 
-    fn run(mut self, rx: mpsc::Receiver<Request>) {
+    fn run(mut self, rx: mpsc::Receiver<Request>, startup: Runtime) {
         self.cleanup_tun();
         for core in Core::ALL {
             let auto = match core {
@@ -1013,10 +1480,10 @@ impl Worker {
             };
             if auto {
                 logging::info("core", format_args!("{} 自动启动已启用", core.label()));
-                self.action(Action::Start(core));
+                self.action(Action::Start(core), &startup);
             }
         }
-        self.refresh();
+        drop(startup);
         let mut last_scan = Instant::now();
         loop {
             match rx.recv_timeout(Duration::from_millis(200)) {
@@ -1025,7 +1492,11 @@ impl Worker {
                     let _guard = self.state.lock().unwrap();
                     logging::with_locked_log(|| panic!("PRIVATE_WORKER_PANIC"));
                 }
-                Ok(Request::Action(action)) => self.action(action),
+                Ok(Request::Action(action, runtime)) => self.action(action, &runtime),
+                Ok(Request::ValidatedLaunch(action, checked)) => {
+                    self.perform(action, Some(&checked))
+                }
+                Ok(Request::TestLatencies(core, names)) => self.test_latencies(core, names),
                 Ok(Request::Prepared(core, prepared)) => self.apply_update(core, prepared),
                 Ok(Request::SetTheme(theme, reply)) => {
                     logging::info("settings", format_args!("更改主题: {theme:?}"));
@@ -1046,6 +1517,10 @@ impl Worker {
                     self.update_settings(|settings| settings.github_proxy = prefix);
                     let _ = reply.try_send(());
                 }
+                Ok(Request::SetCustomLatencyUrl(url, reply)) => {
+                    self.update_settings(|settings| settings.custom_latency_url = url);
+                    let _ = reply.try_send(());
+                }
                 Ok(Request::Shutdown(reply)) => {
                     let result = self.stop_all();
                     let done = result.is_ok();
@@ -1062,6 +1537,7 @@ impl Worker {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     logging::warn("runtime", "核心管理请求通道已断开, 停止托管核心");
+                    self.quitting.store(true, Ordering::Release);
                     let _ = self.stop_all();
                     break;
                 }
@@ -1078,7 +1554,33 @@ impl Worker {
         logging::info("runtime", "核心管理线程已退出");
     }
 
-    fn action(&mut self, action: Action) {
+    fn action(&mut self, action: Action, runtime: &Runtime) {
+        let target = match &action {
+            Action::Start(core) if self.children[*core as usize].is_none() => {
+                self.saved.current(*core).clone().map(|name| (*core, name))
+            }
+            Action::SwitchConfig(core, name) => Some((*core, name.clone())),
+            _ => None,
+        };
+        if let Some((core, name)) = target
+            && self
+                .saved
+                .executable(core, &self.root)
+                .is_ok_and(|exe| exe.is_file())
+            && self.readable_config(core, &name).is_ok()
+        {
+            let mut snapshot = self.state.lock().unwrap();
+            let state = snapshot.core_mut(core);
+            if let Err(error) = runtime.begin_validation(core, state, Some(&name), Some(action)) {
+                state.run_error = Some(error);
+                state.operation = None;
+            }
+            return;
+        }
+        self.perform(action, None);
+    }
+
+    fn perform(&mut self, action: Action, checked: Option<&ValidatedConfig>) {
         let version_action = matches!(
             action,
             Action::SwitchVersion(..) | Action::DeleteVersion(..)
@@ -1100,6 +1602,12 @@ impl Worker {
                 self.retry_dns(desktop_dns);
                 return;
             }
+            Action::SetLatencyTarget(target) => {
+                return self.update_settings(|settings| settings.latency_target = target);
+            }
+            Action::SetLatencyTimeout(seconds) => {
+                return self.update_settings(|settings| settings.latency_timeout_secs = seconds);
+            }
             Action::Set(key, value) => {
                 logging::info("settings", format_args!("更改设置 {key:?}={value}"));
                 return self.update_settings(|settings| match key {
@@ -1116,20 +1624,26 @@ impl Worker {
                 let current = self.saved.current(core).clone();
                 let result = match current {
                     None => Err(t::select_config().into()),
-                    Some(name) if self.children[core as usize].is_none() => self
-                        .readable_config(core, &name)
-                        .and_then(|config| self.start(core, &config)),
+                    Some(name) if self.children[core as usize].is_none() => {
+                        self.readable_config(core, &name).and_then(|config| {
+                            let exe = self.launch_executable(core, &config, checked)?;
+                            let prepared = self.prepare_start(core, &config, &exe)?;
+                            self.start(core, prepared, &exe)
+                        })
+                    }
                     Some(_) => Ok(()),
                 };
                 (core, result)
             }
-            Action::SwitchConfig(core, name) => (core, self.switch_config(core, &name)),
+            Action::SwitchConfig(core, name) => (core, self.switch_config(core, &name, checked)),
             Action::DeleteConfig(core, name) => (core, self.delete_config(core, &name)),
             Action::SwitchVersion(core, version) => (core, self.switch_version(core, &version)),
             Action::DeleteVersion(core, version) => (core, self.delete_version(core, &version)),
             Action::RefreshVersions(_)
             | Action::ValidateConfig(..)
             | Action::ValidateAllConfigs(_)
+            | Action::TestLatency(..)
+            | Action::TestAllLatencies(_)
             | Action::LoadMoreVersions(_)
             | Action::DownloadVersion(_, _) => unreachable!(),
         };
@@ -1162,6 +1676,14 @@ impl Worker {
         match saved {
             Ok(()) => {
                 logging::info("settings", "软件设置已保存");
+                if next.settings.latency_url() != self.saved.settings.latency_url()
+                    || next.settings.latency_timeout_secs
+                        != self.saved.settings.latency_timeout_secs
+                {
+                    for core in Core::ALL {
+                        snapshot.core_mut(core).latency.clear();
+                    }
+                }
                 snapshot.settings = next.settings.clone();
                 self.saved = next;
                 snapshot.settings_error = None;
@@ -1200,12 +1722,36 @@ impl Worker {
         if self.saved.selected_version(core).as_deref() == Some(version) {
             return Err(t::cannot_delete_current_version().into());
         }
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .core(core)
+            .testing_version(version)
+        {
+            return Err(t::latency_busy().into());
+        }
         update::delete_version(core, &self.root, version)?;
         Ok(())
     }
 
-    fn switch_config(&mut self, core: Core, name: &str) -> Result<(), String> {
+    fn switch_config(
+        &mut self,
+        core: Core,
+        name: &str,
+        checked: Option<&ValidatedConfig>,
+    ) -> Result<(), String> {
         let config = self.readable_config(core, name)?;
+        let prepared = self
+            .launch_executable(core, &config, checked)
+            .and_then(|exe| {
+                self.prepare_start(core, &config, &exe)
+                    .map(|config| (config, exe))
+            });
+        // When no core is installed, users can still select a file for future starts.
+        if self.children[core as usize].is_some() || checked.is_some() {
+            prepared.as_ref().map_err(Clone::clone)?;
+        }
         let mut next = self.saved.clone();
         match core {
             Core::SingBox => next.sing_box = Some(name.into()),
@@ -1221,7 +1767,8 @@ impl Worker {
         }
         self.saved = next;
         self.state.lock().unwrap().core_mut(core).current = Some(name.into());
-        self.start(core, &config)
+        let (config, exe) = prepared?;
+        self.start(core, config, &exe)
     }
 
     fn delete_config(&mut self, core: Core, name: &str) -> Result<(), String> {
@@ -1244,10 +1791,17 @@ impl Worker {
             let local_versions = update::installed_versions(core, &self.root);
             let mut snapshot = self.state.lock().unwrap();
             let state = snapshot.core_mut(core);
-            state.validation.retain(|name, record| {
-                state.selected_version == *self.saved.selected_version(core)
-                    && record.stamp == executable_stamp(&core.config_dir(&self.root).join(name))
-            });
+            let same_version = state.selected_version == *self.saved.selected_version(core);
+            let config_dir = core.config_dir(&self.root);
+            let current = |name: &str, stamp| {
+                same_version && stamp == executable_stamp(&config_dir.join(name))
+            };
+            state
+                .validation
+                .retain(|name, record| current(name, record.stamp));
+            state
+                .latency
+                .retain(|name, record| current(name, record.stamp));
             state.installed = installed;
             state.selected_version = self.saved.selected_version(core).clone();
             match local_versions {
@@ -1292,6 +1846,7 @@ impl Worker {
             let stamp = exe.as_deref().and_then(executable_stamp);
             if self.version_files[core as usize] != stamp {
                 state.validation.clear();
+                state.latency.clear();
                 self.version_files[core as usize] = stamp;
                 state.version = None;
                 state.version_error = None;
@@ -1343,18 +1898,48 @@ impl Worker {
         readable_config(core, &self.root, name)
     }
 
-    fn start(&mut self, core: Core, config: &Path) -> Result<(), String> {
-        self.state.lock().unwrap().core_mut(core).output_error = None;
+    fn launch_executable(
+        &self,
+        core: Core,
+        config: &Path,
+        checked: Option<&ValidatedConfig>,
+    ) -> Result<PathBuf, String> {
+        if self.quitting.load(Ordering::Acquire) {
+            return Err(t::quitting().into());
+        }
         let exe = self.saved.executable(core, &self.root)?;
-        let assets = exe.parent().expect("version executable has a parent");
         if !exe.is_file() {
             return Err(t::core_file_missing(exe.display()));
         }
+        if !checked.is_some_and(|proof| proof.config == config && proof.exe == exe) {
+            return Err(t::validation_inputs_changed().into());
+        }
+        Ok(exe)
+    }
+
+    fn prepare_start(
+        &self,
+        core: Core,
+        path: &Path,
+        exe: &Path,
+    ) -> Result<tun_config::PreparedConfig, String> {
+        let mut config = tun_config::prepare(core, path)?;
+        config.reserve_wireguard(&self.wireguard, exe);
+        Ok(config)
+    }
+
+    fn start(
+        &mut self,
+        core: Core,
+        config: tun_config::PreparedConfig,
+        exe: &Path,
+    ) -> Result<(), String> {
+        self.state.lock().unwrap().core_mut(core).output_error = None;
+        let assets = exe.parent().expect("version executable has a parent");
         let hijack = self.saved.settings.hijack_dns;
         if hijack && self.state.lock().unwrap().dns_recovery_error.is_some() {
             self.restore_dns().map_err(|_| t::dns_not_restored())?;
         }
-        let config = tun_config::prepare(core, config)?;
         if !config.names().is_empty() {
             logging::info(
                 "tun",
@@ -1366,7 +1951,7 @@ impl Worker {
             );
             self.cleanup_tun();
         }
-        let child = ManagedChild::spawn(core, &self.root, &exe, assets, config)
+        let child = ManagedChild::spawn(core, &self.root, exe, assets, config)
             .map_err(|e| t::start_core(core.label(), e))?;
         self.children[core as usize] = Some(child);
         logging::info("core", format_args!("{} 托管进程已创建", core.label()));
@@ -1462,6 +2047,9 @@ impl Worker {
     }
 
     fn stop_all(&mut self) -> Result<Option<String>, String> {
+        for job in self.latency_jobs.iter_mut().filter_map(Option::take) {
+            let _ = job.join();
+        }
         let running = self.children.iter().flatten().count();
         let failures: Vec<_> = Core::ALL
             .into_iter()
@@ -1542,7 +2130,7 @@ impl Worker {
         if state.run_error.as_deref() != Some(message.as_str()) {
             logging::warn("core", format_args!("{} {message}", core.label()));
         }
-        state.run_error = Some(message);
+        state.run_error = output_error.is_none().then_some(message);
         state.output_error = output_error;
     }
 }
@@ -1615,6 +2203,14 @@ mod tests {
                 eprintln!("password=fixture-value");
                 std::process::exit(42);
             }
+            if content == "silent failure" {
+                std::process::exit(42);
+            }
+            if content == "timeout" {
+                eprintln!("INFO core started");
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+            println!("Configuration OK");
         }"#,
         )
         .unwrap();
@@ -1636,7 +2232,15 @@ mod tests {
             fs::write(&config, "invalid").unwrap();
             let error = validate_config(core, &exe, root.path(), &config, &AtomicBool::new(false))
                 .unwrap_err();
-            assert_eq!(error, "ERROR unknown field: broken\npassword=fixture-value");
+            assert_eq!(
+                error,
+                ConfigFailure::Core("ERROR unknown field: broken\npassword=fixture-value".into())
+            );
+            fs::write(&config, "silent failure").unwrap();
+            assert_eq!(
+                validate_config(core, &exe, root.path(), &config, &AtomicBool::new(false)),
+                Err(ConfigFailure::Ladder(t::validation_failed().into()))
+            );
         }
         assert_eq!(
             validate_config(
@@ -1647,7 +2251,19 @@ mod tests {
                 &AtomicBool::new(true)
             )
             .unwrap_err(),
-            "配置验证已取消"
+            ConfigFailure::Ladder("配置验证已取消".into())
+        );
+        fs::write(&config, "timeout").unwrap();
+        assert_eq!(
+            validate_config_with_timeout(
+                Core::Xray,
+                &exe,
+                root.path(),
+                &config,
+                &AtomicBool::new(false),
+                Duration::from_secs(2)
+            ),
+            Err(ConfigFailure::ValidationTimeout("INFO core started".into()))
         );
     }
 
@@ -1682,6 +2298,7 @@ mod tests {
             state: state.clone(),
             tx,
             quitting: quitting.clone(),
+            validation_jobs: Default::default(),
         };
         runtime.validate_configs(core, None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1700,6 +2317,8 @@ mod tests {
             children: Default::default(),
             dns: DesktopDns::Portable(DnsLease::for_tests(root.path())),
             quitting,
+            wireguard: Default::default(),
+            latency_jobs: Default::default(),
             version_files: [None, None, executable_stamp(&exe)],
         };
         worker.refresh();
@@ -1729,7 +2348,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let state = runtime.snapshot().core(core).clone();
-            if state.operation.is_none() && !state.running && state.run_error.is_some() {
+            if state.operation.is_none()
+                && !state.running
+                && (state.run_error.is_some() || state.output_error.is_some())
+            {
                 return state;
             }
             assert!(Instant::now() < deadline, "等待核心退出超时: {state:?}");
@@ -1882,9 +2504,9 @@ mod tests {
         );
         assert_eq!(
             state.validation("失败.json"),
-            Some(&ConfigValidation::Invalid(
+            Some(&ConfigValidation::Invalid(ConfigFailure::Core(
                 "fixture configuration rejected".into()
-            ))
+            )))
         );
         runtime
             .send(Action::ValidateConfig(core, "wait.json".into()))
@@ -1950,6 +2572,173 @@ mod tests {
                 "{change}: {state:?}"
             );
             assert!(runtime.shutdown().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn preflight_rejection_keeps_the_running_core_and_saved_selection() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let _guard = lock_and_install_fixture_cores(root);
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        for core in Core::ALL {
+            runtime
+                .send(Action::SwitchConfig(core, "日常.JSON".into()))
+                .unwrap();
+            let state = idle(&runtime, core);
+            assert!(state.running);
+            assert_eq!(
+                state.validation("日常.JSON"),
+                Some(&ConfigValidation::Valid)
+            );
+            let dir = core.config_dir(root);
+            let pid = next_pid(&dir.join("日常.pid"), 0);
+            let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            assert!(!raw.is_null());
+            let previous = unsafe { OwnedHandle::from_raw_handle(raw) };
+
+            // TUN would normally produce a temporary runtime file. Only the original file
+            // can write the expected validation marker next to the source.
+            let name = "rejected.json";
+            let config = dir.join(name);
+            let mut input = match core {
+                Core::Mihomo => serde_json::json!({"tun":{"enable":true}}),
+                Core::SingBox => serde_json::json!({"inbounds":[{"type":"tun"}]}),
+                Core::Xray => serde_json::json!({"inbounds":[{"protocol":"tun"}]}),
+            };
+            input["fixture_validation_wait"] = true.into();
+            input["fixture_failure"] = true.into();
+            fs::write(&config, input.to_string()).unwrap();
+            runtime
+                .send(Action::SwitchConfig(core, name.into()))
+                .unwrap();
+            validation_started(&config);
+            assert_eq!(
+                unsafe { WaitForSingleObject(previous.as_raw_handle(), 0) },
+                WAIT_TIMEOUT
+            );
+            fs::write(config.with_extension("continue"), []).unwrap();
+
+            let state = idle(&runtime, core);
+            assert_eq!(
+                unsafe { WaitForSingleObject(previous.as_raw_handle(), 0) },
+                WAIT_TIMEOUT
+            );
+            assert!(state.running && state.run_error.is_none() && state.output_error.is_none());
+            assert_eq!(state.current.as_deref(), Some("日常.JSON"));
+            assert_eq!(
+                Saved::load(root).unwrap().current(core).as_deref(),
+                Some("日常.JSON")
+            );
+            assert_eq!(
+                state.validation(name),
+                Some(&ConfigValidation::Invalid(ConfigFailure::Core(
+                    "fixture configuration rejected".into()
+                )))
+            );
+            assert!(!config.with_extension("pid").exists());
+        }
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn preflight_rechecks_on_autostart_and_each_manual_start() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let _guard = lock_and_install_fixture_cores(root);
+        let core = Core::Xray;
+        let name = "saved.json";
+        let config = core.config_dir(root).join(name);
+        let continue_file = config.with_extension("continue");
+        let started_file = config.with_extension("started");
+        fs::write(
+            &config,
+            r#"{"fixture_validation_wait":true,"fixture_failure":true}"#,
+        )
+        .unwrap();
+        fs::write(&continue_file, []).unwrap();
+        let mut saved = Saved::load(root).unwrap();
+        saved.xray = Some(name.into());
+        saved.settings.auto_xray = true;
+        saved.store(root).unwrap();
+
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        let state = idle(&runtime, core);
+        assert!(started_file.exists());
+        assert!(!state.running && state.run_error.is_none() && state.output_error.is_none());
+        assert_eq!(
+            state.validation(name),
+            Some(&ConfigValidation::Invalid(ConfigFailure::Core(
+                "fixture configuration rejected".into()
+            )))
+        );
+        assert!(!config.with_extension("pid").exists());
+
+        fs::write(&config, r#"{"fixture_validation_wait":true}"#).unwrap();
+        runtime
+            .send(Action::ValidateConfig(core, name.into()))
+            .unwrap();
+        assert_eq!(
+            validation_done(&runtime, core).validation(name),
+            Some(&ConfigValidation::Valid)
+        );
+        fs::remove_file(&started_file).unwrap();
+        fs::remove_file(&continue_file).unwrap();
+        runtime.send(Action::Start(core)).unwrap();
+        validation_started(&config);
+        assert!(!config.with_extension("pid").exists());
+        fs::write(&continue_file, []).unwrap();
+        let state = idle(&runtime, core);
+        assert!(state.running && state.run_error.is_none());
+        assert_eq!(state.validation(name), Some(&ConfigValidation::Valid));
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_and_cancelled_update_do_not_leave_an_old_preflight_running() {
+        for exiting in [true, false] {
+            let folder = tempfile::tempdir().unwrap();
+            let root = folder.path();
+            let _guard = lock_and_install_fixture_cores(root);
+            let core = Core::Xray;
+            let name = "waiting.json";
+            let config = core.config_dir(root).join(name);
+            fs::write(&config, r#"{"fixture_validation_wait":true}"#).unwrap();
+            let runtime = Runtime::open(root.to_owned()).unwrap();
+            runtime
+                .send(Action::SwitchConfig(core, name.into()))
+                .unwrap();
+            let pid = next_pid(&config.with_extension("started"), 0);
+            let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            assert!(!raw.is_null());
+            let checker = unsafe { OwnedHandle::from_raw_handle(raw) };
+            assert_eq!(
+                unsafe { WaitForSingleObject(checker.as_raw_handle(), 0) },
+                WAIT_TIMEOUT
+            );
+
+            if exiting {
+                runtime.shutdown().unwrap();
+            } else {
+                runtime.prepare_app_update().unwrap();
+                runtime.cancel_app_update();
+            }
+            assert_eq!(
+                unsafe { WaitForSingleObject(checker.as_raw_handle(), 0) },
+                WAIT_OBJECT_0
+            );
+            let state = runtime.snapshot().core(core).clone();
+            assert!(!state.running && !state.validation_busy && state.operation.is_none());
+            assert!(state.current.is_none());
+            assert!(!config.with_extension("pid").exists());
+            if !exiting {
+                fs::write(config.with_extension("continue"), []).unwrap();
+                runtime
+                    .send(Action::SwitchConfig(core, name.into()))
+                    .unwrap();
+                assert!(idle(&runtime, core).running);
+                runtime.shutdown().unwrap();
+            }
         }
     }
 
@@ -2063,7 +2852,7 @@ mod tests {
                 .send(Action::SwitchConfig(core, "native-exit.json".into()))
                 .unwrap();
             let state = failed(&runtime, core);
-            assert_eq!(state.run_error.as_deref(), Some("核心已退出"));
+            assert!(state.run_error.is_none(), "{state:?}");
             assert!(
                 state.output_error.as_deref().is_some_and(
                     |error| error.contains(&format!("fixture-native-exit-{}", core.label()))
@@ -2117,6 +2906,11 @@ mod tests {
             .unwrap();
         let root = folder.path();
         let _process_test = lock_and_install_fixture_cores(root);
+        fs::write(
+            Core::SingBox.config_dir(root).join("失败.json"),
+            r#"{"fixture_start_failure":true}"#,
+        )
+        .unwrap();
         let mut external = FixtureChild(
             Command::new(Core::SingBox.executable(root))
                 .arg(Core::SingBox.config_dir(root).join("日常.JSON"))
@@ -2192,7 +2986,6 @@ mod tests {
         assert_eq!(error, "核心已退出");
         let logs = logging::recent().join("\n");
         assert!(logs.contains("sing-box 核心已退出"));
-        assert!(!logs.contains("PRIVATE_FIXTURE_VALUE"));
         assert!(runtime.snapshot().xray.running);
         runtime.send(Action::Start(Core::SingBox)).unwrap();
         let retry = failed(&runtime, Core::SingBox);
@@ -2272,7 +3065,7 @@ mod tests {
         let config_dir = core.config_dir(root);
         let yaml = "fixture_tree: true\nrule-providers:\n  local:\n    type: file\n    path: rules/relative.yaml\n";
         fs::write(config_dir.join("本地.yaml"), yaml).unwrap();
-        fs::write(config_dir.join("失败.yml"), "fixture_failure: true\n").unwrap();
+        fs::write(config_dir.join("失败.yml"), "fixture_start_failure: true\n").unwrap();
         let runtime = Runtime::open(root.to_owned()).unwrap();
         runtime
             .send(Action::SwitchConfig(core, "日常.JSON".into()))
@@ -2477,27 +3270,13 @@ mod tests {
                     );
                     true
                 } else {
-                    result.as_ref().err().is_some_and(|error| {
-                        let infrastructure_failure = [
-                            "配置验证已取消",
-                            "创建验证输出文件失败",
-                            "无法运行核心验证命令",
-                            "无法读取核心验证状态",
-                            "配置验证超时",
-                            "核心验证输出过多",
-                            "验证进程尚未完全退出",
-                            "无法读取验证输出",
-                        ]
-                        .iter()
-                        .any(|prefix| error.starts_with(prefix));
-                        let missing_file = match core {
-                            Core::SingBox => "ladder-missing.json",
-                            Core::Xray => "ladder-missing.dat",
-                            Core::Mihomo => "ladder-missing.yaml",
-                        };
-                        !infrastructure_failure
-                            && (*name != "missing-resource.json" || error.contains(missing_file))
-                    })
+                    let missing_file = match core {
+                        Core::SingBox => "ladder-missing.json",
+                        Core::Xray => "ladder-missing.dat",
+                        Core::Mihomo => "ladder-missing.yaml",
+                    };
+                    matches!(&result, Err(ConfigFailure::Core(message))
+                        if *name != "missing-resource.json" || message.contains(missing_file))
                 };
                 if !matches_expectation {
                     validation_failures.push(format!("{} {name}: {result:?}", core.label()));
@@ -2680,7 +3459,7 @@ mod tests {
         assert!(!mihomo_restarted.exists());
         fs::write(
             Core::Mihomo.config_dir(root).join("失败TUN.yaml"),
-            "fixture_failure: true\ntun: { enable: true, device: original }\n",
+            "fixture_start_failure: true\ntun: { enable: true, device: original }\n",
         )
         .unwrap();
         runtime
@@ -2719,7 +3498,7 @@ mod tests {
 
         fs::write(
             Core::SingBox.config_dir(root).join("失败TUN.json"),
-            r#"{"fixture_failure":true,"inbounds":[{"type":"tun"}]}"#,
+            r#"{"fixture_start_failure":true,"inbounds":[{"type":"tun"}]}"#,
         )
         .unwrap();
         runtime
@@ -3121,13 +3900,15 @@ mod tests {
             children: Default::default(),
             dns: DesktopDns::Portable(DnsLease::for_tests(root)),
             quitting: Arc::new(AtomicBool::new(false)),
+            wireguard: Default::default(),
+            latency_jobs: Default::default(),
             version_files: Default::default(),
         };
         // 前一个请求已成功重试并启动核心, 排队的重试不应恢复新建的快照。
         worker.dns.lease().unwrap().apply().unwrap();
         let journal = root.join("dns-recovery.json");
         let active = fs::read(&journal).unwrap();
-        worker.action(Action::RetryDns);
+        worker.perform(Action::RetryDns, None);
         assert_eq!(fs::read(journal).unwrap(), active);
         assert!(!worker.state.lock().unwrap().dns_recovery_busy);
     }
@@ -3146,6 +3927,8 @@ mod tests {
             children: Default::default(),
             dns: DesktopDns::Unavailable("目录不可用".into()),
             quitting: Arc::new(AtomicBool::new(false)),
+            wireguard: Default::default(),
+            latency_jobs: Default::default(),
             version_files: Default::default(),
         };
         let journal = root.join("dns-recovery.json");
@@ -3316,6 +4099,7 @@ mod tests {
             state: Arc::new(Mutex::new(Snapshot::default())),
             tx,
             quitting: Arc::new(AtomicBool::new(false)),
+            validation_jobs: Default::default(),
         };
         let mut worker = Worker {
             root: runtime.root.clone(),
@@ -3324,6 +4108,8 @@ mod tests {
             children: Default::default(),
             dns: DesktopDns::Portable(DnsLease::for_tests(folder.path())),
             quitting: Arc::new(AtomicBool::new(false)),
+            wireguard: Default::default(),
+            latency_jobs: Default::default(),
             version_files: Default::default(),
         };
         let core = Core::SingBox;
@@ -3342,10 +4128,10 @@ mod tests {
             runtime.send(action).unwrap();
             assert!(runtime.send(Action::Stop(core)).is_err());
             assert_eq!(runtime.snapshot().core(core).operation, Some(operation));
-            let Request::Action(queued) = rx.try_recv().unwrap() else {
+            let Request::Action(queued, owner) = rx.try_recv().unwrap() else {
                 panic!("预期收到核心操作");
             };
-            worker.action(queued);
+            worker.action(queued, &owner);
             assert!(runtime.snapshot().core(core).operation.is_none());
             assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
         }
@@ -3367,6 +4153,222 @@ mod tests {
             assert!(error.contains("ladder-state.json 格式无效"));
             assert_eq!(fs::read_to_string(&path).unwrap(), data);
         }
+    }
+
+    #[test]
+    fn latency_settings_load_from_legacy_state_and_preserve_custom_addresses() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let mut old = serde_json::to_value(Saved::default()).unwrap();
+        for key in [
+            "latency_target",
+            "latency_timeout_secs",
+            "custom_latency_url",
+        ] {
+            old["settings"].as_object_mut().unwrap().remove(key);
+        }
+        fs::write(
+            root.join("ladder-state.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+        let defaults = runtime.snapshot().settings;
+        assert_eq!(
+            defaults.latency_url(),
+            "https://www.google.com/generate_204"
+        );
+        assert_eq!(defaults.latency_timeout_secs, 5);
+        for value in [
+            "",
+            "/relative",
+            "ftp://example.test/",
+            "https://x:bad/path",
+            "https://u:private@x/",
+            "https://",
+        ] {
+            assert!(runtime.set_custom_latency_url(value.into()).is_err());
+        }
+        for seconds in [2, 9] {
+            assert!(runtime.send(Action::SetLatencyTimeout(seconds)).is_err());
+        }
+        let url = "http://[::1]:8080/204?test=1";
+        runtime.send(Action::SetLatencyTimeout(8)).unwrap();
+        runtime
+            .send(Action::SetLatencyTarget(LatencyTarget::Custom))
+            .unwrap();
+        runtime
+            .set_custom_latency_url(format!("  {url}  "))
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        assert_eq!(runtime.snapshot().settings.latency_url(), url);
+        runtime
+            .send(Action::SetLatencyTarget(LatencyTarget::Cloudflare))
+            .unwrap();
+        runtime.shutdown().unwrap();
+        let saved = Saved::load(root).unwrap().settings;
+        assert_eq!(saved.latency_url(), "https://cp.cloudflare.com/");
+        assert_eq!(saved.custom_latency_url, url);
+        assert_eq!(saved.latency_timeout_secs, 8);
+    }
+
+    #[test]
+    fn latency_errors_are_scoped_to_the_tested_config_and_expire_after_settings_change() {
+        let folder = tempfile::tempdir().unwrap();
+        let runtime = Runtime::open(folder.path().to_owned()).unwrap();
+        let core = Core::Xray;
+        let name = "profile.json";
+        fs::write(runtime.config_dir(core).join(name), "{}").unwrap();
+        runtime
+            .send(Action::SetLatencyTarget(LatencyTarget::Custom))
+            .unwrap();
+        runtime
+            .send(Action::TestLatency(core, name.into()))
+            .unwrap();
+        // 两个操作都在管理线程中执行, 等待先前的请求完成。
+        runtime
+            .set_theme(ThemePreference::Light)
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        let snapshot = runtime.snapshot();
+        assert!(
+            matches!(snapshot.core(core).latency(name), Some(ConfigLatency::Failed(ConfigFailure::Ladder(message))) if message == t::invalid_latency_url())
+        );
+        assert!(!snapshot.core(core).latency_busy());
+        assert!(snapshot.core(core).run_error.is_none());
+        runtime
+            .set_custom_latency_url("http://localhost/204".into())
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        assert!(runtime.snapshot().core(core).latency(name).is_none());
+        assert!(
+            runtime
+                .send(Action::TestLatency(core, "../other.json".into()))
+                .is_err()
+        );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn latency_preflight_respects_manual_validation_settings_changes_and_shutdown() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let _guard = lock_and_install_fixture_cores(root);
+        let core = Core::Xray;
+        let dir = core.config_dir(root);
+        let name = "00-first.json";
+        let first = dir.join(name);
+        let later = dir.join("01-next.json");
+        for path in [&first, &later] {
+            fs::write(path, r#"{"fixture_validation_wait":true}"#).unwrap();
+        }
+        let started = first.with_extension("started");
+        let resume = first.with_extension("continue");
+        let runtime = Runtime::open(root.to_owned()).unwrap();
+
+        fs::write(&resume, []).unwrap();
+        runtime
+            .send(Action::ValidateConfig(core, name.into()))
+            .unwrap();
+        assert_eq!(
+            validation_done(&runtime, core).validation(name),
+            Some(&ConfigValidation::Valid)
+        );
+        fs::remove_file(&resume).unwrap();
+        fs::remove_file(&started).unwrap();
+        runtime.send(Action::TestAllLatencies(core)).unwrap();
+        let first_check = next_pid(&started, 0);
+        runtime
+            .send(Action::ValidateConfig(core, name.into()))
+            .unwrap();
+        next_pid(&started, first_check);
+        let state = runtime.snapshot().xray;
+        assert!(state.validation_busy && state.latency_busy());
+        assert_eq!(state.validation(name), Some(&ConfigValidation::Checking));
+
+        runtime.send(Action::SetLatencyTimeout(4)).unwrap();
+        runtime
+            .set_theme(ThemePreference::Light)
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        fs::write(&resume, []).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let state = loop {
+            let state = runtime.snapshot().xray;
+            if !state.validation_busy && !state.latency_busy() {
+                break state;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "obsolete latency batch did not stop"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(state.validation(name), Some(&ConfigValidation::Valid));
+        assert!(state.latency(name).is_none() && !later.with_extension("started").exists());
+        // The fixture writes a PID file on every normal launch, including temporary probes.
+        assert!(
+            !fs::read_dir(&dir)
+                .unwrap()
+                .any(|entry| { entry.unwrap().path().extension() == Some(OsStr::new("pid")) })
+        );
+
+        fs::remove_file(&resume).unwrap();
+        fs::remove_file(&started).unwrap();
+        runtime
+            .send(Action::TestLatency(core, name.into()))
+            .unwrap();
+        let pid = next_pid(&started, 0);
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        assert!(!raw.is_null());
+        let checker = unsafe { OwnedHandle::from_raw_handle(raw) };
+        runtime.shutdown().unwrap();
+        assert_eq!(
+            unsafe { WaitForSingleObject(checker.as_raw_handle(), 0) },
+            WAIT_OBJECT_0
+        );
+        assert!(!runtime.snapshot().xray.latency_busy());
+    }
+
+    #[test]
+    fn latency_batch_handles_empty_lists_and_reports_setup_failure_for_each_config() {
+        let folder = tempfile::tempdir().unwrap();
+        let runtime = Runtime::open(folder.path().to_owned()).unwrap();
+        let core = Core::Mihomo;
+        runtime.send(Action::TestAllLatencies(core)).unwrap();
+        assert!(!runtime.snapshot().core(core).latency_busy());
+
+        for name in [
+            "first.yaml",
+            "second.yml",
+            "third.json",
+            ".ladder-latency-temp.yaml",
+        ] {
+            fs::write(runtime.config_dir(core).join(name), "{}").unwrap();
+        }
+        runtime
+            .send(Action::SetLatencyTarget(LatencyTarget::Custom))
+            .unwrap();
+        runtime.send(Action::TestAllLatencies(core)).unwrap();
+        runtime
+            .set_theme(ThemePreference::Light)
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        let snapshot = runtime.snapshot();
+        let state = snapshot.core(core);
+        assert!(state.latency_progress().is_none() && !state.latency_busy());
+        assert_eq!(state.latency.len(), 3);
+        for name in ["first.yaml", "second.yml", "third.json"] {
+            assert!(
+                matches!(state.latency(name),Some(ConfigLatency::Failed(ConfigFailure::Ladder(message))) if message == t::invalid_latency_url())
+            );
+        }
+        runtime.shutdown().unwrap();
     }
 
     #[test]
@@ -3666,10 +4668,12 @@ mod tests {
             children: Default::default(),
             dns: DesktopDns::Unavailable("测试不访问 DNS".into()),
             quitting: Arc::new(AtomicBool::new(false)),
+            wireguard: Default::default(),
+            latency_jobs: Default::default(),
             version_files: Default::default(),
         };
         for enabled in [true, false, true] {
-            worker.action(Action::Set(Setting::GithubProxyEnabled, enabled));
+            worker.perform(Action::Set(Setting::GithubProxyEnabled, enabled), None);
             let stored = Saved::load(folder.path()).unwrap().settings;
             assert_eq!(stored.github_proxy_enabled, enabled);
             assert_eq!(stored.github_proxy, "https://example.com/proxy/");
@@ -3694,6 +4698,7 @@ mod tests {
             state: Arc::new(Mutex::new(Snapshot::default())),
             tx,
             quitting: Arc::new(AtomicBool::new(false)),
+            validation_jobs: Default::default(),
         };
         for prefix in ["", " \t "] {
             assert!(runtime.set_github_proxy(prefix.into()).is_err());
@@ -4045,6 +5050,8 @@ mod tests {
             children: Default::default(),
             dns: DesktopDns::Portable(DnsLease::for_tests(root)),
             quitting: Arc::new(AtomicBool::new(false)),
+            wireguard: Default::default(),
+            latency_jobs: Default::default(),
             version_files: Default::default(),
         };
         worker.refresh();

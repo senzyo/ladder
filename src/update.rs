@@ -858,13 +858,16 @@ impl PreparedUpdate {
 }
 
 fn parse_version(core: Core, output: &str) -> Option<String> {
-    let first = output.lines().next()?;
     let prefix = match core {
         Core::SingBox => "sing-box version ",
         Core::Xray => "Xray ",
         Core::Mihomo => "Mihomo Meta ",
     };
-    let version = first.strip_prefix(prefix)?.split_whitespace().next()?;
+    let version = output
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix))?
+        .split_whitespace()
+        .next()?;
     let version = version.strip_prefix('v').unwrap_or(version);
     if version.len() > 64
         || !version
@@ -890,8 +893,7 @@ fn read_version(core: Core, executable: &Path, timeout: Duration) -> Result<Stri
     let deadline = Instant::now() + timeout;
     let result = loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => break Ok(()),
-            Ok(Some(_)) => break Err(t::version_command_failed().to_string()),
+            Ok(Some(status)) => break Ok(status.success()),
             Err(_) => break Err(t::cannot_read_version_status().to_string()),
             Ok(None) => {}
         }
@@ -909,18 +911,27 @@ fn read_version(core: Core, executable: &Path, timeout: Duration) -> Result<Stri
     let cleanup = child
         .terminate()
         .map_err(|_| t::version_process_still_running().to_string());
-    result?;
+    let success = result?;
     cleanup?;
     drop(child);
     output
         .seek(SeekFrom::Start(0))
         .map_err(|_| t::cannot_read_core_version())?;
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     output
         .take(16 * 1024)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .map_err(|_| t::cannot_read_core_version())?;
-    parse_version(core, &text).ok_or_else(|| t::unrecognized_core_version().into())
+    if !success {
+        let text = crate::core_output::sanitized_output(&bytes);
+        return Err(if text.trim().is_empty() {
+            t::version_command_failed().to_owned()
+        } else {
+            text
+        });
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| t::cannot_read_core_version())?;
+    parse_version(core, text).ok_or_else(|| t::unrecognized_core_version().into())
 }
 
 fn validate_executable(executable: &Path) -> Result<(), String> {
@@ -1804,6 +1815,7 @@ fn main() {
         eprintln!("PRIVATE_CORE_OUTPUT");
         std::process::exit(23);
     }
+    eprintln!("fixture startup notice");
     println!("sing-box version 1.2.3-beta.1");
 }
 "#,
@@ -1824,7 +1836,7 @@ fn main() {
     }
 
     #[test]
-    fn version_commands_have_a_deadline_and_never_expose_raw_output() {
+    fn version_commands_have_a_deadline_and_preserve_failure_output() {
         let root = tempfile::tempdir().unwrap();
         let target = version_directory(Core::SingBox, root.path(), "1.0.0").unwrap();
         fs::create_dir_all(&target).unwrap();
@@ -1836,7 +1848,7 @@ fn main() {
         );
         fs::write(target.join("failure"), b"").unwrap();
         let error = read_version_for(Core::SingBox, &exe).unwrap_err();
-        assert!(!error.contains("PRIVATE_CORE_OUTPUT"));
+        assert_eq!(error, "PRIVATE_CORE_OUTPUT");
         fs::remove_file(target.join("failure")).unwrap();
         fs::write(target.join("sleep"), b"").unwrap();
         let start = Instant::now();

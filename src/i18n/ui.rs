@@ -7,7 +7,15 @@ messages! {
     start_core => ("启动核心", "Start core", "Запустить ядро");
     config_valid => ("配置合法", "Valid", "Корректна");
     validating => ("验证中", "Validating", "Проверка");
+    validation_timed_out => ("验证超时", "Validation timed out", "Время проверки истекло");
     validate => ("验证", "Validate", "Проверить");
+    test_latency => ("测速", "Test latency", "Задержка");
+    test_all_latencies => ("测速全部", "Test all", "Измерить все");
+    latency_progress(current: usize, total: usize) => ("测速中 {current}/{total}", "Testing {current}/{total}", "Измерение {current}/{total}");
+    latency_queued => ("待测速", "Queued", "В очереди");
+    latency_failed => ("测速失败", "Test failed", "Сбой замера");
+    testing_latency => ("测速中", "Testing…", "Измерение…");
+    latency_ms(ms: u128) => ("{ms} ms", "{ms} ms", "{ms} мс");
     edit => ("编辑", "Edit", "Изменить");
     current => ("当前使用", "In use", "Используется");
     switch => ("切换", "Switch", "Выбрать");
@@ -38,15 +46,19 @@ messages! {
     theme => ("主题", "Theme", "Тема");
     startup_page => ("启动界面", "Startup page", "Стартовая страница");
     hide_on_startup => ("启动时隐藏主窗口", "Hide window on startup", "Скрывать окно при запуске");
-    open_from_tray => ("从系统托盘打开 Ladder", "Open Ladder from the system tray", "Открывайте Ladder из системного трея");
+    open_from_tray => ("你可以从系统托盘打开 Ladder", "You can open Ladder from the system tray", "Вы можете открыть Ladder из системного трея");
     auto_mihomo => ("随 Ladder 启动 mihomo", "Start mihomo with Ladder", "Запускать mihomo вместе с Ladder");
     last_mihomo_config => ("使用上次选择的 mihomo 配置", "Use the last selected mihomo configuration", "Использовать последнюю выбранную конфигурацию mihomo");
     auto_sing_box => ("随 Ladder 启动 sing-box", "Start sing-box with Ladder", "Запускать sing-box вместе с Ladder");
     last_sing_box_config => ("使用上次选择的 sing-box 配置", "Use the last selected sing-box configuration", "Использовать последнюю выбранную конфигурацию sing-box");
     auto_xray => ("随 Ladder 启动 Xray", "Start Xray with Ladder", "Запускать Xray вместе с Ladder");
     last_xray_config => ("使用上次选择的 Xray 配置", "Use the last selected Xray configuration", "Использовать последнюю выбранную конфигурацию Xray");
-    hijack_dns => ("劫持DNS到本地回环", "Redirect DNS to loopback", "Перенаправлять DNS на локальный адрес");
-    hijack_dns_description => ("下次启动任一核心时, 将物理网卡 DNS 设为 127.0.0.1 和 ::1。不要和 mihomo 的 strict-route、sing-box 的 strict_route、Xray 的 autoSystemWfpBlockLeak 同时开启。", "On the next core start, set physical adapter DNS to 127.0.0.1 and ::1. Do not enable together with mihomo strict-route, sing-box strict_route, or Xray autoSystemWfpBlockLeak.", "При следующем запуске любого ядра DNS физических адаптеров будет изменён на 127.0.0.1 и ::1. Не включайте одновременно с strict-route в mihomo, strict_route в sing-box или autoSystemWfpBlockLeak в Xray.");
+    hijack_dns => ("劫持 DNS 到本地回环", "Redirect DNS to loopback", "Перенаправлять DNS на петлевой интерфейс");
+    hijack_dns_description => ("下次启动任一核心时, 将物理网卡 DNS 设为 127.0.0.1 和 ::1。不要和 mihomo 的 strict-route、sing-box 的 strict_route、Xray 的 autoSystemWfpBlockLeak 同时使用。", "On the next core start, set physical adapter DNS to 127.0.0.1 and ::1. Do not use this setting together with mihomo strict-route, sing-box strict_route, or Xray autoSystemWfpBlockLeak.", "При следующем запуске любого ядра DNS физических адаптеров будет изменён на 127.0.0.1 и ::1. Не используйте эту настройку одновременно с strict-route в mihomo, strict_route в sing-box или autoSystemWfpBlockLeak в Xray.");
+    latency_url => ("测速URL", "Test URL", "URL проверки");
+    latency_timeout => ("测速超时", "Test timeout", "Тайм-аут проверки");
+    custom_url => ("自定义", "Custom", "Свой URL");
+    seconds(value: u8) => ("{value}秒", "{value} s", "{value} с");
     github_proxy => ("GitHub 加速", "GitHub proxy", "Прокси для GitHub");
     github_proxy_description => ("用于核心和软件的版本检查与下载", "For core and app update checks and downloads", "Для проверки версий и загрузки ядер и обновлений приложения");
     enabled => ("开启", "On", "Вкл.");
@@ -64,7 +76,6 @@ messages! {
     check_update => ("检查更新", "Check for updates", "Проверить обновления");
     restoring_dns => ("正在恢复 DNS", "Restoring DNS", "Восстановление DNS");
     retry_dns => ("重试恢复 DNS", "Retry DNS restore", "Повторить восстановление DNS");
-    about => ("关于", "About", "О приложении");
     mit_license => ("MIT 许可证", "MIT License", "Лицензия MIT");
     update_restart_hint => ("更新时将停止所有核心, 完成后重新打开 Ladder。", "Updating stops all cores and reopens Ladder when complete.", "При обновлении все ядра будут остановлены, затем Ladder откроется снова.");
     fetching_release => ("正在获取官方版本信息…", "Fetching official release information…", "Получение сведений об официальной версии…");
@@ -83,4 +94,5 @@ messages! {
     theme_save_thread_closed => ("主题设置未保存, 管理线程已关闭。", "The theme was not saved: the management thread has stopped.", "Тема не сохранена: управляющий поток завершён.");
     language_save_thread_closed => ("语言设置未保存, 管理线程已关闭。", "The language was not saved: the management thread has stopped.", "Язык не сохранён: управляющий поток завершён.");
     proxy_save_thread_closed => ("GitHub 加速链接前缀未保存, 管理线程已关闭。", "The GitHub proxy URL prefix was not saved: the management thread has stopped.", "Префикс URL прокси для GitHub не сохранён: управляющий поток завершён.");
+    latency_url_save_thread_closed => ("自定义测速地址未保存，管理线程已关闭。", "The custom test URL was not saved because the management thread stopped.", "Не удалось сохранить URL проверки, так как управляющий поток завершён.");
 }

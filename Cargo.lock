@@ -3202,6 +3202,7 @@ version = "3.1.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
+ "base64 0.22.1",
  "gpui",
  "raw-window-handle",
  "same-file",

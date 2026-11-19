@@ -6,6 +6,73 @@ use std::thread::{self, JoinHandle};
 
 use crate::{core::Core, logging};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigFailure {
+    Core(String),
+    Ladder(String),
+    ValidationTimeout(String),
+}
+
+impl ConfigFailure {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Core(message) | Self::Ladder(message) => message,
+            Self::ValidationTimeout(_) => crate::i18n::runtime::validation_timeout(),
+        }
+    }
+
+    pub(crate) fn core_output(&self) -> Option<&str> {
+        match self {
+            Self::Core(output) => Some(output),
+            Self::ValidationTimeout(output) if !output.trim().is_empty() => Some(output),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())?;
+        if let Self::ValidationTimeout(output) = self
+            && !output.trim().is_empty()
+        {
+            write!(f, "\n{output}")?;
+        }
+        Ok(())
+    }
+}
+
+impl From<String> for ConfigFailure {
+    fn from(message: String) -> Self {
+        Self::Ladder(message)
+    }
+}
+
+impl From<&str> for ConfigFailure {
+    fn from(message: &str) -> Self {
+        Self::Ladder(message.to_owned())
+    }
+}
+
+// Keep an unlabelled final line as well, for cores that exit before opening the test port.
+// Routine output from a working listener must not replace an HTTP error or timeout.
+pub(crate) fn probe_diagnostic(pipe: impl Read) -> (Option<String>, Option<String>) {
+    let mut error = None;
+    let mut warning = None;
+    let mut unlabelled = None;
+    let _ = read_output(pipe, |line| match logging::log_level(&line) {
+        Some(logging::LogLevel::Error) => error = Some(line),
+        Some(logging::LogLevel::Warning)
+            if line.contains(" error:") || line.contains(" failed") =>
+        {
+            warning = Some(line);
+        }
+        None if !line.trim().is_empty() => unlabelled = Some(line),
+        _ => {}
+    });
+    (error.or(warning), unlabelled)
+}
+
 pub(crate) struct CoreOutput {
     stdout: JoinHandle<Option<&'static str>>,
     stderr: JoinHandle<Option<&'static str>>,
@@ -79,15 +146,9 @@ fn capture_reason(
     }) {
         Ok(()) => None,
         Err(error) => {
-            // IO 错误的自定义文本也可能来自核心, 日志只记录系统代码和种类。
             logging::warn(
                 "core",
-                format_args!(
-                    "{} {stream} 读取失败 ({:?}, 系统错误码 {:?})",
-                    core.label(),
-                    error.kind(),
-                    error.raw_os_error()
-                ),
+                format_args!("{} {stream} 读取失败: {error}", core.label()),
             );
             Some(t::core_output_read_failed())
         }
@@ -221,6 +282,28 @@ mod tests {
     use std::io::{self, Cursor};
     use std::sync::{Arc, Barrier, mpsc};
     use std::time::Duration;
+
+    #[test]
+    fn probe_preserves_diagnostics_separately_from_routine_output() {
+        let banner = "INFO[0000] listening\n[Warning] core started";
+        assert_eq!(probe_diagnostic(banner.as_bytes()).0, None);
+        let plain = "fixture configuration rejected";
+        assert_eq!(
+            probe_diagnostic(plain.as_bytes()),
+            (None, Some(plain.into()))
+        );
+        let warning = r#"time="fixture" level=warning msg="[TCP] dial error: connection refused""#;
+        let fatal = "FATAL[0000] unknown outbound";
+        assert_eq!(
+            probe_diagnostic(warning.as_bytes()).0.as_deref(),
+            Some(warning)
+        );
+        let output = format!("{banner}\n{fatal}\n{warning}\n");
+        assert_eq!(
+            probe_diagnostic(output.as_bytes()).0.as_deref(),
+            Some(fatal)
+        );
+    }
 
     #[test]
     fn streams_utf8_crlf_and_ansi_split_at_every_byte() {
@@ -465,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_reads_retry_and_failures_return_a_safe_summary() {
+    fn interrupted_reads_retry_and_failures_log_the_io_error() {
         struct FailingReader(bool);
         impl Read for FailingReader {
             fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
@@ -485,7 +568,7 @@ mod tests {
             Some("读取核心输出失败, 诊断可能不完整")
         );
         assert!(
-            !logging::recent()
+            logging::recent()
                 .iter()
                 .any(|line| line.contains("PRIVATE_PIPE_ERROR"))
         );

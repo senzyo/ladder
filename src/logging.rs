@@ -1,4 +1,4 @@
-//! 应用诊断只落盘安全摘要；核心日志清理终端控制序列后仅保存在各自的内存队列。
+//! 应用日志写入文件，核心日志保存在各自的内存队列。
 
 use std::collections::VecDeque;
 use std::fmt::{self, Display, Write as _};
@@ -150,13 +150,8 @@ impl LogState {
 
     fn file_failed(&mut self, error: &io::Error) {
         self.file = None;
-        // 不格式化自定义 IO 错误中的外部文本。
-        let reason = match error.raw_os_error() {
-            Some(code) => format!("Windows 错误 {code}"),
-            None => format!("I/O 类型 {:?}", error.kind()),
-        };
         let message = format!(
-            "应用日志无法写入文件 ({reason}) 。本次仅在界面保留最近 500 条日志, 请检查日志目录权限或磁盘空间后重启 Ladder。"
+            "应用日志无法写入文件 ({error}) 。本次仅在界面保留最近 500 条日志, 请检查日志目录权限或磁盘空间后重启 Ladder。"
         );
         self.remember(format_record("WARN", "logging", message));
     }
@@ -219,29 +214,15 @@ fn record(level: &str, target: &str, message: impl Display) {
 
 pub(crate) fn install_panic_hook() {
     std::panic::set_hook(Box::new(|panic| {
-        let line = match panic.location() {
-            Some(location) => format_record(
-                "ERROR",
-                "panic",
-                format_args!(
-                    "线程发生异常: {}:{}:{} (异常内容不记录)",
-                    location.file(),
-                    location.line(),
-                    location.column()
-                ),
-            ),
-            None => format_record("ERROR", "panic", "线程发生异常 (异常内容不记录)"),
-        };
         // 日志写入本身发生 panic 时不能再次等待相同的锁。
         if let Some(state) = LOG.get()
             && let Ok(mut state) = state.try_lock()
         {
-            state.record(line);
+            state.record(format_record("ERROR", "panic", panic));
             if let Some(file) = state.file.as_ref() {
                 let _ = file.file.sync_data();
             }
         }
-        // 默认 hook 会输出可能包含配置和密钥的 panic payload, 因此不转发。
     }));
 }
 
@@ -568,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn panic_hook_records_location_without_payload() {
+    fn panic_hook_records_location_and_message() {
         const CHILD_LOG: &str = "LADDER_TEST_PANIC_LOG";
         if let Some(path) = std::env::var_os(CHILD_LOG) {
             init(Path::new(&path)).unwrap();
@@ -585,7 +566,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "logging::tests::panic_hook_records_location_without_payload",
+                "logging::tests::panic_hook_records_location_and_message",
                 "--nocapture",
             ])
             .env(CHILD_LOG, &path)
@@ -596,12 +577,6 @@ mod tests {
         assert!(text.contains("[ERROR] [panic]"));
         assert!(text.contains("logging.rs:"));
         assert!(text.contains("异常捕获后继续记录"));
-        for content in [
-            text,
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ] {
-            assert!(!content.contains("PRIVATE_PANIC_PAYLOAD"));
-        }
+        assert!(text.contains("PRIVATE_PANIC_PAYLOAD"));
     }
 }

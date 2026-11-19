@@ -1,4 +1,53 @@
 messages! {
+    latency_config => (
+        "无法准备此配置的测速副本", "Cannot prepare this configuration for the latency test",
+        "Не удалось подготовить конфигурацию для проверки задержки"
+    );
+    latency_cache(error: impl std::fmt::Display) => (
+        "无法准备 mihomo 的测速缓存副本：{error}", "Could not prepare a copy of the mihomo cache for the latency test: {error}",
+        "Не удалось подготовить копию кеша mihomo для проверки задержки: {error}"
+    );
+    latency_endpoint => (
+        "此配置使用的网络端点暂不支持隔离测速", "This configuration uses a network endpoint that does not support an isolated latency test",
+        "Сетевой конечный узел в этой конфигурации не поддерживает изолированную проверку задержки"
+    );
+    latency_wireguard_conflict => (
+        "另一份正在运行或测速的配置使用了同一 WireGuard 身份，无法为此配置单独测速。",
+        "Another active configuration or latency test uses the same WireGuard identity. This configuration cannot be tested separately.",
+        "Другая активная конфигурация или проверка использует тот же идентификатор WireGuard. Отдельная проверка недоступна."
+    );
+    latency_wireguard_unknown => (
+        "无法确定所有 WireGuard 身份。为避免影响现有连接，请在相关核心或测速停止后重试。",
+        "The WireGuard identities could not all be determined. Retry after the other core or latency test stops to avoid interrupting its connection.",
+        "Не удалось определить все идентификаторы WireGuard. Чтобы не прервать соединение, повторите после остановки другого ядра или проверки."
+    );
+    latency_wireguard_no_proxy => (
+        "运行中的配置没有可复用的本地 HTTP 或 SOCKS5 代理入口，无法安全地测试这条线路。",
+        "The running configuration has no usable local HTTP or SOCKS5 proxy listener for a safe latency test.",
+        "В работающей конфигурации нет доступного локального прокси HTTP или SOCKS5 для безопасной проверки задержки."
+    );
+    latency_start => (
+        "测速核心启动失败，请检查配置和所选版本", "The test core could not start. Check the configuration and selected version.",
+        "Не удалось запустить ядро для проверки. Проверьте конфигурацию и выбранную версию."
+    );
+    latency_start_timeout => (
+        "等待测速核心就绪超时", "Timed out waiting for the test core to start",
+        "Истекло время ожидания запуска ядра"
+    );
+    latency_cancelled => (
+        "测速已取消", "Latency test cancelled", "Проверка задержки отменена"
+    );
+    latency_timeout => (
+        "测速请求超时", "Latency request timed out", "Истекло время ожидания ответа"
+    );
+    latency_request => (
+        "无法通过此配置访问测速 URL", "Could not reach the test URL through this configuration",
+        "Не удалось открыть тестовый URL через эту конфигурацию"
+    );
+    latency_status(status: u16) => (
+        "测速地址返回 HTTP {status}", "The test URL returned HTTP {status}",
+        "Тестовый URL вернул HTTP {status}"
+    );
     dns_read_record(path: impl std::fmt::Display, error: impl std::fmt::Display) => (
         "无法读取 DNS 恢复记录 {path}: {error}",
         "Cannot read DNS recovery record {path}: {error}",

@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::core::Core;
+use crate::wireguard::{Identities, Lease, Profile, Sessions};
 
 pub(crate) const TUN_PREFIX: &str = "tun-";
 pub(crate) const RUNTIME_PREFIX: &str = ".ladder-tun-";
@@ -19,9 +21,23 @@ pub(crate) struct PreparedConfig {
     source: PathBuf,
     temporary: Option<NamedTempFile>,
     names: Vec<String>,
+    wireguard: Identities,
+    digest: [u8; 32],
+    pub(crate) session: Option<Lease>,
 }
 
 impl PreparedConfig {
+    pub(crate) fn reserve_wireguard(&mut self, sessions: &Sessions, exe: &Path) {
+        self.session = sessions.start(
+            std::mem::take(&mut self.wireguard),
+            Profile {
+                source: self.source.clone(),
+                exe: exe.into(),
+                digest: self.digest,
+            },
+        );
+    }
+
     pub(crate) fn path(&self) -> &Path {
         self.temporary
             .as_ref()
@@ -38,13 +54,9 @@ pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, Strin
     if core == Core::Mihomo {
         return prepare_mihomo(source, &text);
     }
-    let text = if core == Core::Xray {
-        mask_hash_comments(text)
-    } else {
-        text
-    };
-    let mut config: Value = serde_json_lenient::from_slice(&text)
-        .map_err(|e| t::core_config_invalid(e.line(), e.column()))?;
+    let digest = Sha256::digest(&text).into();
+    let mut config = parse_json(core, text)?;
+    let wireguard = Identities::read(core, &config);
     let mut names = Vec::new();
     let inbounds_key = config_key(core, &config, "inbounds");
     if let Some(inbounds) = config.get_mut(&inbounds_key).and_then(Value::as_array_mut) {
@@ -110,10 +122,22 @@ pub(crate) fn prepare(core: Core, source: &Path) -> Result<PreparedConfig, Strin
         source: source.to_owned(),
         temporary,
         names,
+        wireguard,
+        digest,
+        session: None,
     })
 }
 
-fn prepare_mihomo(source: &Path, text: &[u8]) -> Result<PreparedConfig, String> {
+pub(crate) fn parse_json(core: Core, text: Vec<u8>) -> Result<Value, String> {
+    let text = if core == Core::Xray {
+        mask_hash_comments(text)
+    } else {
+        text
+    };
+    serde_json_lenient::from_slice(&text).map_err(|e| t::core_config_invalid(e.line(), e.column()))
+}
+
+pub(crate) fn parse_mihomo(text: &[u8]) -> Result<serde_yaml_ng::Value, String> {
     let mut config: serde_yaml_ng::Value = serde_yaml_ng::from_slice(text).map_err(|error| {
         error.location().map_or_else(
             || t::core_yaml_invalid().into(),
@@ -123,6 +147,14 @@ fn prepare_mihomo(source: &Path, text: &[u8]) -> Result<PreparedConfig, String> 
     config
         .apply_merge()
         .map_err(|_| t::core_yaml_merge_invalid())?;
+    Ok(config)
+}
+
+fn prepare_mihomo(source: &Path, text: &[u8]) -> Result<PreparedConfig, String> {
+    let mut config = parse_mihomo(text)?;
+    let wireguard = serde_json::to_value(&config)
+        .map(|value| Identities::read(Core::Mihomo, &value))
+        .unwrap_or_else(|_| Identities::unknown());
     let mut names = Vec::new();
     if let Some(tun) = config
         .get_mut("tun")
@@ -152,10 +184,13 @@ fn prepare_mihomo(source: &Path, text: &[u8]) -> Result<PreparedConfig, String> 
         source: source.into(),
         temporary,
         names,
+        wireguard,
+        digest: Sha256::digest(text).into(),
+        session: None,
     })
 }
 
-fn config_key(core: Core, object: &Value, key: &str) -> String {
+pub(crate) fn config_key(core: Core, object: &Value, key: &str) -> String {
     // 保留 Xray 的原字段拼写, 避免另插入 settings 或 name 而覆盖原设置。
     if core == Core::Xray
         && object.get(key).is_none()

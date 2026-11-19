@@ -56,8 +56,7 @@ fn main() {
         )
         .unwrap();
     }
-    if config.contains("fixture_failure") {
-        eprintln!("access is denied: PRIVATE_FIXTURE_VALUE");
+    if config.contains("fixture_start_failure") {
         process::exit(42);
     }
     if config.contains("fixture_native_exit") {
