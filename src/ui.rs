@@ -9,9 +9,9 @@ use crate::runtime::{
 };
 use crate::update::{CoreVersion, UpdateChannel, UpdateProgress};
 use gpui::{
-    Animation, AnimationExt, App, Context, Div, ElementId, FocusHandle, FontWeight, Image,
-    ImageFormat, PathBuilder, Rgba, ScrollHandle, SharedString, Stateful, Task, Timer, Window,
-    WindowAppearance, canvas, div, img, point, prelude::*, px, rgb, rgba,
+    Animation, AnimationExt, App, Asset, Context, Div, ElementId, FocusHandle, FontWeight,
+    ImageCacheError, Img, PathBuilder, RenderImage, Rgba, ScrollHandle, SharedString, Stateful,
+    Task, Timer, Window, WindowAppearance, canvas, div, img, point, prelude::*, px, rgb, rgba,
 };
 use std::{
     collections::HashMap,
@@ -34,6 +34,46 @@ use proxy_input::{UrlField, UrlInput};
 
 const TEXT_PRIMARY: f32 = 14.;
 const TEXT_SECONDARY: f32 = 12.;
+
+struct LadderIcon;
+
+impl Asset for LadderIcon {
+    type Source = u32;
+    type Output = Result<Arc<RenderImage>, ImageCacheError>;
+
+    fn load(side: u32, _: &mut App) -> impl Future<Output = Self::Output> + Send + 'static {
+        async move { render_ladder_icon(side) }
+    }
+}
+
+fn render_ladder_icon(side: u32) -> Result<Arc<RenderImage>, ImageCacheError> {
+    let tree = resvg::usvg::Tree::from_data(
+        include_bytes!("../assets/ladder_color.svg"),
+        &resvg::usvg::Options::default(),
+    )?;
+    let scale = side as f32 / tree.size().width();
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(side, side).ok_or(resvg::usvg::Error::InvalidSize)?;
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    // GPUI expects straight-alpha BGRA pixels for its color image atlas.
+    let mut bgra = image::RgbaImage::new(side, side);
+    for (output, pixel) in bgra.pixels_mut().zip(pixmap.pixels()) {
+        let color = pixel.demultiply();
+        *output = image::Rgba([color.blue(), color.green(), color.red(), color.alpha()]);
+    }
+    Ok(Arc::new(RenderImage::new([image::Frame::new(bgra)])))
+}
+
+fn ladder_icon(size: f32) -> Img {
+    img(move |window: &mut Window, cx: &mut App| {
+        let side = (size * window.scale_factor()).round() as u32;
+        window.use_asset::<LadderIcon>(&side, cx)
+    })
+    .size(px(size))
+    .flex_shrink_0()
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -94,7 +134,6 @@ pub(crate) struct MainWindow {
     command_errors: Vec<(FeedbackScope, String)>,
     focus: FocusHandle,
     logs: LogView,
-    icon: Arc<Image>,
     url_inputs: [UrlInput; 2],
     timeout_menu: Option<u8>,
     updater: AppUpdater,
@@ -152,10 +191,6 @@ impl MainWindow {
             command_errors: Vec::new(),
             focus,
             logs: LogView::new(),
-            icon: Arc::new(Image::from_bytes(
-                ImageFormat::Png,
-                include_bytes!("../assets/ladder.png").to_vec(),
-            )),
             url_inputs,
             timeout_menu: None,
             updater,
@@ -585,7 +620,7 @@ impl MainWindow {
                     .mb(px(20.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_size(px(18.))
-                    .child(img(self.icon.clone()).size(px(24.)).flex_shrink_0())
+                    .child(ladder_icon(24.))
                     .child("Ladder"),
             )
             .child(item(Page::Core(Core::Mihomo), "mihomo", 1))
@@ -1781,7 +1816,7 @@ impl MainWindow {
                             .flex_wrap()
                             .items_center()
                             .gap(px(10.))
-                            .child(img(self.icon.clone()).size(px(36.)).flex_shrink_0())
+                            .child(ladder_icon(36.))
                             .child(
                                 div()
                                     .flex_shrink_0()
@@ -2375,6 +2410,22 @@ impl Colors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ladder_icon_preserves_color_and_antialiasing_at_display_sizes() {
+        for side in [24, 30, 36, 54] {
+            let icon = render_ladder_icon(side).unwrap();
+            assert_eq!(icon.size(0), gpui::size(side.into(), side.into()));
+            let bytes = icon.as_bytes(0).unwrap();
+            assert_eq!(bytes[3], 0);
+            assert!(bytes.chunks_exact(4).any(|p| (1..255).contains(&p[3])));
+            assert!(
+                bytes
+                    .chunks_exact(4)
+                    .any(|p| p[3] == 255 && p[2] > p[1] && p[1] > p[0])
+            );
+        }
+    }
 
     #[test]
     fn config_row_prefers_core_output_over_generic_failures() {

@@ -1,5 +1,5 @@
 <p align="center">
-    <img src="https://raw.githubusercontent.com/senzyo/ladder/main/assets/ladder.ico" width="100px" align="center" />
+    <img src="assets/ladder_3d.png" width="100px" align="center" />
     <h2 align="center">Ladder</h2>
     <p align="center">
         一个 Windows 上的 mihomo、sing-box 和 Xray 轻量启动器。

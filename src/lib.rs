@@ -36,9 +36,12 @@ use tray_icon::{
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND},
     System::Threading::CreateMutexW,
-    UI::WindowsAndMessaging::{
-        IsIconic, MB_ICONERROR, MB_ICONWARNING, MB_OK, MessageBoxW, SW_HIDE, SW_RESTORE, SW_SHOW,
-        SetForegroundWindow, ShowWindow,
+    UI::{
+        HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi},
+        WindowsAndMessaging::{
+            FindWindowW, IsIconic, MB_ICONERROR, MB_ICONWARNING, MB_OK, MessageBoxW, SM_CXSMICON,
+            SM_CYSMICON, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
+        },
     },
 };
 use windows_sys::w;
@@ -76,8 +79,20 @@ fn tray_action(id: &str) -> Option<TrayAction> {
 }
 
 fn install_tray(events: &Sender<TrayAction>) -> Result<TrayIcon> {
+    // 通知区域可以和主窗口位于不同显示器；Explorer 尚未就绪时采用系统 DPI。
+    let icon_size = unsafe {
+        let taskbar = FindWindowW(w!("Shell_TrayWnd"), ptr::null());
+        let dpi = match GetDpiForWindow(taskbar) {
+            0 => GetDpiForSystem(),
+            dpi => dpi,
+        };
+        (
+            GetSystemMetricsForDpi(SM_CXSMICON, dpi) as u32,
+            GetSystemMetricsForDpi(SM_CYSMICON, dpi) as u32,
+        )
+    };
     let tray = TrayIconBuilder::new()
-        .with_icon(Icon::from_resource(1, Some((32, 32)))?)
+        .with_icon(Icon::from_resource(1, Some(icon_size))?)
         .with_tooltip("Ladder")
         .with_menu(Box::new(tray_menu()?))
         .with_menu_on_left_click(false)
