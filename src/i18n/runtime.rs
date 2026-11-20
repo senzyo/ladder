@@ -7,8 +7,8 @@ messages! {
     empty_proxy => ("GitHub 加速链接前缀不能为空", "The GitHub proxy URL prefix cannot be empty.", "Префикс URL прокси GitHub не может быть пустым.");
     invalid_latency_url => ("请在设置中输入并保存有效的 HTTP 或 HTTPS 测速地址。", "Enter and save a valid HTTP or HTTPS test URL in Settings.", "Введите и сохраните корректный тестовый URL с HTTP или HTTPS в настройках.");
     invalid_latency_timeout => ("测速超时须为 3 至 8 秒。", "Choose a test timeout between 3 and 8 seconds.", "Выберите тайм-аут от 3 до 8 секунд.");
-    latency_busy => ("该核心正在测速，请稍候。", "A latency test is already running for this core. Please wait.", "Для этого ядра уже выполняется проверка задержки. Подождите.");
-    latency_thread(error: impl std::fmt::Display) => ("无法启动测速线程：{error}", "Cannot start the latency test thread: {error}", "Не удалось запустить поток проверки задержки: {error}");
+    latency_busy => ("该核心正在测速, 请稍候。", "A latency test is already running for this core. Please wait.", "Для этого ядра уже выполняется проверка задержки. Подождите.");
+    latency_thread(error: impl std::fmt::Display) => ("无法启动测速线程: {error}", "Cannot start the latency test thread: {error}", "Не удалось запустить поток проверки задержки: {error}");
     quitting_validation => ("正在退出, 无法验证配置", "Cannot validate configurations while exiting.", "Нельзя проверить конфигурацию во время выхода.");
     validation_busy => ("正在验证配置, 请稍候", "Validating configurations. Please wait.", "Выполняется проверка конфигурации. Подождите.");
     select_core => ("请先下载并选择核心版本", "Download and select a core version first.", "Сначала скачайте и выберите версию ядра.");
@@ -24,7 +24,7 @@ messages! {
     not_config_file => ("所选路径不是配置文件", "The selected path is not a configuration file.", "Выбранный путь не является файлом конфигурации.");
     invalid_config_name => ("配置文件名无效", "Invalid configuration filename.", "Недопустимое имя файла конфигурации.");
     validation_cancelled => ("配置验证已取消", "Configuration validation cancelled.", "Проверка конфигурации отменена.");
-    validation_inputs_changed => ("配置文件或核心程序已更改，请重新启动核心。", "The configuration or core executable changed. Start the core again.", "Файл конфигурации или ядра изменился. Запустите ядро ещё раз.");
+    validation_inputs_changed => ("配置文件或核心程序已更改, 请重新启动核心。", "The configuration or core executable changed. Start the core again.", "Файл конфигурации или ядра изменился. Запустите ядро ещё раз.");
     validation_status_failed => ("无法读取核心验证状态", "Cannot read the core validation status.", "Не удалось получить состояние проверки ядра.");
     validation_timeout => ("配置验证超时, 请检查配置引用的资源是否可用", "Configuration validation timed out. Check that referenced resources are available.", "Время проверки конфигурации истекло. Проверьте доступность указанных в ней ресурсов.");
     validation_output_limit => ("核心验证输出过多, 已停止验证", "Validation stopped because the core produced too much output.", "Проверка остановлена: ядро выдало слишком много данных.");

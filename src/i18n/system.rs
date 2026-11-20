@@ -4,7 +4,7 @@ messages! {
         "Не удалось подготовить копию этой конфигурации для проверки задержки"
     );
     latency_cache(error: impl std::fmt::Display) => (
-        "无法准备 mihomo 的测速缓存副本：{error}", "Could not prepare a copy of the mihomo cache for the latency test: {error}",
+        "无法准备 mihomo 的测速缓存副本: {error}", "Could not prepare a copy of the mihomo cache for the latency test: {error}",
         "Не удалось подготовить копию кеша mihomo для проверки задержки: {error}"
     );
     latency_endpoint => (
@@ -12,22 +12,22 @@ messages! {
         "Для сетевой конечной точки этой конфигурации пока не поддерживается изолированная проверка задержки"
     );
     latency_wireguard_conflict => (
-        "另一份正在运行或测速的配置使用了同一 WireGuard 身份，无法为此配置单独测速。",
+        "另一份正在运行或测速的配置使用了同一 WireGuard 身份, 无法为此配置单独测速。",
         "Another active configuration or latency test uses the same WireGuard identity. This configuration cannot be tested separately.",
         "Другая активная конфигурация или проверка использует тот же идентификатор WireGuard. Отдельная проверка недоступна."
     );
     latency_wireguard_unknown => (
-        "无法确定所有 WireGuard 身份。为避免影响现有连接，请在相关核心或测速停止后重试。",
+        "无法确定所有 WireGuard 身份。为避免影响现有连接, 请在相关核心或测速停止后重试。",
         "The WireGuard identities could not all be determined. Retry after the other core or latency test stops to avoid interrupting its connection.",
         "Не удалось определить все идентификаторы WireGuard. Чтобы не прервать соединение, повторите после остановки другого ядра или проверки."
     );
     latency_wireguard_no_proxy => (
-        "运行中的配置没有可复用的本地 HTTP 或 SOCKS5 代理入口，无法安全地测试这条线路。",
+        "运行中的配置没有可复用的本地 HTTP 或 SOCKS5 代理入口, 无法安全地测试这条线路。",
         "The running configuration has no usable local HTTP or SOCKS5 proxy listener for a safe latency test.",
         "В работающей конфигурации нет доступного локального прокси HTTP или SOCKS5 для безопасной проверки задержки."
     );
     latency_start => (
-        "测速核心启动失败，请检查配置和所选版本", "The test core could not start. Check the configuration and selected version.",
+        "测速核心启动失败, 请检查配置和所选版本", "The test core could not start. Check the configuration and selected version.",
         "Не удалось запустить ядро для проверки. Проверьте конфигурацию и выбранную версию."
     );
     latency_start_timeout => (

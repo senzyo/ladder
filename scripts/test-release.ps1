@@ -1,6 +1,9 @@
 #requires -Version 7.0
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Executable)
+param(
+    [Parameter(Mandatory)][string]$Executable,
+    [switch]$PackageOnly
+)
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -37,20 +40,27 @@ try {
     foreach ($readme in @('README.md', 'README.zh-CN.md', 'README.ru.md')) {
         [IO.File]::WriteAllText((Join-Path $project $readme), 'must-not-be-packaged')
     }
-    [IO.File]::WriteAllText((Join-Path $project 'LICENSE'), 'Test license')
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../LICENSE') -Destination (Join-Path $project 'LICENSE')
     [IO.File]::WriteAllText((Join-Path $project '.env'), 'must-not-be-packaged')
     [IO.File]::WriteAllText((Join-Path $project 'ladder-state.json'), 'must-not-be-packaged')
     & (Join-Path $project 'scripts/release.ps1') -Architecture amd64 -SkipBuild | Out-Null
-    $zipPath = Join-Path $project "dist/ladder-amd64-v$Version.zip"
+    $archiveName = "ladder-amd64-v$Version.zip"
+    $zipPath = Join-Path $project "dist/$archiveName"
     $hash = (Get-FileHash -LiteralPath $zipPath).Hash
     $archive = [IO.Compression.ZipFile]::OpenRead($zipPath)
     try {
         Assert-True (($archive.Entries.FullName -join ',') -ceq 'LICENSE,ladder.exe') 'Package allowlist was violated.'
     } finally { $archive.Dispose() }
-    $checksum = Get-Content -LiteralPath "$zipPath.sha256" -Raw
-    Assert-True ($checksum.StartsWith($hash.ToLowerInvariant())) 'Checksum did not match the archive.'
-    & (Join-Path $project 'scripts/release.ps1') -Architecture amd64 -SkipBuild | Out-Null
+    if ($PackageOnly) {
+        $zipPath = Join-Path $PSScriptRoot "../dist/$archiveName"
+    } else {
+        & (Join-Path $project 'scripts/release.ps1') -Architecture amd64 -SkipBuild | Out-Null
+    }
     Assert-True ((Get-FileHash -LiteralPath $zipPath).Hash -ceq $hash) 'Packaging was not reproducible for identical input files.'
+    $checksum = Get-Content -LiteralPath "$zipPath.sha256" -Raw
+    Assert-True ($checksum -ceq "$($hash.ToLowerInvariant())  $archiveName`n") 'Checksum did not match the archive.'
+    Write-Host 'PASS: package allowlist, deterministic ZIP, SHA-256.'
+    if ($PackageOnly) { return }
 
     $fixtureSource = Join-Path $TestRoot 'fixture.rs'
     $fixtureCode = @'
@@ -156,7 +166,6 @@ fn main() {
         }
         Write-Host "PASS: update helper $scenario; settings and configuration preserved."
     }
-    Write-Host 'PASS: package allowlist, deterministic ZIP, SHA-256, Windows PowerShell 5.1 update/restart/rollback/checksum/locked-file/ready-cancellation, settings and configuration preservation.'
 } finally {
     $resolved = [IO.Path]::GetFullPath($TestRoot)
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'

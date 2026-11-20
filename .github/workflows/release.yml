@@ -2,22 +2,7 @@ name: Build and release
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
-    paths-ignore:
-      - 'README*.md'
-      - 'LICENSE'
-      - 'AGENTS.md'
-      - 'docs/**'
-      - 'screenshots/**'
-  pull_request:
-    branches: [main]
-    paths-ignore:
-      - 'README*.md'
-      - 'LICENSE'
-      - 'AGENTS.md'
-      - 'docs/**'
-      - 'screenshots/**'
   workflow_dispatch:
 
 permissions:
@@ -32,37 +17,56 @@ defaults:
     shell: pwsh
 
 jobs:
-  check:
+  manual-check:
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/check.yml
+
+  verify-tag:
+    if: github.event_name == 'push'
     runs-on: windows-2025
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install Rust components
+        with:
+          fetch-depth: 2
+      - name: Verify version and successful check for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup default stable
-      - name: Check and test on isolated runner
-        run: |
-          cargo fmt --check
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo fmt --manifest-path dns-recovery/Cargo.toml --check
+          $version = ($metadata.packages | Where-Object name -eq 'ladder').version
+          if ($env:GITHUB_REF_NAME -cne "v$version") { throw 'Tag does not match Cargo.toml version.' }
+
+          $commit = git rev-parse HEAD
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo clippy --locked --all-targets -- -D warnings
+          $parents = (git show -s --format=%P HEAD) -split ' '
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo clippy --manifest-path dns-recovery/Cargo.toml --locked --all-targets -- -D warnings
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo test --locked --lib
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo test --manifest-path dns-recovery/Cargo.toml --locked
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Verify package and update helper before merge
-        run: |
-          cargo build --locked
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ./scripts/test-release.ps1 -Executable ./target/debug/ladder.exe
+          $heads = @($commit)
+          # GitHub indexes a PR run under the PR head, the merge preview's second parent.
+          if ($parents.Count -eq 2) { $heads += $parents[1] }
+          foreach ($head in $heads) {
+            $endpoint = "repos/$env:GITHUB_REPOSITORY/actions/workflows/check.yml/runs?head_sha=$head&status=success&per_page=100"
+            $source = if ($head -ceq $commit) {
+              'select((.event == "push" and .head_branch == "main") or .event == "workflow_dispatch")'
+            } else {
+              'select(.event == "pull_request" and any(.pull_requests[]?; .base.ref == "main"))'
+            }
+            $titles = @(gh api --paginate $endpoint --jq ".workflow_runs[] | select(.head_repository.full_name == .repository.full_name) | $source | .display_title")
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            if ($titles -ccontains "Check $commit") {
+              Write-Host "Found successful Check for $commit."
+              return
+            }
+          }
+          throw "No successful Check for $commit. Complete the Check workflow for this exact commit, then re-run the failed jobs."
 
   package:
-    needs: check
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: [manual-check, verify-tag]
+    if: >-
+      !cancelled() && (needs.manual-check.result == 'success' || needs.verify-tag.result == 'success')
     runs-on: windows-2025
     strategy:
       fail-fast: false
@@ -70,24 +74,15 @@ jobs:
         architecture: [amd64, arm64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Verify release tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $version = ($metadata.packages | Where-Object name -eq 'ladder').version
-          if ($env:RELEASE_TAG -cne "v$version") { throw 'Tag does not match Cargo.toml version.' }
       - name: Install stable Rust
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Package
         run: ./scripts/release.ps1 -Architecture '${{ matrix.architecture }}'
-      - name: Verify package and update helper
+      - name: Verify release archive and checksum
         if: matrix.architecture == 'amd64'
-        run: ./scripts/test-release.ps1 -Executable ./target/x86_64-pc-windows-msvc/release/ladder.exe
+        run: ./scripts/test-release.ps1 -PackageOnly -Executable ./target/x86_64-pc-windows-msvc/release/ladder.exe
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ladder-${{ matrix.architecture }}
@@ -99,7 +94,7 @@ jobs:
 
   release:
     needs: package
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push'
     runs-on: windows-2025
     permissions:
       contents: write

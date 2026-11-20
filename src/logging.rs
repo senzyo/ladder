@@ -1,4 +1,4 @@
-//! 应用日志写入文件，核心日志保存在各自的内存队列。
+//! 应用日志写入文件, 核心日志保存在各自的内存队列。
 
 use std::collections::VecDeque;
 use std::fmt::{self, Display, Write as _};

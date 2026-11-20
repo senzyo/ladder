@@ -92,5 +92,5 @@ messages! {
     theme_save_thread_closed => ("主题设置未保存, 管理线程已关闭。", "The theme was not saved: the management thread has stopped.", "Тема не сохранена: управляющий поток завершён.");
     language_save_thread_closed => ("语言设置未保存, 管理线程已关闭。", "The language was not saved: the management thread has stopped.", "Язык не сохранён: управляющий поток завершён.");
     proxy_save_thread_closed => ("GitHub 加速链接前缀未保存, 管理线程已关闭。", "The GitHub proxy URL prefix was not saved: the management thread has stopped.", "Префикс URL прокси для GitHub не сохранён: управляющий поток завершён.");
-    latency_url_save_thread_closed => ("自定义测速地址未保存，管理线程已关闭。", "The custom test URL was not saved because the management thread stopped.", "Не удалось сохранить пользовательский URL проверки, так как управляющий поток завершён.");
+    latency_url_save_thread_closed => ("自定义测速地址未保存, 管理线程已关闭。", "The custom test URL was not saved because the management thread stopped.", "Не удалось сохранить пользовательский URL проверки, так как управляющий поток завершён.");
 }

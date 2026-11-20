@@ -867,7 +867,7 @@ impl MainWindow {
         let config_list = div()
             .id("config-scroll")
             .relative()
-            // 按可用空间扩展列表，避免文件数量撑高卡片、挤走底部按钮。
+            // 按可用空间扩展列表, 避免文件数量撑高卡片、挤走底部按钮。
             .flex_grow()
             .h(px(120.))
             .flex()

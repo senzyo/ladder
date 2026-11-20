@@ -9,7 +9,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub(super) struct ConfigName(pub(super) SharedString);
 
 fn wrap_name(name: &str, limit: Pixels, shape: impl Fn(&str) -> ShapedLine) -> Vec<ShapedLine> {
-    // 每行取实际能放下的最长前缀，断点只落在完整字素之间。
+    // 每行取实际能放下的最长前缀, 断点只落在完整字素之间。
     let ends: Vec<_> = name
         .grapheme_indices(true)
         .map(|(i, g)| i + g.len())

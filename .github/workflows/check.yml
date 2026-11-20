@@ -1,0 +1,64 @@
+name: Check
+# The tag gate uses this title to identify the tested commit, including PR merge refs.
+run-name: Check ${{ github.sha }}
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README*.md'
+      - 'LICENSE'
+      - 'AGENTS.md'
+      - 'docs/**'
+      - 'screenshots/**'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'README*.md'
+      - 'LICENSE'
+      - 'AGENTS.md'
+      - 'docs/**'
+      - 'screenshots/**'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Verify checkout and install Rust components
+        run: |
+          if ((git rev-parse HEAD) -cne $env:GITHUB_SHA) { throw 'Checkout does not match the check SHA.' }
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustup default stable
+      - name: Check and test on isolated runner
+        run: |
+          cargo fmt --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo fmt --manifest-path dns-recovery/Cargo.toml --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo clippy --locked --all-targets -- -D warnings
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo clippy --manifest-path dns-recovery/Cargo.toml --locked --all-targets -- -D warnings
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --lib
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --manifest-path dns-recovery/Cargo.toml --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Verify packaging and update helper
+        run: |
+          cargo build --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./scripts/test-release.ps1 -Executable ./target/debug/ladder.exe

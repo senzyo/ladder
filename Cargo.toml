@@ -15,7 +15,7 @@ async-channel = "2"
 base64 = "0.22"
 # 桌面程序自行提供含 UAC 和 DPI 设置的清单, 避免与 GPUI 的默认清单重复。
 # 升级时需重新检查 flag_text 中的 GlyphId 布局和 Windows 彩色字形支持。
-gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui = { version = "=0.2.2", default-features = false }
 image = { version = "0.25", default-features = false }
 raw-window-handle = "0.6"
 resvg = { version = "0.45", default-features = false }
@@ -51,7 +51,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-zip = { version = "9", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [build-dependencies]
 winresource = "0.1"

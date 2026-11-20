@@ -69,8 +69,8 @@ pub(crate) fn runs(text: &str, style: &TextStyle) -> Vec<TextRun> {
         }
         let mut run = style.to_run(cluster.len());
         run.font = FLAG_FONT.clone();
-        // GPUI 0.2.2 的 shape_line 会合并相邻同色同装饰的段，即使字体不同。
-        // 国旗自带调色板，透明前景将它与普通文字的字体段隔开。
+        // GPUI 0.2.2 的 shape_line 会合并相邻同色同装饰的段, 即使字体不同。
+        // 国旗自带调色板, 透明前景将它与普通文字的字体段隔开。
         run.color = gpui::transparent_black();
         runs.push(run);
         end = start + cluster.len();
@@ -82,7 +82,7 @@ pub(crate) fn runs(text: &str, style: &TextStyle) -> Vec<TextRun> {
 }
 
 // GPUI 0.2.2 的 GlyphId 是 #[repr(C)] 的单字段 u32。这里只转换同一字体的
-// 有效 OpenType 字形编号，交给 GPUI 的字形图集时仍使用原来的字体。
+// 有效 OpenType 字形编号, 交给 GPUI 的字形图集时仍使用原来的字体。
 fn gpui_glyph(id: ttf_parser::GlyphId) -> GlyphId {
     unsafe { std::mem::transmute::<u32, GlyphId>(u32::from(id.0)) }
 }
@@ -149,7 +149,7 @@ pub(crate) fn paint_line(
             if run.font_id == flags
                 && let Some(layers) = COLOR_LAYERS.get(&glyph.id)
             {
-                // 每层单独排序，避免 GPUI 按图集位置重排重叠的彩色轮廓。
+                // 每层单独排序, 避免 GPUI 按图集位置重排重叠的彩色轮廓。
                 for &(id, ink) in &layers.0 {
                     let ink = ink.map_or(color, |ink| ink.opacity(color.a));
                     window.paint_layer(bounds, |window| {
