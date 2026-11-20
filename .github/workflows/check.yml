@@ -1,6 +1,4 @@
 name: Check
-# The tag gate uses this title to identify the tested commit, including PR merge refs.
-run-name: Check ${{ github.sha }}
 
 on:
   push:
@@ -37,9 +35,10 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Verify checkout and install Rust components
+      - name: Verify checkout ${{ github.sha }}
+        run: if ((git rev-parse HEAD) -cne $env:GITHUB_SHA) { throw 'Checkout does not match the check SHA.' }
+      - name: Install Rust components
         run: |
-          if ((git rev-parse HEAD) -cne $env:GITHUB_SHA) { throw 'Checkout does not match the check SHA.' }
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           rustup default stable

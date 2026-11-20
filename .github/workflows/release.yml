@@ -54,9 +54,16 @@ jobs:
             } else {
               'select(.event == "pull_request" and any(.pull_requests[]?; .base.ref == "main"))'
             }
-            $titles = @(gh api --paginate $endpoint --jq ".workflow_runs[] | select(.head_repository.full_name == .repository.full_name) | $source | .display_title")
+            $filter = ".workflow_runs[] | select(.head_repository.full_name == .repository.full_name) | $source" + ' | "\(.id)/attempts/\(.run_attempt)"'
+            $attempts = @(gh api --paginate $endpoint --jq $filter)
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
-            if ($titles -ccontains "Check $commit") {
+            foreach ($attempt in $attempts) {
+              if ($head -cne $commit) {
+                $jobs = "repos/$env:GITHUB_REPOSITORY/actions/runs/$attempt/jobs?per_page=100"
+                $steps = @(gh api --paginate $jobs --jq '.jobs[] | select(.name == "check" and .conclusion == "success") | .steps[] | select(.conclusion == "success") | .name')
+                if ($LASTEXITCODE) { exit $LASTEXITCODE }
+                if ($steps -cnotcontains "Verify checkout $commit") { continue }
+              }
               Write-Host "Found successful Check for $commit."
               return
             }
@@ -94,7 +101,7 @@ jobs:
 
   release:
     needs: package
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && !cancelled() && needs.package.result == 'success'
     runs-on: windows-2025
     permissions:
       contents: write
